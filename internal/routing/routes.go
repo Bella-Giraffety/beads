@@ -469,6 +469,11 @@ func findTownRoutes(currentBeadsDir string) ([]Route, string) {
 			}
 			return routes, townRoot
 		}
+
+		if os.Getenv("BD_DEBUG_ROUTING") != "" {
+			fmt.Fprintf(os.Stderr, "[routing] findTownRoutes: no routes found for authoritative beads dir %s\n", currentBeadsDir)
+		}
+		return nil, ""
 	}
 
 	// Walk up town roots from CWD until we find one that actually has routes.

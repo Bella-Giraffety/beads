@@ -888,3 +888,139 @@ func TestResolveBeadsDirForID_UsesOuterTownRootFromNestedTownCWD(t *testing.T) {
 		t.Errorf("ResolveBeadsDirForID() should use outer town root:\n  got:  %s\n  want: %s", resolvedDir, outerTarget)
 	}
 }
+
+func TestResolveBeadsDirForID_DoesNotUseCWDRoutesWhenCurrentBeadsDirIsAuthoritative(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	authoritativeBeadsDir := filepath.Join(tmpDir, "explicit", ".beads")
+	if err := os.MkdirAll(authoritativeBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	nestedTownDir := filepath.Join(tmpDir, "nested-town")
+	if err := os.MkdirAll(filepath.Join(nestedTownDir, "mayor"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nestedTownDir, "mayor", "town.json"), []byte(`{"name":"inner-town"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	innerBeadsDir := filepath.Join(nestedTownDir, ".beads")
+	if err := os.MkdirAll(innerBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(innerBeadsDir, "routes.jsonl"), []byte(`{"prefix":"crom-","path":"crom"}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	innerTarget := filepath.Join(nestedTownDir, "crom", ".beads")
+	if err := os.MkdirAll(innerTarget, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	workerDir := filepath.Join(nestedTownDir, "crew", "worker")
+	if err := os.MkdirAll(workerDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(workerDir)
+
+	ctx := context.Background()
+	resolvedDir, routed, err := ResolveBeadsDirForID(ctx, "crom-abc123", authoritativeBeadsDir)
+	if err != nil {
+		t.Fatalf("ResolveBeadsDirForID() error = %v", err)
+	}
+	if routed {
+		t.Fatal("ResolveBeadsDirForID() routed = true, want false")
+	}
+	if resolvedDir != authoritativeBeadsDir {
+		t.Fatalf("ResolveBeadsDirForID() = %s, want %s", resolvedDir, authoritativeBeadsDir)
+	}
+	if got := ResolveTownBeadsDir(authoritativeBeadsDir); got != "" {
+		t.Fatalf("ResolveTownBeadsDir() = %s, want empty string", got)
+	}
+	if innerTarget == resolvedDir {
+		t.Fatal("ResolveBeadsDirForID() should not drift to CWD town routes")
+	}
+}
+
+func TestResolveBeadsDirForID_UsesOuterTownRootWithNestedTownAndRedirectedRouteSource(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	tmpDir, err := filepath.EvalSymlinks(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(filepath.Join(tmpDir, "mayor"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "mayor", "town.json"), []byte(`{"name":"outer-town"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	routerBeadsDir := filepath.Join(tmpDir, "router", ".beads")
+	if err := os.MkdirAll(routerBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(routerBeadsDir, "routes.jsonl"), []byte(`{"prefix":"crom-","path":"crom"}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Symlink(routerBeadsDir, filepath.Join(tmpDir, ".beads")); err != nil {
+		t.Skip("Cannot create symlinks on this system")
+	}
+
+	outerStubBeadsDir := filepath.Join(tmpDir, "crom", ".beads")
+	if err := os.MkdirAll(outerStubBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	outerActualTarget := filepath.Join(tmpDir, "crom", "mayor", "rig", ".beads")
+	if err := os.MkdirAll(outerActualTarget, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outerStubBeadsDir, "redirect"), []byte("mayor/rig/.beads\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	nestedTownDir := filepath.Join(tmpDir, "beads")
+	if err := os.MkdirAll(filepath.Join(nestedTownDir, "mayor"), 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nestedTownDir, "mayor", "town.json"), []byte(`{"name":"inner-town"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	innerBeadsDir := filepath.Join(nestedTownDir, ".beads")
+	if err := os.MkdirAll(innerBeadsDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(innerBeadsDir, "routes.jsonl"), []byte(`{"prefix":"crom-","path":"crom"}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	innerTarget := filepath.Join(nestedTownDir, "crom", ".beads")
+	if err := os.MkdirAll(innerTarget, 0750); err != nil {
+		t.Fatal(err)
+	}
+
+	worktreeDir := filepath.Join(nestedTownDir, "polecats", "obsidian", "beads")
+	if err := os.MkdirAll(worktreeDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(worktreeDir)
+
+	ctx := context.Background()
+	resolvedDir, routed, err := ResolveBeadsDirForID(ctx, "crom-abc123", routerBeadsDir)
+	if err != nil {
+		t.Fatalf("ResolveBeadsDirForID() error = %v", err)
+	}
+	if !routed {
+		t.Fatal("ResolveBeadsDirForID() routed = false, want true")
+	}
+
+	resolvedResolved, _ := filepath.EvalSymlinks(resolvedDir)
+	outerResolved, _ := filepath.EvalSymlinks(outerActualTarget)
+	innerResolved, _ := filepath.EvalSymlinks(innerTarget)
+	if resolvedResolved != outerResolved {
+		t.Fatalf("ResolveBeadsDirForID() should use outer redirected target:\n  got:  %s\n  want: %s", resolvedDir, outerActualTarget)
+	}
+	if resolvedResolved == innerResolved {
+		t.Fatal("ResolveBeadsDirForID() drifted to nested CWD town root")
+	}
+}
