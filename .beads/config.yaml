@@ -1,0 +1,3 @@
+sync.mode: "dolt-native"
+prefix: bd
+issue-prefix: bd
