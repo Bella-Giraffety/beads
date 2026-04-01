@@ -22,18 +22,27 @@ import (
 	"golang.org/x/term"
 )
 
+type bootstrapServerProbeConfig struct {
+	host     string
+	port     int
+	user     string
+	pass     string
+	database string
+	tls      bool
+}
+
 type bootstrapServerDBCheck struct {
 	Exists    bool
 	Reachable bool
 	Err       error
 }
 
-var checkBootstrapServerDB = func(cfg *configfile.Config) bootstrapServerDBCheck {
-	host := cfg.GetDoltServerHost()
-	port := cfg.GetDoltServerPort()
-	user := cfg.GetDoltServerUser()
-	password := cfg.GetDoltServerPassword()
-	dbName := cfg.GetDoltDatabase()
+var checkBootstrapServerDB = func(probeCfg bootstrapServerProbeConfig) bootstrapServerDBCheck {
+	host := probeCfg.host
+	port := probeCfg.port
+	user := probeCfg.user
+	password := probeCfg.pass
+	dbName := probeCfg.database
 	var userPart string
 	if password != "" {
 		userPart = fmt.Sprintf("%s:%s", user, password)
@@ -41,7 +50,7 @@ var checkBootstrapServerDB = func(cfg *configfile.Config) bootstrapServerDBCheck
 		userPart = user
 	}
 	params := "timeout=5s"
-	if cfg.GetDoltServerTLS() {
+	if probeCfg.tls {
 		params += "&tls=true"
 	}
 	dsn := fmt.Sprintf("%s@tcp(%s:%d)/?%s", userPart, host, port, params)
@@ -206,7 +215,16 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 		entries, _ := os.ReadDir(dbPath)
 		if len(entries) > 0 {
 			if cfg.GetDoltMode() == configfile.DoltModeServer {
-				result := checkBootstrapServerDB(cfg)
+				resolved := doltserver.DefaultConfig(beadsDir)
+				probeCfg := bootstrapServerProbeConfig{
+					host:     cfg.GetDoltServerHost(),
+					port:     resolved.Port,
+					user:     cfg.GetDoltServerUser(),
+					pass:     cfg.GetDoltServerPassword(),
+					database: cfg.GetDoltDatabase(),
+					tls:      cfg.GetDoltServerTLS(),
+				}
+				result := checkBootstrapServerDB(probeCfg)
 				if result.Err != nil {
 					plan.Action = "none"
 					plan.Reason = fmt.Sprintf("Could not verify existing server database %s: %v", cfg.GetDoltDatabase(), result.Err)

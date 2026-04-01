@@ -130,6 +130,9 @@ func TestDetectBootstrapAction_ServerModeMissingConfiguredDBDoesNotReturnNone(t 
 	if err := os.MkdirAll(filepath.Join(sharedDir, "hq"), 0o750); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(sharedDir, "dolt-server.port"), []byte("3311"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	oldWd, err := os.Getwd()
 	if err != nil {
@@ -144,12 +147,16 @@ func TestDetectBootstrapAction_ServerModeMissingConfiguredDBDoesNotReturnNone(t 
 	cfg.DoltMode = configfile.DoltModeServer
 	cfg.DoltDatabase = "project_missing"
 	cfg.DoltDataDir = sharedDir
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
 	t.Setenv("BEADS_DOLT_DATA_DIR", sharedDir)
 
 	origCheck := checkBootstrapServerDB
-	checkBootstrapServerDB = func(cfg *configfile.Config) bootstrapServerDBCheck {
-		if cfg.GetDoltDatabase() != "project_missing" {
-			t.Fatalf("unexpected dbName: %s", cfg.GetDoltDatabase())
+	checkBootstrapServerDB = func(probeCfg bootstrapServerProbeConfig) bootstrapServerDBCheck {
+		if probeCfg.database != "project_missing" {
+			t.Fatalf("unexpected dbName: %s", probeCfg.database)
+		}
+		if probeCfg.port != 3311 {
+			t.Fatalf("expected resolved server port 3311, got %d", probeCfg.port)
 		}
 		return bootstrapServerDBCheck{Exists: false, Reachable: true}
 	}
@@ -195,7 +202,7 @@ func TestDetectBootstrapAction_ServerModeProbeErrorStopsWithReason(t *testing.T)
 	t.Setenv("BEADS_DOLT_DATA_DIR", sharedDir)
 
 	origCheck := checkBootstrapServerDB
-	checkBootstrapServerDB = func(cfg *configfile.Config) bootstrapServerDBCheck {
+	checkBootstrapServerDB = func(probeCfg bootstrapServerProbeConfig) bootstrapServerDBCheck {
 		return bootstrapServerDBCheck{Reachable: true, Err: fmt.Errorf("permission denied")}
 	}
 	defer func() { checkBootstrapServerDB = origCheck }()
@@ -210,13 +217,15 @@ func TestDetectBootstrapAction_ServerModeProbeErrorStopsWithReason(t *testing.T)
 }
 
 func TestCheckBootstrapServerDB_HonorsTLSFlagInDSN(t *testing.T) {
-	cfg := configfile.DefaultConfig()
-	cfg.DoltMode = configfile.DoltModeServer
-	cfg.DoltServerHost = "127.0.0.1"
-	cfg.DoltServerPort = 1
-	cfg.DoltServerTLS = true
+	probeCfg := bootstrapServerProbeConfig{
+		host:     "127.0.0.1",
+		port:     1,
+		user:     "root",
+		database: "beads",
+		tls:      true,
+	}
 
-	result := checkBootstrapServerDB(cfg)
+	result := checkBootstrapServerDB(probeCfg)
 	if result.Reachable {
 		t.Fatal("expected unreachable test connection")
 	}
