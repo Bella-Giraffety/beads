@@ -28,14 +28,23 @@ type bootstrapServerDBCheck struct {
 	Err       error
 }
 
-var checkBootstrapServerDB = func(host string, port int, user, password, dbName string) bootstrapServerDBCheck {
+var checkBootstrapServerDB = func(cfg *configfile.Config) bootstrapServerDBCheck {
+	host := cfg.GetDoltServerHost()
+	port := cfg.GetDoltServerPort()
+	user := cfg.GetDoltServerUser()
+	password := cfg.GetDoltServerPassword()
+	dbName := cfg.GetDoltDatabase()
 	var userPart string
 	if password != "" {
 		userPart = fmt.Sprintf("%s:%s", user, password)
 	} else {
 		userPart = user
 	}
-	dsn := fmt.Sprintf("%s@tcp(%s:%d)/?timeout=5s", userPart, host, port)
+	params := "timeout=5s"
+	if cfg.GetDoltServerTLS() {
+		params += "&tls=true"
+	}
+	dsn := fmt.Sprintf("%s@tcp(%s:%d)/?%s", userPart, host, port, params)
 
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -197,13 +206,12 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 		entries, _ := os.ReadDir(dbPath)
 		if len(entries) > 0 {
 			if cfg.GetDoltMode() == configfile.DoltModeServer {
-				result := checkBootstrapServerDB(
-					cfg.GetDoltServerHost(),
-					cfg.GetDoltServerPort(),
-					cfg.GetDoltServerUser(),
-					cfg.GetDoltServerPassword(),
-					cfg.GetDoltDatabase(),
-				)
+				result := checkBootstrapServerDB(cfg)
+				if result.Err != nil {
+					plan.Action = "none"
+					plan.Reason = fmt.Sprintf("Could not verify existing server database %s: %v", cfg.GetDoltDatabase(), result.Err)
+					return plan
+				}
 				if result.Exists {
 					plan.HasExisting = true
 					plan.Action = "none"

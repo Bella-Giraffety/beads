@@ -3,9 +3,11 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/configfile"
@@ -145,9 +147,9 @@ func TestDetectBootstrapAction_ServerModeMissingConfiguredDBDoesNotReturnNone(t 
 	t.Setenv("BEADS_DOLT_DATA_DIR", sharedDir)
 
 	origCheck := checkBootstrapServerDB
-	checkBootstrapServerDB = func(host string, port int, user, password, dbName string) bootstrapServerDBCheck {
-		if dbName != "project_missing" {
-			t.Fatalf("unexpected dbName: %s", dbName)
+	checkBootstrapServerDB = func(cfg *configfile.Config) bootstrapServerDBCheck {
+		if cfg.GetDoltDatabase() != "project_missing" {
+			t.Fatalf("unexpected dbName: %s", cfg.GetDoltDatabase())
 		}
 		return bootstrapServerDBCheck{Exists: false, Reachable: true}
 	}
@@ -159,6 +161,67 @@ func TestDetectBootstrapAction_ServerModeMissingConfiguredDBDoesNotReturnNone(t 
 	}
 	if plan.Action != "init" {
 		t.Fatalf("expected init fallback when no remote/backup/jsonl exists, got %q", plan.Action)
+	}
+}
+
+func TestDetectBootstrapAction_ServerModeProbeErrorStopsWithReason(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sharedDir := filepath.Join(tmpDir, "shared-dolt")
+	if err := os.MkdirAll(filepath.Join(sharedDir, "hq"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }()
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := configfile.DefaultConfig()
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltDatabase = "project_missing"
+	cfg.DoltDataDir = sharedDir
+	t.Setenv("BEADS_DOLT_DATA_DIR", sharedDir)
+
+	origCheck := checkBootstrapServerDB
+	checkBootstrapServerDB = func(cfg *configfile.Config) bootstrapServerDBCheck {
+		return bootstrapServerDBCheck{Reachable: true, Err: fmt.Errorf("permission denied")}
+	}
+	defer func() { checkBootstrapServerDB = origCheck }()
+
+	plan := detectBootstrapAction(beadsDir, cfg)
+	if plan.Action != "none" {
+		t.Fatalf("expected bootstrap to stop when server probe errors, got %#v", plan)
+	}
+	if !strings.Contains(plan.Reason, "permission denied") {
+		t.Fatalf("expected probe error in plan reason, got %#v", plan)
+	}
+}
+
+func TestCheckBootstrapServerDB_HonorsTLSFlagInDSN(t *testing.T) {
+	cfg := configfile.DefaultConfig()
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltServerHost = "127.0.0.1"
+	cfg.DoltServerPort = 1
+	cfg.DoltServerTLS = true
+
+	result := checkBootstrapServerDB(cfg)
+	if result.Reachable {
+		t.Fatal("expected unreachable test connection")
+	}
+	if result.Err == nil {
+		t.Fatal("expected connection error for unreachable test host")
 	}
 }
 
