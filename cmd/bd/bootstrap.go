@@ -233,7 +233,7 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 				if result.Exists {
 					plan.HasExisting = true
 					plan.Action = "none"
-					plan.Reason = fmt.Sprintf("Database %s already exists on server at %s:%d", cfg.GetDoltDatabase(), cfg.GetDoltServerHost(), cfg.GetDoltServerPort())
+					plan.Reason = fmt.Sprintf("Database %s already exists on server at %s:%d", probeCfg.database, probeCfg.host, probeCfg.port)
 					return plan
 				}
 			} else {
