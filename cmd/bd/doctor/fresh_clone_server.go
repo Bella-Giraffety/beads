@@ -88,12 +88,12 @@ func freshCloneServerResult(dbExists bool, dbName, host string, port int, syncGi
 	var msg strings.Builder
 	fmt.Fprintf(&msg, "Fresh clone detected: database %q not found on server at %s:%d.", dbName, host, port)
 
-	fix := "bd init"
+	fix := "bd bootstrap"
 	if syncGitRemote == "" {
-		msg.WriteString(" Set sync.git-remote in .beads/config.yaml to bootstrap from a remote.")
-		fix = "bd init (after setting sync.git-remote in .beads/config.yaml)"
+		msg.WriteString(" Run bd bootstrap first to recover existing state. If bootstrap cannot find the expected remote automatically, then set sync.git-remote in .beads/config.yaml and rerun bd bootstrap.")
+		fix = "bd bootstrap"
 	} else {
-		fmt.Fprintf(&msg, " sync.git-remote is configured (%s) — run bd init to bootstrap.", syncGitRemote)
+		fmt.Fprintf(&msg, " sync.git-remote is configured (%s) — run bd bootstrap to recover the existing database.", syncGitRemote)
 	}
 
 	return DoctorCheck{
