@@ -356,7 +356,8 @@ func CheckFreshClone(repoPath string) DoctorCheck {
 		Message: fmt.Sprintf("Fresh clone detected (%d issues in %s, no database)", issueCount, jsonlName),
 		Detail: "This appears to be a freshly cloned repository.\n" +
 			"  The JSONL file contains issues but no local database exists.\n" +
-			"  Run 'bd bootstrap' to recover the existing project state safely.\n" +
+			"  Run 'bd bootstrap' as the safe entry point for recovering existing state.\n" +
+			"  Use '--dry-run' first if you need to inspect whether bootstrap will recover or initialize.\n" +
 			"  Use 'bd init' only when creating a brand-new project with no existing .beads data.",
 		Fix: fmt.Sprintf("Run '%s' to recover the existing database and import tracked issues", fixCmd),
 	}

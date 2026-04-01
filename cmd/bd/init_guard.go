@@ -94,11 +94,11 @@ func initGuardServerMessage(dbName, host string, port int, prefix, syncGitRemote
 
 	b.WriteString("\nIf this is an existing project, fresh clone, or shared-server recovery, run:\n")
 	b.WriteString("  bd bootstrap\n")
-	b.WriteString("This safely recovers existing state before creating anything new.\n")
+	b.WriteString("This is the safe entry point for existing-project recovery and may recover or initialize depending on detected state.\n")
 
 	if syncGitRemote != "" {
 		fmt.Fprintf(&b, "\nTip: sync.git-remote is configured (%s).\n", syncGitRemote)
-		b.WriteString("Run bd bootstrap to recover from the configured remote.\n")
+		b.WriteString("Run bd bootstrap to recover from the configured remote, or use --dry-run to inspect the plan first.\n")
 	} else {
 		b.WriteString("\nIf this is a brand-new project, create the database with:\n")
 		fmt.Fprintf(&b, "  bd init --prefix %s\n", prefix)

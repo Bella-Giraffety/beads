@@ -90,10 +90,10 @@ func freshCloneServerResult(dbExists bool, dbName, host string, port int, syncGi
 
 	fix := "bd bootstrap"
 	if syncGitRemote == "" {
-		msg.WriteString(" Run bd bootstrap first to recover existing state. If bootstrap cannot find the expected remote automatically, then set sync.git-remote in .beads/config.yaml and rerun bd bootstrap.")
+		msg.WriteString(" Run bd bootstrap first as the safe recovery entry point. It may recover existing state or initialize if no prior state can be found. If bootstrap cannot find the expected remote automatically, then set sync.git-remote in .beads/config.yaml and rerun bd bootstrap.")
 		fix = "bd bootstrap"
 	} else {
-		fmt.Fprintf(&msg, " sync.git-remote is configured (%s) — run bd bootstrap to recover the existing database.", syncGitRemote)
+		fmt.Fprintf(&msg, " sync.git-remote is configured (%s) — run bd bootstrap to recover from the remote, or use --dry-run to inspect the plan first.", syncGitRemote)
 	}
 
 	return DoctorCheck{
