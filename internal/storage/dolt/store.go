@@ -950,14 +950,18 @@ func (s *DoltStore) verifyProjectIdentity(ctx context.Context, beadsDir string) 
 		return fmt.Errorf(
 			"PROJECT IDENTITY MISMATCH — refusing to connect\n\n"+
 				"  Local project ID (metadata.json):  %s\n"+
-				"  Database project ID:               %s\n\n"+
-				"This means the Dolt server is serving a DIFFERENT project's database.\n"+
-				"This can happen when:\n"+
+				"  Database project ID:               %s\n"+
+				"  Local beads dir:                   %s\n\n"+
+				"The live database and your local metadata.json disagree.\n"+
+				"Supported causes include:\n"+
+				"  - Stale local metadata after DB regeneration/recovery (project-id drift)\n"+
 				"  - Another project's server is running on the same port\n"+
 				"  - The server restarted with a different data directory\n\n"+
-				"To diagnose: bd dolt status\n"+
-				"Do NOT run 'bd init' — your data likely exists, just on a different server.",
-			localID, dbID)
+				"Recovery guidance:\n"+
+				"  - Confirm the live server/database: bd dolt status\n"+
+				"  - If the live database is correct, refresh the local metadata.json for this beads dir\n"+
+				"  - Do NOT run 'bd init' unless you intend to create a brand-new project.",
+			localID, dbID, filepath.Clean(beadsDir))
 	}
 	return nil
 }
