@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
 func buildBDUnderTest(t *testing.T) string {
@@ -435,5 +437,85 @@ func TestDoltShowUsesBEADSDBForNoDBCommand(t *testing.T) {
 	}
 	if got["host"] != "10.0.0.2" {
 		t.Fatalf("host = %v, want 10.0.0.2", got["host"])
+	}
+}
+
+func TestCreateRepairsSharedServerProjectIdentityWithExplicitBEADSDir(t *testing.T) {
+	skipIfNoDolt(t)
+
+	binPath := buildBDUnderTest(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	ownerBeadsDir := filepath.Join(root, "owner", ".beads")
+	clientRepo := filepath.Join(root, "client")
+	clientBeadsDir := filepath.Join(clientRepo, ".beads")
+	dbName := uniqueTestDBName(t)
+	authoritativeID := "shared-db-project-id"
+	staleID := "stale-local-project-id"
+
+	if err := os.MkdirAll(ownerBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir owner beads dir: %v", err)
+	}
+	if err := (&configfile.Config{
+		Backend:        configfile.BackendDolt,
+		Database:       "dolt",
+		DoltDatabase:   dbName,
+		DoltMode:       configfile.DoltModeServer,
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: testDoltServerPort,
+		ProjectID:      authoritativeID,
+	}).Save(ownerBeadsDir); err != nil {
+		t.Fatalf("save owner metadata: %v", err)
+	}
+
+	doltNewMutex.Lock()
+	ownerStore, err := dolt.New(ctx, &dolt.Config{
+		Path:            filepath.Join(ownerBeadsDir, "dolt"),
+		BeadsDir:        ownerBeadsDir,
+		Database:        dbName,
+		ServerHost:      "127.0.0.1",
+		ServerPort:      testDoltServerPort,
+		CreateIfMissing: true,
+	})
+	doltNewMutex.Unlock()
+	if err != nil {
+		t.Fatalf("create owner store: %v", err)
+	}
+	if err := ownerStore.SetMetadata(ctx, "_project_id", authoritativeID); err != nil {
+		ownerStore.Close()
+		t.Fatalf("set _project_id: %v", err)
+	}
+	if err := ownerStore.SetConfig(ctx, "issue_prefix", "be"); err != nil {
+		ownerStore.Close()
+		t.Fatalf("set issue_prefix: %v", err)
+	}
+	ownerStore.Close()
+
+	initGitRepo(t, clientRepo)
+	if err := os.MkdirAll(clientBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir client beads dir: %v", err)
+	}
+	if err := (&configfile.Config{
+		Backend:        configfile.BackendDolt,
+		Database:       "dolt",
+		DoltDatabase:   dbName,
+		DoltMode:       configfile.DoltModeServer,
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: testDoltServerPort,
+		ProjectID:      staleID,
+	}).Save(clientBeadsDir); err != nil {
+		t.Fatalf("save client metadata: %v", err)
+	}
+	writeFile(t, filepath.Join(clientBeadsDir, "dolt-server.port"), []byte(strconv.Itoa(testDoltServerPort)))
+	writeProjectConfig(t, clientBeadsDir, "origin", testDoltServerPort, true)
+
+	runBDCommand(t, binPath, clientRepo, []string{"BEADS_DIR=" + clientBeadsDir}, "create", "shared-server identity repair", "-p", "1", "--json")
+
+	loaded, err := configfile.Load(clientBeadsDir)
+	if err != nil {
+		t.Fatalf("load repaired metadata: %v", err)
+	}
+	if loaded.ProjectID != authoritativeID {
+		t.Fatalf("ProjectID = %q, want %q after explicit-BEADS_DIR repair", loaded.ProjectID, authoritativeID)
 	}
 }

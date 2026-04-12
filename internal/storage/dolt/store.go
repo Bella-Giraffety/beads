@@ -36,6 +36,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
@@ -1169,6 +1170,13 @@ func (s *DoltStore) verifyProjectIdentity(ctx context.Context, beadsDir string) 
 	}
 
 	if localID != dbID {
+		if shouldRepairSharedServerProjectIdentity(beadsDir) {
+			metaCfg.ProjectID = dbID
+			if err := metaCfg.Save(beadsDir); err != nil {
+				return fmt.Errorf("shared-server project identity drift: failed to update metadata.json: %w", err)
+			}
+			return nil
+		}
 		return fmt.Errorf(
 			"PROJECT IDENTITY MISMATCH — refusing to connect\n\n"+
 				"  Local project ID (metadata.json):  %s\n"+
@@ -1182,6 +1190,17 @@ func (s *DoltStore) verifyProjectIdentity(ctx context.Context, beadsDir string) 
 			localID, dbID)
 	}
 	return nil
+}
+
+// Shared-server mode already identifies the target project by database name, so
+// a local metadata.json mismatch is stale runtime state that should be repaired
+// from the authoritative database metadata rather than treated as leakage.
+func shouldRepairSharedServerProjectIdentity(beadsDir string) bool {
+	if v := os.Getenv("BEADS_DOLT_SHARED_SERVER"); v == "1" || strings.EqualFold(v, "true") {
+		return true
+	}
+	v := strings.TrimSpace(config.GetStringFromDir(beadsDir, "dolt.shared-server"))
+	return v == "1" || strings.EqualFold(v, "true")
 }
 
 // isLocalHost returns true if the host refers to the local machine.
