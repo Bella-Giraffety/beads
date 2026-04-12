@@ -369,10 +369,42 @@ func findLocalBeadsDir() string {
 		return canonicalizeBeadsDirPath(beadsDir)
 	}
 
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+
+	gitRoot := findGitRoot()
+	isWt := git.IsWorktree()
+	walkBoundary := gitRoot
+	if isWt {
+		walkBoundary = git.GetRepoRoot()
+	}
+
+	// Walk up from CWD first so rig-local .beads directories above a nested
+	// worktree repo win over worktree/main-repo fallback.
+	for dir := cwd; dir != "/" && dir != "."; {
+		if walkBoundary != "" && dir == walkBoundary {
+			break
+		}
+
+		beadsDir := filepath.Join(dir, ".beads")
+		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+			return beadsDir
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+
 	// For worktrees, check worktree-local redirect first (per-worktree override).
 	// Returns the raw worktree .beads dir (not the resolved target) since
 	// findLocalBeadsDir doesn't follow redirects — callers use FollowRedirect.
-	if git.IsWorktree() {
+	var mainRepoRoot string
+	if isWt {
 		if root := git.GetRepoRoot(); root != "" {
 			wt := filepath.Join(root, ".beads")
 			// Check for redirect file first
@@ -386,24 +418,60 @@ func findLocalBeadsDir() string {
 				}
 			}
 		}
-	}
 
-	if beadsDir := GetWorktreeFallbackBeadsDir(); beadsDir != "" {
-		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
-			return beadsDir
+		if root, err := git.GetMainRepoRoot(); err == nil {
+			mainRepoRoot = root
+		}
+
+		if worktreeRoot := git.GetRepoRoot(); worktreeRoot != "" {
+			ancestorLimit := commonAncestorPath(worktreeRoot, mainRepoRoot)
+			for dir := filepath.Dir(worktreeRoot); dir != "/" && dir != "."; {
+				beadsDir := filepath.Join(dir, ".beads")
+				redirectFile := filepath.Join(beadsDir, "redirect")
+				if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+					if _, err := os.Stat(redirectFile); err != nil {
+						goto nextLocalAncestor
+					}
+					return beadsDir
+				}
+
+				if ancestorLimit != "" && dir == ancestorLimit {
+					break
+				}
+
+			nextLocalAncestor:
+				parent := filepath.Dir(dir)
+				if parent == dir {
+					break
+				}
+				dir = parent
+			}
+		}
+
+		if beadsDir := GetWorktreeFallbackBeadsDir(); beadsDir != "" {
+			if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+				return beadsDir
+			}
 		}
 	}
 
-	// Walk up directory tree
-	cwd, err := os.Getwd()
-	if err != nil {
+	if walkBoundary == "" {
 		return ""
 	}
 
-	for dir := cwd; dir != "/" && dir != "."; {
+	extendedRoot := gitRoot
+	if isWt && mainRepoRoot != "" {
+		extendedRoot = mainRepoRoot
+	}
+
+	for dir := walkBoundary; dir != "/" && dir != "."; {
 		beadsDir := filepath.Join(dir, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			return beadsDir
+		}
+
+		if extendedRoot != "" && dir == extendedRoot {
+			break
 		}
 
 		// Move up one directory
@@ -658,7 +726,43 @@ func FindBeadsDir() string {
 			}
 		}
 
-		// 3c. Fall back to the canonical shared .beads for this worktree.
+		var err error
+		mainRepoRoot, err = git.GetMainRepoRoot()
+		if err != nil {
+			mainRepoRoot = ""
+		}
+
+		// 3c. Search ancestors above the worktree root up to the common rig root
+		// before falling back to the mayor clone's shared .beads.
+		if worktreeRoot := git.GetRepoRoot(); worktreeRoot != "" {
+			ancestorLimit := commonAncestorPath(worktreeRoot, mainRepoRoot)
+			for dir := filepath.Dir(worktreeRoot); dir != "/" && dir != "."; {
+				beadsDir := filepath.Join(dir, ".beads")
+				redirectFile := filepath.Join(beadsDir, "redirect")
+				if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+					if _, err := os.Stat(redirectFile); err != nil {
+						goto nextBeadsAncestor
+					}
+					beadsDir = FollowRedirect(beadsDir)
+					if hasBeadsProjectFiles(beadsDir) {
+						return beadsDir
+					}
+				}
+
+				if ancestorLimit != "" && dir == ancestorLimit {
+					break
+				}
+
+			nextBeadsAncestor:
+				parent := filepath.Dir(dir)
+				if parent == dir {
+					break
+				}
+				dir = parent
+			}
+		}
+
+		// 3d. Fall back to the canonical shared .beads for this worktree.
 		if fallbackBeadsDir := GetWorktreeFallbackBeadsDir(); fallbackBeadsDir != "" {
 			if info, err := os.Stat(fallbackBeadsDir); err == nil && info.IsDir() {
 				fallbackBeadsDir = FollowRedirect(fallbackBeadsDir)
@@ -666,12 +770,6 @@ func FindBeadsDir() string {
 					return fallbackBeadsDir
 				}
 			}
-		}
-
-		var err error
-		mainRepoRoot, err = git.GetMainRepoRoot()
-		if err != nil {
-			mainRepoRoot = ""
 		}
 	}
 
@@ -748,6 +846,38 @@ func GetWorktreeFallbackBeadsDir() string {
 	return filepath.Join(commonDir, ".beads")
 }
 
+func commonAncestorPath(a, b string) string {
+	if a == "" || b == "" {
+		return ""
+	}
+
+	a = filepath.Clean(a)
+	b = filepath.Clean(b)
+
+	for {
+		if a == b {
+			return a
+		}
+
+		if len(a) >= len(b) {
+			parent := filepath.Dir(a)
+			if parent == a {
+				break
+			}
+			a = parent
+			continue
+		}
+
+		parent := filepath.Dir(b)
+		if parent == b {
+			break
+		}
+		b = parent
+	}
+
+	return ""
+}
+
 // worktreeRedirectTarget returns the resolved redirect target for the current
 // worktree's .beads/redirect file, or empty string if not in a worktree or no
 // redirect exists. This centralizes the per-worktree redirect override logic
@@ -793,21 +923,38 @@ func findDatabaseInTree() string {
 		dir = resolvedDir
 	}
 
-	// Check cwd first — a rig subdirectory with its own .beads/ takes
-	// priority over the git root's .beads/ (same fix as FindBeadsDir step 1b).
-	{
-		cwdBeadsDir := filepath.Join(dir, ".beads")
-		if info, err := os.Stat(cwdBeadsDir); err == nil && info.IsDir() {
-			cwdBeadsDir = FollowRedirect(cwdBeadsDir)
-			if dbPath := findDatabaseInBeadsDir(cwdBeadsDir, true); dbPath != "" {
+	gitRoot := findGitRoot()
+	isWt := git.IsWorktree()
+	walkBoundary := gitRoot
+	if isWt {
+		walkBoundary = git.GetRepoRoot()
+	}
+
+	// Walk up from CWD before worktree fallback so rig-local .beads directories
+	// above a nested polecat worktree can win over main-repo/shared fallback.
+	for current := dir; current != "/" && current != "."; {
+		if walkBoundary != "" && current == walkBoundary {
+			break
+		}
+
+		beadsDir := filepath.Join(current, ".beads")
+		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+			beadsDir = FollowRedirect(beadsDir)
+			if dbPath := findDatabaseInBeadsDir(beadsDir, true); dbPath != "" {
 				return dbPath
 			}
 		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		current = parent
 	}
 
 	// Check if we're in a git worktree
 	var mainRepoRoot string
-	if git.IsWorktree() {
+	if isWt {
 		// Per-worktree redirect override
 		if target := worktreeRedirectTarget(); target != "" {
 			if dbPath := findDatabaseInBeadsDir(target, true); dbPath != "" {
@@ -825,6 +972,40 @@ func findDatabaseInTree() string {
 			}
 		}
 
+		var err error
+		mainRepoRoot, err = git.GetMainRepoRoot()
+		if err != nil {
+			mainRepoRoot = ""
+		}
+
+		if worktreeRoot := git.GetRepoRoot(); worktreeRoot != "" {
+			ancestorLimit := commonAncestorPath(worktreeRoot, mainRepoRoot)
+			for current := filepath.Dir(worktreeRoot); current != "/" && current != "."; {
+				beadsDir := filepath.Join(current, ".beads")
+				redirectFile := filepath.Join(beadsDir, "redirect")
+				if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+					if _, err := os.Stat(redirectFile); err != nil {
+						goto nextDatabaseAncestor
+					}
+					beadsDir = FollowRedirect(beadsDir)
+					if dbPath := findDatabaseInBeadsDir(beadsDir, true); dbPath != "" {
+						return dbPath
+					}
+				}
+
+				if ancestorLimit != "" && current == ancestorLimit {
+					break
+				}
+
+			nextDatabaseAncestor:
+				parent := filepath.Dir(current)
+				if parent == current {
+					break
+				}
+				current = parent
+			}
+		}
+
 		// Fall back: search the canonical shared .beads for this worktree.
 		if fallbackBeadsDir := GetWorktreeFallbackBeadsDir(); fallbackBeadsDir != "" {
 			if info, err := os.Stat(fallbackBeadsDir); err == nil && info.IsDir() {
@@ -834,24 +1015,22 @@ func findDatabaseInTree() string {
 				}
 			}
 		}
-		var err error
-		mainRepoRoot, err = git.GetMainRepoRoot()
-		if err != nil {
-			mainRepoRoot = ""
-		}
 		// If not found in main repo, fall back to worktree search below
 	}
 
-	// Find git root to limit the search
-	gitRoot := findGitRoot()
-	if git.IsWorktree() && mainRepoRoot != "" {
-		// For worktrees, extend search boundary to include main repo
-		gitRoot = mainRepoRoot
+	if walkBoundary == "" {
+		return ""
 	}
 
-	// Walk up directory tree (regular repository or worktree fallback)
-	for {
-		beadsDir := filepath.Join(dir, ".beads")
+	extendedRoot := gitRoot
+	if isWt && mainRepoRoot != "" {
+		extendedRoot = mainRepoRoot
+	}
+
+	// Walk from the boundary toward the main repo root (worktrees) or include the
+	// git root itself (regular repos) after worktree-specific fallback.
+	for current := walkBoundary; current != "/" && current != "."; {
+		beadsDir := filepath.Join(current, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			// Follow redirect if present
 			beadsDir = FollowRedirect(beadsDir)
@@ -863,18 +1042,17 @@ func findDatabaseInTree() string {
 		}
 
 		// Move up one directory
-		parent := filepath.Dir(dir)
-		if parent == dir {
+		if extendedRoot != "" && current == extendedRoot {
+			break
+		}
+
+		parent := filepath.Dir(current)
+		if parent == current {
 			// Reached filesystem root
 			break
 		}
 
-		// Stop at git root to avoid finding unrelated databases
-		if gitRoot != "" && dir == gitRoot {
-			break
-		}
-
-		dir = parent
+		current = parent
 	}
 
 	return ""
