@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/ui"
 )
 
 // syncTracer is the OTel tracer for tracker sync spans.
@@ -81,6 +84,9 @@ type Engine struct {
 	// stateCache holds the opaque value from PushHooks.BuildStateCache during a push.
 	// Tracker adapters access it via ResolveState().
 	stateCache interface{}
+
+	// warnings collects warning messages during a Sync() call for inclusion in SyncResult.
+	warnings []string
 }
 
 // NewEngine creates a new sync engine for the given tracker and storage.
@@ -105,7 +111,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	defer span.End()
 
 	result := &SyncResult{Success: true}
-	now := time.Now().UTC()
+	e.warnings = nil
 
 	// Default to bidirectional if neither specified
 	if !opts.Pull && !opts.Push {
@@ -117,9 +123,22 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 	skipPushIDs := make(map[string]bool)
 	forcePushIDs := make(map[string]bool)
 
-	// Phase 1: Pull
+	allowPullOverwriteIDs := make(map[string]bool)
+
+	// Phase 1: Detect conflicts (only for bidirectional sync)
+	if opts.Pull && opts.Push {
+		conflicts, err := e.DetectConflicts(ctx)
+		if err != nil {
+			e.warn("Failed to detect conflicts: %v", err)
+		} else if len(conflicts) > 0 {
+			result.Stats.Conflicts = len(conflicts)
+			e.resolveConflicts(opts, conflicts, skipPushIDs, forcePushIDs, allowPullOverwriteIDs)
+		}
+	}
+
+	// Phase 2: Pull
 	if opts.Pull {
-		pullStats, err := e.doPull(ctx, opts)
+		pullStats, err := e.doPull(ctx, opts, allowPullOverwriteIDs)
 		if err != nil {
 			result.Success = false
 			result.Error = fmt.Sprintf("pull failed: %v", err)
@@ -127,21 +146,12 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 			span.SetStatus(codes.Error, result.Error)
 			return result, err
 		}
+		result.PullStats = *pullStats
 		result.Stats.Pulled = pullStats.Created + pullStats.Updated
 		result.Stats.Created += pullStats.Created
 		result.Stats.Updated += pullStats.Updated
 		result.Stats.Skipped += pullStats.Skipped
-	}
-
-	// Phase 2: Detect conflicts (only for bidirectional sync)
-	if opts.Pull && opts.Push {
-		conflicts, err := e.DetectConflicts(ctx)
-		if err != nil {
-			e.warn("Failed to detect conflicts: %v", err)
-		} else if len(conflicts) > 0 {
-			result.Stats.Conflicts = len(conflicts)
-			e.resolveConflicts(ctx, opts, conflicts, skipPushIDs, forcePushIDs)
-		}
+		result.Stats.Errors += pullStats.Errors
 	}
 
 	// Phase 3: Push
@@ -154,11 +164,13 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 			span.SetStatus(codes.Error, result.Error)
 			return result, err
 		}
+		result.PushStats = *pushStats
 		result.Stats.Pushed = pushStats.Created + pushStats.Updated
 		result.Stats.Created += pushStats.Created
 		result.Stats.Updated += pushStats.Updated
 		result.Stats.Skipped += pushStats.Skipped
 		result.Stats.Errors += pushStats.Errors
+		result.Warnings = append(result.Warnings, pushStats.Warnings...)
 	}
 
 	// Record final stats as span attributes.
@@ -174,7 +186,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 
 	// Update last_sync timestamp
 	if !opts.DryRun {
-		lastSync := now.Format(time.RFC3339)
+		lastSync := time.Now().UTC().Format(time.RFC3339Nano)
 		key := e.Tracker.ConfigPrefix() + ".last_sync"
 		if err := e.Store.SetConfig(ctx, key, lastSync); err != nil {
 			e.warn("Failed to update last_sync: %v", err)
@@ -182,6 +194,7 @@ func (e *Engine) Sync(ctx context.Context, opts SyncOptions) (*SyncResult, error
 		result.LastSync = lastSync
 	}
 
+	result.Warnings = e.warnings
 	return result, nil
 }
 
@@ -200,7 +213,7 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 		return nil, nil // No previous sync, no conflicts possible
 	}
 
-	lastSync, err := time.Parse(time.RFC3339, lastSyncStr)
+	lastSync, err := parseSyncTime(lastSyncStr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid last_sync timestamp %q: %w", lastSyncStr, err)
 	}
@@ -252,7 +265,7 @@ func (e *Engine) DetectConflicts(ctx context.Context) ([]Conflict, error) {
 }
 
 // doPull imports issues from the external tracker into beads.
-func (e *Engine) doPull(ctx context.Context, opts SyncOptions) (*PullStats, error) {
+func (e *Engine) doPull(ctx context.Context, opts SyncOptions, allowOverwriteIDs map[string]bool) (*PullStats, error) {
 	ctx, span := syncTracer.Start(ctx, "tracker.pull",
 		trace.WithAttributes(
 			attribute.String("sync.tracker", e.Tracker.DisplayName()),
@@ -268,7 +281,7 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions) (*PullStats, erro
 	var lastSync *time.Time
 	key := e.Tracker.ConfigPrefix() + ".last_sync"
 	if lastSyncStr, err := e.Store.GetConfig(ctx, key); err == nil && lastSyncStr != "" {
-		if t, err := time.Parse(time.RFC3339, lastSyncStr); err == nil {
+		if t, err := parseSyncTime(lastSyncStr); err == nil {
 			fetchOpts.Since = &t
 			lastSync = &t
 			stats.Incremental = true
@@ -276,13 +289,78 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions) (*PullStats, erro
 		}
 	}
 
-	// Fetch issues from external tracker
-	extIssues, err := e.Tracker.FetchIssues(ctx, fetchOpts)
+	localIssues, err := e.Store.SearchIssues(ctx, "", types.IssueFilter{})
 	if err != nil {
-		return nil, fmt.Errorf("fetching issues: %w", err)
+		return nil, fmt.Errorf("searching local issues: %w", err)
+	}
+	localByExternalIdentifier := make(map[string]*types.Issue, len(localIssues))
+	localByID := make(map[string]*types.Issue, len(localIssues))
+	for _, localIssue := range localIssues {
+		if localIssue == nil {
+			continue
+		}
+		if localID := strings.TrimSpace(localIssue.ID); localID != "" {
+			localByID[localID] = localIssue
+		}
+		if localIssue == nil || localIssue.ExternalRef == nil {
+			continue
+		}
+		localRef := strings.TrimSpace(*localIssue.ExternalRef)
+		if localRef == "" || !e.Tracker.IsExternalRef(localRef) {
+			continue
+		}
+		identifier := e.Tracker.ExtractIdentifier(localRef)
+		if identifier == "" {
+			continue
+		}
+		localByExternalIdentifier[identifier] = localIssue
 	}
 
-	e.msg("Fetched %d issues from %s", len(extIssues), e.Tracker.DisplayName())
+	// Fetch issues from external tracker
+	var extIssues []TrackerIssue
+	if len(opts.IssueIDs) > 0 {
+		// Selective pull: fetch only requested issues via FetchIssue()
+		prefix, _ := e.Store.GetConfig(ctx, "issue_prefix")
+		for _, id := range opts.IssueIDs {
+			var identifier string
+			if isBeadID(id, prefix) {
+				// Look up the local issue to find its external ref
+				if local, ok := localByID[id]; ok && local.ExternalRef != nil {
+					identifier = e.Tracker.ExtractIdentifier(*local.ExternalRef)
+				}
+				if identifier == "" {
+					e.warn("No external ref found for local issue %s, skipping pull", id)
+					stats.Skipped++
+					continue
+				}
+			} else {
+				identifier = id
+			}
+			extIssue, err := e.Tracker.FetchIssue(ctx, identifier)
+			if err != nil {
+				e.warn("Failed to fetch %s: %v", identifier, err)
+				stats.Errors++
+				continue
+			}
+			if extIssue == nil {
+				e.warn("Issue %s not found in %s", identifier, e.Tracker.DisplayName())
+				stats.Skipped++
+				continue
+			}
+			extIssues = append(extIssues, *extIssue)
+		}
+		stats.Candidates = len(extIssues)
+	} else {
+		// Bulk pull: fetch all issues matching filters
+		extIssues, err = e.Tracker.FetchIssues(ctx, fetchOpts)
+		if err != nil {
+			return nil, fmt.Errorf("fetching issues: %w", err)
+		}
+		stats.Candidates = len(extIssues)
+		if provider, ok := e.Tracker.(PullStatsProvider); ok {
+			stats.Queried, stats.Candidates = provider.LastPullStats()
+		}
+	}
 
 	mapper := e.Tracker.FieldMapper()
 	var pendingDeps []DependencyInfo
@@ -296,20 +374,25 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions) (*PullStats, erro
 			}
 		}
 
-		if opts.DryRun {
-			e.msg("[dry-run] Would import: %s - %s", extIssue.Identifier, extIssue.Title)
-			stats.Created++
-			continue
-		}
-
-		// Check if we already have this issue
+		// Check if we already have this issue before dry-run so preview stats
+		// distinguish creates from updates.
 		ref := e.Tracker.BuildExternalRef(&extIssue)
 		existing, _ := e.Store.GetIssueByExternalRef(ctx, ref)
-
+		if existing == nil && ref != "" {
+			identifier := e.Tracker.ExtractIdentifier(ref)
+			if identifier != "" {
+				existing = localByExternalIdentifier[identifier]
+			}
+		}
 		conv := mapper.IssueToBeads(&extIssue)
 		if conv == nil || conv.Issue == nil {
 			stats.Skipped++
 			continue
+		}
+		if existing == nil {
+			if localID := strings.TrimSpace(conv.Issue.ID); localID != "" {
+				existing = localByID[localID]
+			}
 		}
 
 		// TransformIssue hook: description formatting, field normalization
@@ -326,32 +409,44 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions) (*PullStats, erro
 			}
 		}
 
+		if existing != nil && pullIssueEqual(existing, conv.Issue, ref) {
+			stats.Skipped++
+			continue
+		}
+
+		if opts.DryRun {
+			if existing != nil {
+				e.msg("[dry-run] Would update local issue: %s - %s", extIssue.Identifier, ui.SanitizeForTerminal(extIssue.Title))
+				stats.Updated++
+			} else {
+				e.msg("[dry-run] Would import: %s - %s", extIssue.Identifier, ui.SanitizeForTerminal(extIssue.Title))
+				stats.Created++
+			}
+			continue
+		}
+
 		if existing != nil {
 			// Conflict-aware pull: skip updating issues that were locally
 			// modified since last sync. Conflict detection (Phase 2) will
 			// handle these per the configured resolution strategy.
 			// Without this guard, pull silently overwrites local changes
 			// before conflict detection can compare timestamps.
-			if lastSync != nil && existing.UpdatedAt.After(*lastSync) {
+			if lastSync != nil && existing.UpdatedAt.After(*lastSync) && !allowOverwriteIDs[existing.ID] {
 				stats.Skipped++
 				continue
 			}
 
-			// Update existing issue
-			updates := make(map[string]interface{})
-			updates["title"] = conv.Issue.Title
-			updates["description"] = conv.Issue.Description
-			updates["priority"] = conv.Issue.Priority
-			updates["status"] = string(conv.Issue.Status)
-
-			// Preserve metadata from tracker
-			if extIssue.Metadata != nil {
-				if raw, err := json.Marshal(extIssue.Metadata); err == nil {
-					updates["metadata"] = json.RawMessage(raw)
-				}
+			updates := buildPullIssueUpdates(existing, conv.Issue, ref)
+			if raw, ok := marshalTrackerMetadata(extIssue.Metadata); ok {
+				updates["metadata"] = raw
 			}
 
-			if err := e.Store.UpdateIssue(ctx, existing.ID, updates, e.Actor); err != nil {
+			if err := e.Store.RunInTransaction(ctx, fmt.Sprintf("bd: pull update %s", existing.ID), func(tx storage.Transaction) error {
+				if err := tx.UpdateIssue(ctx, existing.ID, updates, e.Actor); err != nil {
+					return err
+				}
+				return syncIssueLabels(ctx, tx, existing.ID, conv.Issue.Labels, e.Actor)
+			}); err != nil {
 				e.warn("Failed to update %s: %v", existing.ID, err)
 				continue
 			}
@@ -359,10 +454,8 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions) (*PullStats, erro
 		} else {
 			// Create new issue
 			conv.Issue.ExternalRef = strPtr(ref)
-			if extIssue.Metadata != nil {
-				if raw, err := json.Marshal(extIssue.Metadata); err == nil {
-					conv.Issue.Metadata = json.RawMessage(raw)
-				}
+			if raw, ok := marshalTrackerMetadata(extIssue.Metadata); ok {
+				conv.Issue.Metadata = raw
 			}
 			if err := e.Store.CreateIssue(ctx, conv.Issue, e.Actor); err != nil {
 				e.warn("Failed to create issue for %s: %v", extIssue.Identifier, err)
@@ -375,7 +468,8 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions) (*PullStats, erro
 	}
 
 	// Create dependencies after all issues are imported
-	e.createDependencies(ctx, pendingDeps)
+	depErrors := e.createDependencies(ctx, pendingDeps)
+	stats.Skipped += depErrors
 
 	span.SetAttributes(
 		attribute.Int("sync.created", stats.Created),
@@ -383,6 +477,128 @@ func (e *Engine) doPull(ctx context.Context, opts SyncOptions) (*PullStats, erro
 		attribute.Int("sync.skipped", stats.Skipped),
 	)
 	return stats, nil
+}
+
+func pullIssueEqual(local *types.Issue, remote *types.Issue, ref string) bool {
+	if local == nil || remote == nil {
+		return false
+	}
+	if local.Title != remote.Title ||
+		local.Description != remote.Description ||
+		local.Priority != remote.Priority ||
+		local.Status != remote.Status ||
+		local.IssueType != remote.IssueType ||
+		strings.TrimSpace(local.Assignee) != strings.TrimSpace(remote.Assignee) ||
+		!equalNormalizedStrings(local.Labels, remote.Labels) {
+		return false
+	}
+	localRef := ""
+	if local.ExternalRef != nil {
+		localRef = strings.TrimSpace(*local.ExternalRef)
+	}
+	return localRef == strings.TrimSpace(ref)
+}
+
+func buildPullIssueUpdates(existing *types.Issue, remote *types.Issue, ref string) map[string]interface{} {
+	updates := map[string]interface{}{
+		"title":       remote.Title,
+		"description": remote.Description,
+		"priority":    remote.Priority,
+		"status":      string(remote.Status),
+		"issue_type":  string(remote.IssueType),
+		"assignee":    remote.Assignee,
+	}
+	trimmedRef := strings.TrimSpace(ref)
+	if trimmedRef == "" {
+		return updates
+	}
+	if existing.ExternalRef == nil || strings.TrimSpace(*existing.ExternalRef) != trimmedRef {
+		updates["external_ref"] = trimmedRef
+	}
+	return updates
+}
+
+func marshalTrackerMetadata(metadata interface{}) (json.RawMessage, bool) {
+	if metadata == nil {
+		return nil, false
+	}
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, false
+	}
+	return json.RawMessage(raw), true
+}
+
+func syncIssueLabels(ctx context.Context, tx storage.Transaction, issueID string, desired []string, actor string) error {
+	current, err := tx.GetLabels(ctx, issueID)
+	if err != nil {
+		return err
+	}
+	currentSet := normalizedStringSet(current)
+	desiredSet := normalizedStringSet(desired)
+	for label := range currentSet {
+		if _, ok := desiredSet[label]; ok {
+			continue
+		}
+		if err := tx.RemoveLabel(ctx, issueID, label, actor); err != nil {
+			return err
+		}
+	}
+	for label := range desiredSet {
+		if _, ok := currentSet[label]; ok {
+			continue
+		}
+		if err := tx.AddLabel(ctx, issueID, label, actor); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func equalNormalizedStrings(a, b []string) bool {
+	an := normalizedStringSlice(a)
+	bn := normalizedStringSlice(b)
+	if len(an) != len(bn) {
+		return false
+	}
+	for i := range an {
+		if an[i] != bn[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizedStringSet(values []string) map[string]struct{} {
+	result := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		result[value] = struct{}{}
+	}
+	return result
+}
+
+func normalizedStringSlice(values []string) []string {
+	set := normalizedStringSet(values)
+	result := make([]string, 0, len(set))
+	for value := range set {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func parseSyncTime(value string) (time.Time, error) {
+	if value == "" {
+		return time.Time{}, fmt.Errorf("empty sync timestamp")
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed, nil
+	}
+	return time.Parse(time.RFC3339, value)
 }
 
 // doPush exports beads issues to the external tracker.
@@ -415,7 +631,81 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		return nil, fmt.Errorf("searching local issues: %w", err)
 	}
 
+	// Filter to specific IssueIDs if requested.
+	if issueIDSet := buildIssueIDSet(opts.IssueIDs); issueIDSet != nil {
+		filtered := make([]*types.Issue, 0, len(opts.IssueIDs))
+		for _, issue := range issues {
+			if issueIDSet[issue.ID] {
+				filtered = append(filtered, issue)
+			}
+		}
+		issues = filtered
+	}
+
+	// Build descendant set if --parent was specified.
+	var descendantSet map[string]bool
+	if opts.ParentID != "" {
+		descendantSet, err = e.buildDescendantSet(ctx, opts.ParentID)
+		if err != nil {
+			return nil, fmt.Errorf("resolving parent %s: %w", opts.ParentID, err)
+		}
+	}
+
+	if batchTracker, ok := e.Tracker.(BatchPushTracker); ok {
+		pushIssues, skipped := e.collectBatchPushIssues(issues, opts, descendantSet, skipIDs, forceIDs)
+		stats.Skipped += skipped
+		if len(pushIssues) == 0 {
+			return stats, nil
+		}
+		if opts.DryRun {
+			if dryRunner, ok := e.Tracker.(BatchPushDryRunner); ok {
+				batchResult, err := dryRunner.BatchPushDryRun(ctx, pushIssues, forceIDs)
+				if err != nil {
+					return nil, fmt.Errorf("previewing batch push: %w", err)
+				}
+				e.renderBatchDryRun(pushIssues, batchResult)
+				stats.Created += len(batchResult.Created)
+				stats.Updated += len(batchResult.Updated)
+				stats.Skipped += len(batchResult.Skipped)
+				stats.Errors += len(batchResult.Errors)
+				stats.Warnings = append(stats.Warnings, batchResult.Warnings...)
+				for _, item := range batchResult.Errors {
+					if item.LocalID != "" {
+						e.warn("Failed to preview push %s in %s: %s", item.LocalID, e.Tracker.DisplayName(), item.Message)
+						continue
+					}
+					e.warn("Failed to preview pushes in %s: %s", e.Tracker.DisplayName(), item.Message)
+				}
+				return stats, nil
+			}
+		} else {
+			batchResult, err := batchTracker.BatchPush(ctx, pushIssues, forceIDs)
+			if err != nil {
+				return nil, fmt.Errorf("batch pushing issues: %w", err)
+			}
+			e.applyBatchPushResult(ctx, batchResult)
+			stats.Created += len(batchResult.Created)
+			stats.Updated += len(batchResult.Updated)
+			stats.Skipped += len(batchResult.Skipped)
+			stats.Errors += len(batchResult.Errors)
+			stats.Warnings = append(stats.Warnings, batchResult.Warnings...)
+			for _, item := range batchResult.Errors {
+				if item.LocalID != "" {
+					e.warn("Failed to push %s in %s: %s", item.LocalID, e.Tracker.DisplayName(), item.Message)
+					continue
+				}
+				e.warn("Failed to push issues in %s: %s", e.Tracker.DisplayName(), item.Message)
+			}
+			return stats, nil
+		}
+	}
+
 	for _, issue := range issues {
+		// Limit to parent and its descendants if requested.
+		if descendantSet != nil && !descendantSet[issue.ID] {
+			stats.Skipped++
+			continue
+		}
 		// Skip filtered types/states/ephemeral
 		if !e.shouldPushIssue(issue, opts) {
 			stats.Skipped++
@@ -437,13 +727,14 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 		}
 
 		extRef := derefStr(issue.ExternalRef)
+		willCreate := extRef == "" || !e.Tracker.IsExternalRef(extRef)
 
 		if opts.DryRun {
-			if extRef == "" {
-				e.msg("[dry-run] Would create in %s: %s", e.Tracker.DisplayName(), issue.Title)
+			if willCreate {
+				e.msg("[dry-run] Would create in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(issue.Title))
 				stats.Created++
 			} else {
-				e.msg("[dry-run] Would update in %s: %s", e.Tracker.DisplayName(), issue.Title)
+				e.msg("[dry-run] Would update in %s: %s", e.Tracker.DisplayName(), ui.SanitizeForTerminal(issue.Title))
 				stats.Updated++
 			}
 			continue
@@ -457,7 +748,7 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			pushIssue = &copy
 		}
 
-		if extRef == "" || !e.Tracker.IsExternalRef(extRef) {
+		if willCreate {
 			// Create in external tracker
 			created, err := e.Tracker.CreateIssue(ctx, pushIssue)
 			if err != nil {
@@ -471,6 +762,9 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 			updates := map[string]interface{}{"external_ref": ref}
 			if err := e.Store.UpdateIssue(ctx, issue.ID, updates, e.Actor); err != nil {
 				e.warn("Failed to update external_ref for %s: %v", issue.ID, err)
+				stats.Errors++
+				// Note: issue WAS created externally, so we still count Created
+				// but also flag the error so the user knows the link is broken
 			}
 			stats.Created++
 		} else if !opts.CreateOnly || forceIDs[issue.ID] {
@@ -518,8 +812,84 @@ func (e *Engine) doPush(ctx context.Context, opts SyncOptions, skipIDs, forceIDs
 	return stats, nil
 }
 
+func (e *Engine) collectBatchPushIssues(issues []*types.Issue, opts SyncOptions, descendantSet, skipIDs, forceIDs map[string]bool) ([]*types.Issue, int) {
+	pushIssues := make([]*types.Issue, 0, len(issues))
+	skipped := 0
+	for _, issue := range issues {
+		if descendantSet != nil && !descendantSet[issue.ID] {
+			skipped++
+			continue
+		}
+		if !e.shouldPushIssue(issue, opts) {
+			skipped++
+			continue
+		}
+		if e.PushHooks != nil && e.PushHooks.ShouldPush != nil && !e.PushHooks.ShouldPush(issue) {
+			skipped++
+			continue
+		}
+		if skipIDs[issue.ID] {
+			skipped++
+			continue
+		}
+
+		extRef := derefStr(issue.ExternalRef)
+		willCreate := extRef == "" || !e.Tracker.IsExternalRef(extRef)
+		if !willCreate && opts.CreateOnly && !forceIDs[issue.ID] {
+			skipped++
+			continue
+		}
+		pushIssues = append(pushIssues, e.formatPushIssue(issue))
+	}
+	return pushIssues, skipped
+}
+
+func (e *Engine) formatPushIssue(issue *types.Issue) *types.Issue {
+	if e.PushHooks == nil || e.PushHooks.FormatDescription == nil {
+		return issue
+	}
+	copy := *issue
+	copy.Description = e.PushHooks.FormatDescription(issue)
+	return &copy
+}
+
+func (e *Engine) applyBatchPushResult(ctx context.Context, result *BatchPushResult) {
+	if result == nil {
+		return
+	}
+	items := append(append([]BatchPushItem(nil), result.Created...), result.Updated...)
+	for _, item := range items {
+		if item.LocalID == "" || strings.TrimSpace(item.ExternalRef) == "" {
+			continue
+		}
+		updates := map[string]interface{}{"external_ref": strings.TrimSpace(item.ExternalRef)}
+		if err := e.Store.UpdateIssue(ctx, item.LocalID, updates, e.Actor); err != nil {
+			e.warn("Failed to update external_ref for %s: %v", item.LocalID, err)
+		}
+	}
+}
+
+func (e *Engine) renderBatchDryRun(issues []*types.Issue, result *BatchPushResult) {
+	if result == nil {
+		return
+	}
+	titles := make(map[string]string, len(issues))
+	for _, issue := range issues {
+		if issue == nil || issue.ID == "" {
+			continue
+		}
+		titles[issue.ID] = issue.Title
+	}
+	for _, item := range result.Created {
+		e.msg("[dry-run] Would create in %s: %s", e.Tracker.DisplayName(), titles[item.LocalID])
+	}
+	for _, item := range result.Updated {
+		e.msg("[dry-run] Would update in %s: %s", e.Tracker.DisplayName(), titles[item.LocalID])
+	}
+}
+
 // resolveConflicts applies the configured conflict resolution strategy.
-func (e *Engine) resolveConflicts(ctx context.Context, opts SyncOptions, conflicts []Conflict, skipIDs, forceIDs map[string]bool) {
+func (e *Engine) resolveConflicts(opts SyncOptions, conflicts []Conflict, skipIDs, forceIDs, allowPullOverwriteIDs map[string]bool) {
 	for _, c := range conflicts {
 		switch opts.ConflictResolution {
 		case ConflictLocal:
@@ -528,7 +898,7 @@ func (e *Engine) resolveConflicts(ctx context.Context, opts SyncOptions, conflic
 
 		case ConflictExternal:
 			skipIDs[c.IssueID] = true
-			e.reimportIssue(ctx, c)
+			allowPullOverwriteIDs[c.IssueID] = true
 			e.msg("Conflict on %s: keeping external version", c.IssueID)
 
 		default: // ConflictTimestamp or unset
@@ -537,7 +907,7 @@ func (e *Engine) resolveConflicts(ctx context.Context, opts SyncOptions, conflic
 				e.msg("Conflict on %s: local is newer, pushing", c.IssueID)
 			} else {
 				skipIDs[c.IssueID] = true
-				e.reimportIssue(ctx, c)
+				allowPullOverwriteIDs[c.IssueID] = true
 				e.msg("Conflict on %s: external is newer, importing", c.IssueID)
 			}
 		}
@@ -575,18 +945,30 @@ func (e *Engine) reimportIssue(ctx context.Context, c Conflict) {
 }
 
 // createDependencies creates dependencies from the pending list, matching
-// external IDs to local issue IDs.
-func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) {
+// external IDs to local issue IDs. Returns the number of dependencies that
+// failed to resolve or create.
+func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) int {
 	if len(deps) == 0 {
-		return
+		return 0
 	}
 
+	errCount := 0
 	for _, dep := range deps {
-		fromIssue, _ := e.Store.GetIssueByExternalRef(ctx, dep.FromExternalID)
-		toIssue, _ := e.Store.GetIssueByExternalRef(ctx, dep.ToExternalID)
+		fromIssue, err := e.Store.GetIssueByExternalRef(ctx, dep.FromExternalID)
+		if err != nil {
+			e.warn("Failed to resolve dependency source %s: %v", dep.FromExternalID, err)
+			errCount++
+			continue
+		}
+		toIssue, err := e.Store.GetIssueByExternalRef(ctx, dep.ToExternalID)
+		if err != nil {
+			e.warn("Failed to resolve dependency target %s: %v", dep.ToExternalID, err)
+			errCount++
+			continue
+		}
 
 		if fromIssue == nil || toIssue == nil {
-			continue
+			continue // Not found (no error) — expected if issue wasn't imported
 		}
 
 		d := &types.Dependency{
@@ -596,8 +978,32 @@ func (e *Engine) createDependencies(ctx context.Context, deps []DependencyInfo) 
 		}
 		if err := e.Store.AddDependency(ctx, d, e.Actor); err != nil {
 			e.warn("Failed to create dependency %s -> %s: %v", fromIssue.ID, toIssue.ID, err)
+			errCount++
 		}
 	}
+	return errCount
+}
+
+// buildDescendantSet returns the set of issue IDs consisting of the given parent
+// and all its transitive descendants via parent-child dependencies.
+func (e *Engine) buildDescendantSet(ctx context.Context, parentID string) (map[string]bool, error) {
+	result := map[string]bool{parentID: true}
+	queue := []string{parentID}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		dependents, err := e.Store.GetDependentsWithMetadata(ctx, current)
+		if err != nil {
+			return nil, fmt.Errorf("getting dependents of %s: %w", current, err)
+		}
+		for _, dep := range dependents {
+			if dep.DependencyType == types.DepParentChild && !result[dep.Issue.ID] {
+				result[dep.Issue.ID] = true
+				queue = append(queue, dep.Issue.ID)
+			}
+		}
+	}
+	return result, nil
 }
 
 // shouldPushIssue checks if an issue should be included in push based on filters.
@@ -653,6 +1059,28 @@ func derefStr(s *string) string {
 	return *s
 }
 
+// isBeadID returns true if the given string looks like a local bead ID
+// (i.e. it starts with the configured prefix followed by a hyphen, like "bd-123").
+// External tracker refs (URLs, "EXT-1", etc.) will return false.
+func isBeadID(id, prefix string) bool {
+	if prefix == "" || id == "" {
+		return false
+	}
+	return strings.HasPrefix(id, prefix+"-")
+}
+
+// buildIssueIDSet converts a slice of IDs into a set for O(1) lookup.
+func buildIssueIDSet(ids []string) map[string]bool {
+	if len(ids) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
+}
+
 func (e *Engine) msg(format string, args ...interface{}) {
 	if e.OnMessage != nil {
 		e.OnMessage(fmt.Sprintf(format, args...))
@@ -660,7 +1088,9 @@ func (e *Engine) msg(format string, args ...interface{}) {
 }
 
 func (e *Engine) warn(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	e.warnings = append(e.warnings, msg)
 	if e.OnWarning != nil {
-		e.OnWarning(fmt.Sprintf(format, args...))
+		e.OnWarning(msg)
 	}
 }

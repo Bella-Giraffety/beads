@@ -121,6 +121,7 @@ func Initialize() error {
 	v.SetDefault("json", false)
 	v.SetDefault("events-export", false)
 	v.SetDefault("no-db", false)
+	v.SetDefault("no-hooks", false)
 	v.SetDefault("db", "")
 	v.SetDefault("actor", "")
 	v.SetDefault("issue-prefix", "")
@@ -143,7 +144,7 @@ func Initialize() error {
 	v.SetDefault("sync.require_confirmation_on_mass_delete", false)
 
 	// Federation configuration (optional Dolt remote)
-	v.SetDefault("federation.remote", "")      // e.g., dolthub://org/beads, gs://bucket/beads, s3://bucket/beads
+	v.SetDefault("federation.remote", "")      // e.g., dolthub://org/beads, gs://bucket/beads, s3://bucket/beads, az://account.blob.core.windows.net/container/beads
 	v.SetDefault("federation.sovereignty", "") // T1 | T2 | T3 | T4 (empty = no restriction)
 
 	// Push configuration defaults
@@ -185,6 +186,14 @@ func Initialize() error {
 	v.SetDefault("backup.interval", "15m")
 	v.SetDefault("backup.git-push", false)
 	v.SetDefault("backup.git-repo", "")
+
+	// Auto-export: write git-tracked JSONL after mutations for portability
+	// When no Dolt remote is configured, this is the primary way to share
+	// beads state (issues + memories) across machines via git.
+	v.SetDefault("export.auto", false)
+	v.SetDefault("export.interval", "60s")
+	v.SetDefault("export.path", "export.jsonl") // relative to .beads/
+	v.SetDefault("export.git-add", false)
 
 	// AI configuration defaults
 	v.SetDefault("ai.model", "claude-haiku-4-5-20251001")
@@ -299,6 +308,21 @@ func GetValueSource(key string) ConfigSource {
 	}
 
 	return SourceDefault
+}
+
+// EnvVarName returns the environment variable name that would override the given
+// config key, if one is set. Returns the BD_ or BEADS_ prefixed name, or empty
+// string if no env var is set for this key.
+func EnvVarName(key string) string {
+	envKey := "BD_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
+	if _, ok := os.LookupEnv(envKey); ok {
+		return envKey
+	}
+	beadsEnvKey := "BEADS_" + strings.ToUpper(strings.ReplaceAll(strings.ReplaceAll(key, "-", "_"), ".", "_"))
+	if _, ok := os.LookupEnv(beadsEnvKey); ok {
+		return beadsEnvKey
+	}
+	return ""
 }
 
 // CheckOverrides checks for configuration overrides and returns a list of detected overrides.
@@ -553,6 +577,15 @@ func AllSettings() map[string]interface{} {
 		return map[string]interface{}{}
 	}
 	return v.AllSettings()
+}
+
+// AllKeys returns all keys in the viper registry (defaults + config file + env).
+// Keys are returned in lowercase dot-notation (e.g., "federation.remote").
+func AllKeys() []string {
+	if v == nil {
+		return nil
+	}
+	return v.AllKeys()
 }
 
 // ConfigFileUsed returns the path to the config file that was loaded.

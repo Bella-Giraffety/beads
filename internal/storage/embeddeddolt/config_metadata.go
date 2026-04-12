@@ -1,11 +1,11 @@
-//go:build embeddeddolt
+//go:build cgo
 
 package embeddeddolt
 
 import (
 	"context"
 	"database/sql"
-	"strings"
+	"fmt"
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/storage"
@@ -15,7 +15,21 @@ import (
 
 func (s *EmbeddedDoltStore) SetConfig(ctx context.Context, key, value string) error {
 	return s.withConn(ctx, true, func(tx *sql.Tx) error {
-		return issueops.SetConfigInTx(ctx, tx, key, value)
+		if err := issueops.SetConfigInTx(ctx, tx, key, value); err != nil {
+			return err
+		}
+		// Sync normalized tables when config keys change
+		switch key {
+		case "status.custom":
+			if err := issueops.SyncCustomStatusesTable(ctx, tx, value); err != nil {
+				return fmt.Errorf("syncing custom_statuses table: %w", err)
+			}
+		case "types.custom":
+			if err := issueops.SyncCustomTypesTable(ctx, tx, value); err != nil {
+				return fmt.Errorf("syncing custom_types table: %w", err)
+			}
+		}
+		return nil
 	})
 }
 
@@ -59,31 +73,22 @@ func (s *EmbeddedDoltStore) SetMetadata(ctx context.Context, key, value string) 
 // to the wisps table. Reads from DB config "types.infra", falls back to YAML,
 // then to hardcoded defaults (agent, rig, role, message).
 func (s *EmbeddedDoltStore) GetInfraTypes(ctx context.Context) map[string]bool {
-	var typeList []string
-
-	value, err := s.GetConfig(ctx, "types.infra")
-	if err == nil && value != "" {
-		for _, t := range strings.Split(value, ",") {
-			t = strings.TrimSpace(t)
-			if t != "" {
-				typeList = append(typeList, t)
-			}
-		}
-	}
-
-	if len(typeList) == 0 {
+	var result map[string]bool
+	if err := s.withConn(ctx, false, func(tx *sql.Tx) error {
+		result = issueops.ResolveInfraTypesInTx(ctx, tx)
+		return nil
+	}); err != nil || result == nil {
+		// DB unavailable — fall back to YAML then defaults.
+		var typeList []string
 		if yamlTypes := config.GetInfraTypesFromYAML(); len(yamlTypes) > 0 {
 			typeList = yamlTypes
+		} else {
+			typeList = storage.DefaultInfraTypes()
 		}
-	}
-
-	if len(typeList) == 0 {
-		typeList = storage.DefaultInfraTypes()
-	}
-
-	result := make(map[string]bool, len(typeList))
-	for _, t := range typeList {
-		result[t] = true
+		result = make(map[string]bool, len(typeList))
+		for _, t := range typeList {
+			result[t] = true
+		}
 	}
 	return result
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -46,6 +47,13 @@ This is useful for agents executing molecules to see which steps can run next.`,
 			return
 		}
 
+		// Handle --explain flag (dependency-aware reasoning)
+		explain, _ := cmd.Flags().GetBool("explain")
+		if explain {
+			runReadyExplain(cmd)
+			return
+		}
+
 		limit, _ := cmd.Flags().GetInt("limit")
 		assignee, _ := cmd.Flags().GetString("assignee")
 		unassigned, _ := cmd.Flags().GetBool("unassigned")
@@ -61,7 +69,6 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		includeDeferred, _ := cmd.Flags().GetBool("include-deferred")
 		includeEphemeral, _ := cmd.Flags().GetBool("include-ephemeral")
 		excludeTypeStrs, _ := cmd.Flags().GetStringSlice("exclude-type")
-		rigOverride, _ := cmd.Flags().GetString("rig")
 		var molType *types.MolType
 		if molTypeStr != "" {
 			mt := types.MolType(molTypeStr)
@@ -153,26 +160,15 @@ This is useful for agents executing molecules to see which steps can run next.`,
 		// Direct mode
 		ctx := rootCtx
 
-		// Handle --rig flag: query a different rig's database
 		activeStore := store
-		if rigOverride != "" {
-			rigStore, err := openStoreForRig(ctx, rigOverride)
-			if err != nil {
-				FatalError("%v", err)
-			}
-			defer func() { _ = rigStore.Close() }()
-			activeStore = rigStore
-		} else {
-			// Keep ready/read behavior aligned with bd create routing decisions.
-			// Contributor auto-routing should read from the same target repo.
-			routedStore, routed, err := openRoutedReadStore(ctx, activeStore)
-			if err != nil {
-				FatalError("%v", err)
-			}
-			if routed {
-				defer func() { _ = routedStore.Close() }()
-				activeStore = routedStore
-			}
+		// Contributor auto-routing: read from the same target repo as bd create.
+		routedStore, routed, err := openRoutedReadStore(ctx, activeStore)
+		if err != nil {
+			FatalError("%v", err)
+		}
+		if routed {
+			defer func() { _ = routedStore.Close() }()
+			activeStore = routedStore
 		}
 
 		issues, err := activeStore.GetReadyWork(ctx, filter)
@@ -329,10 +325,8 @@ var blockedCmd = &cobra.Command{
 			if blockedBy == nil {
 				blockedBy = []string{}
 			}
-			// Resolve external refs to show real issue info (bd-k0pfm)
-			resolved := resolveBlockedByRefs(ctx, blockedBy)
 			fmt.Printf("  Blocked by %d open dependencies: %v\n",
-				issue.BlockedByCount, resolved)
+				issue.BlockedByCount, blockedBy)
 			fmt.Println()
 		}
 	},
@@ -407,6 +401,137 @@ func displayReadyList(issues []*types.Issue, parentEpicMap map[string]string) {
 	fmt.Printf("Ready: %d issues with no active blockers\n", len(issues))
 	fmt.Println()
 	fmt.Println("Status: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred")
+}
+
+// runReadyExplain shows dependency-aware reasoning for why issues are ready or blocked.
+func runReadyExplain(_ *cobra.Command) {
+	ctx := rootCtx
+
+	activeStore := store
+
+	// Get ready issues (no limit for explain mode — show everything)
+	filter := types.WorkFilter{
+		Status:     types.StatusOpen,
+		SortPolicy: types.SortPolicyPriority,
+	}
+	readyIssues, err := activeStore.GetReadyWork(ctx, filter)
+	if err != nil {
+		FatalErrorRespectJSON("%v", err)
+	}
+
+	// Get blocked issues
+	blockedIssues, err := activeStore.GetBlockedIssues(ctx, types.WorkFilter{})
+	if err != nil {
+		FatalErrorRespectJSON("%v", err)
+	}
+
+	// Get dependency records for ready issues to find resolved blockers
+	readyIDs := make([]string, len(readyIssues))
+	for i, issue := range readyIssues {
+		readyIDs[i] = issue.ID
+	}
+	depCounts, err := activeStore.GetDependencyCounts(ctx, readyIDs)
+	if err != nil {
+		debug.Logf("warning: failed to get dependency counts: %v", err)
+	}
+	allDeps, err := activeStore.GetDependencyRecordsForIssues(ctx, readyIDs)
+	if err != nil {
+		debug.Logf("warning: failed to get dependency records: %v", err)
+	}
+
+	// Detect cycles
+	cycles, err := activeStore.DetectCycles(ctx)
+	if err != nil {
+		debug.Logf("warning: failed to detect cycles: %v", err)
+	}
+
+	// Collect all blocker IDs to batch-fetch blocker details
+	allBlockerIDs := make(map[string]bool)
+	for _, bi := range blockedIssues {
+		for _, blockerID := range bi.BlockedBy {
+			allBlockerIDs[blockerID] = true
+		}
+	}
+	blockerIDList := make([]string, 0, len(allBlockerIDs))
+	for id := range allBlockerIDs {
+		blockerIDList = append(blockerIDList, id)
+	}
+
+	// Build ready items with explanations
+	blockerIssues, err := activeStore.GetIssuesByIDs(ctx, blockerIDList)
+	if err != nil {
+		debug.Logf("warning: failed to get blocker issues: %v", err)
+	}
+	blockerMap := make(map[string]*types.Issue, len(blockerIssues))
+	for _, issue := range blockerIssues {
+		blockerMap[issue.ID] = issue
+	}
+
+	explanation := types.BuildReadyExplanation(readyIssues, blockedIssues, depCounts, allDeps, blockerMap, cycles)
+
+	if jsonOutput {
+		outputJSON(explanation)
+		return
+	}
+
+	// Human-readable output
+	fmt.Printf("\n%s Ready Work Explanation\n\n", ui.RenderAccent("📊"))
+
+	// Ready section
+	if len(explanation.Ready) > 0 {
+		fmt.Printf("%s Ready (%d issues):\n\n", ui.RenderPass("●"), len(explanation.Ready))
+		for _, item := range explanation.Ready {
+			fmt.Printf("  %s [%s] %s\n",
+				ui.RenderID(item.ID),
+				ui.RenderPriority(item.Priority),
+				item.Title)
+			fmt.Printf("    Reason: %s\n", item.Reason)
+			if len(item.ResolvedBlockers) > 0 {
+				fmt.Printf("    Resolved blockers: %s\n", strings.Join(item.ResolvedBlockers, ", "))
+			}
+			if item.DependentCount > 0 {
+				fmt.Printf("    Unblocks: %d issue(s)\n", item.DependentCount)
+			}
+			fmt.Println()
+		}
+	} else {
+		fmt.Printf("%s No ready work\n\n", ui.RenderWarn("○"))
+	}
+
+	// Blocked section
+	if len(explanation.Blocked) > 0 {
+		fmt.Printf("%s Blocked (%d issues):\n\n", ui.RenderFail("●"), len(explanation.Blocked))
+		for _, item := range explanation.Blocked {
+			fmt.Printf("  %s [%s] %s\n",
+				ui.RenderID(item.ID),
+				ui.RenderPriority(item.Priority),
+				item.Title)
+			for _, blocker := range item.BlockedBy {
+				fmt.Printf("    ← blocked by %s: %s [%s]\n",
+					ui.RenderID(blocker.ID), blocker.Title, blocker.Status)
+			}
+			fmt.Println()
+		}
+	}
+
+	// Cycles section
+	if len(explanation.Cycles) > 0 {
+		fmt.Printf("%s Cycles detected (%d):\n\n", ui.RenderFail("⚠"), len(explanation.Cycles))
+		for _, cycle := range explanation.Cycles {
+			fmt.Printf("  %s → %s\n", strings.Join(cycle, " → "), cycle[0])
+		}
+		fmt.Println()
+	}
+
+	// Summary
+	fmt.Printf("%s Summary: %d ready, %d blocked",
+		ui.RenderMuted("─"),
+		explanation.Summary.TotalReady,
+		explanation.Summary.TotalBlocked)
+	if explanation.Summary.CycleCount > 0 {
+		fmt.Printf(", %d cycle(s)", explanation.Summary.CycleCount)
+	}
+	fmt.Printf("\n\n")
 }
 
 // runMoleculeReady shows ready steps within a specific molecule
@@ -552,7 +677,7 @@ func init() {
 	readyCmd.Flags().Bool("include-ephemeral", false, "Include ephemeral issues (wisps) in results")
 	readyCmd.Flags().Bool("gated", false, "Find molecules ready for gate-resume dispatch")
 	readyCmd.Flags().StringSlice("exclude-type", nil, "Exclude issue types from results (comma-separated or repeatable, e.g., --exclude-type=convoy,epic)")
-	readyCmd.Flags().String("rig", "", "Query a different rig's database (e.g., --rig my-project, --rig gt-, --rig gt)")
+	readyCmd.Flags().Bool("explain", false, "Show dependency-aware reasoning for why issues are ready or blocked")
 	// Metadata filtering (GH#1406)
 	readyCmd.Flags().StringArray("metadata-field", nil, "Filter by metadata field (key=value, repeatable)")
 	readyCmd.Flags().String("has-metadata-key", "", "Filter issues that have this metadata key set")

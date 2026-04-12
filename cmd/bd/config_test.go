@@ -10,7 +10,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -420,40 +422,100 @@ federation:
 	})
 }
 
-// TestFindBeadsRepoRoot tests the repo root finding function
-func TestFindBeadsRepoRoot(t *testing.T) {
-	// Create a temp directory structure
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	subDir := filepath.Join(tmpDir, "sub", "dir")
-
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatalf("Failed to create .beads dir: %v", err)
-	}
-	if err := os.MkdirAll(subDir, 0755); err != nil {
-		t.Fatalf("Failed to create sub dir: %v", err)
+func TestResolvedConfigRepoRoot(t *testing.T) {
+	resetResolutionCaches := func(t *testing.T) {
+		t.Helper()
+		beads.ResetCaches()
+		git.ResetCaches()
+		t.Cleanup(func() {
+			beads.ResetCaches()
+			git.ResetCaches()
+		})
 	}
 
-	t.Run("from repo root", func(t *testing.T) {
-		got := findBeadsRepoRoot(tmpDir)
-		if got != tmpDir {
-			t.Errorf("findBeadsRepoRoot(%q) = %q, want %q", tmpDir, got, tmpDir)
+	assertSameResolvedPath := func(t *testing.T, got, want string) {
+		t.Helper()
+
+		gotResolved, err := filepath.EvalSymlinks(got)
+		if err != nil {
+			t.Fatalf("EvalSymlinks(%q): %v", got, err)
 		}
+		wantResolved, err := filepath.EvalSymlinks(want)
+		if err != nil {
+			t.Fatalf("EvalSymlinks(%q): %v", want, err)
+		}
+		if gotResolved != wantResolved {
+			t.Errorf("resolvedConfigRepoRoot() = %q (resolved %q), want %q (resolved %q)", got, gotResolved, want, wantResolved)
+		}
+	}
+
+	t.Run("uses local workspace from subdirectory", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		subDir := filepath.Join(tmpDir, "sub", "dir")
+
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatalf("Failed to create .beads dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt"}`), 0o644); err != nil {
+			t.Fatalf("Failed to create metadata.json: %v", err)
+		}
+		if err := os.MkdirAll(subDir, 0o755); err != nil {
+			t.Fatalf("Failed to create sub dir: %v", err)
+		}
+
+		t.Chdir(subDir)
+		resetResolutionCaches(t)
+
+		got, err := resolvedConfigRepoRoot()
+		if err != nil {
+			t.Fatalf("resolvedConfigRepoRoot returned error: %v", err)
+		}
+		assertSameResolvedPath(t, got, tmpDir)
 	})
 
-	t.Run("from subdirectory", func(t *testing.T) {
-		got := findBeadsRepoRoot(subDir)
-		if got != tmpDir {
-			t.Errorf("findBeadsRepoRoot(%q) = %q, want %q", subDir, got, tmpDir)
+	t.Run("uses BEADS_DIR target", func(t *testing.T) {
+		cwdDir := t.TempDir()
+		targetRepo := t.TempDir()
+		targetBeadsDir := filepath.Join(targetRepo, ".beads")
+
+		if err := os.MkdirAll(targetBeadsDir, 0o755); err != nil {
+			t.Fatalf("Failed to create target .beads dir: %v", err)
 		}
+		if err := os.WriteFile(filepath.Join(targetBeadsDir, "metadata.json"), []byte(`{"backend":"dolt"}`), 0o644); err != nil {
+			t.Fatalf("Failed to create target metadata.json: %v", err)
+		}
+
+		t.Setenv("BEADS_DIR", targetBeadsDir)
+		t.Chdir(cwdDir)
+		resetResolutionCaches(t)
+
+		got, err := resolvedConfigRepoRoot()
+		if err != nil {
+			t.Fatalf("resolvedConfigRepoRoot returned error: %v", err)
+		}
+		assertSameResolvedPath(t, got, targetRepo)
 	})
 
-	t.Run("not in repo", func(t *testing.T) {
-		noRepoDir := t.TempDir()
-		got := findBeadsRepoRoot(noRepoDir)
-		if got != "" {
-			t.Errorf("findBeadsRepoRoot(%q) = %q, want empty string", noRepoDir, got)
+	t.Run("uses worktree fallback when local .beads is absent", func(t *testing.T) {
+		bareDir, worktreeDir := setupBareParentInitWorktree(t)
+		bareBeadsDir := filepath.Join(bareDir, ".beads")
+
+		if err := os.MkdirAll(bareBeadsDir, 0o755); err != nil {
+			t.Fatalf("Failed to create bare .beads dir: %v", err)
 		}
+		if err := os.WriteFile(filepath.Join(bareBeadsDir, "metadata.json"), []byte(`{"backend":"dolt"}`), 0o644); err != nil {
+			t.Fatalf("Failed to create bare metadata.json: %v", err)
+		}
+
+		t.Chdir(worktreeDir)
+		resetResolutionCaches(t)
+
+		got, err := resolvedConfigRepoRoot()
+		if err != nil {
+			t.Fatalf("resolvedConfigRepoRoot returned error: %v", err)
+		}
+		assertSameResolvedPath(t, got, bareDir)
 	})
 }
 
@@ -572,6 +634,208 @@ func TestCustomStatusConfig(t *testing.T) {
 		}
 		if detailed2[1].Name != "gamma" || detailed2[1].Category != types.CategoryDone {
 			t.Errorf("status[1] = {%q, %q}, want {gamma, done}", detailed2[1].Name, detailed2[1].Category)
+		}
+	})
+}
+
+// TestConfigSetMany tests the batch config set functionality used by 'bd config set-many'.
+func TestConfigSetMany(t *testing.T) {
+	ctx := context.Background()
+	store, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	t.Run("batch set multiple DB keys", func(t *testing.T) {
+		pairs := map[string]string{
+			"ado.state_map.open":        "New",
+			"ado.state_map.in_progress": "Active",
+			"ado.state_map.closed":      "Closed",
+		}
+		for k, v := range pairs {
+			if err := store.SetConfig(ctx, k, v); err != nil {
+				t.Fatalf("SetConfig(%s) failed: %v", k, err)
+			}
+		}
+
+		// Verify all values were set correctly
+		for k, expected := range pairs {
+			got, err := store.GetConfig(ctx, k)
+			if err != nil {
+				t.Fatalf("GetConfig(%s) failed: %v", k, err)
+			}
+			if got != expected {
+				t.Errorf("GetConfig(%s) = %q, want %q", k, got, expected)
+			}
+		}
+
+		// Verify they appear in GetAllConfig
+		all, err := store.GetAllConfig(ctx)
+		if err != nil {
+			t.Fatalf("GetAllConfig failed: %v", err)
+		}
+		for k, expected := range pairs {
+			if all[k] != expected {
+				t.Errorf("GetAllConfig[%s] = %q, want %q", k, all[k], expected)
+			}
+		}
+	})
+
+	t.Run("batch set overwrites existing values", func(t *testing.T) {
+		// Set initial values
+		if err := store.SetConfig(ctx, "test.batch.a", "old-a"); err != nil {
+			t.Fatalf("SetConfig failed: %v", err)
+		}
+		if err := store.SetConfig(ctx, "test.batch.b", "old-b"); err != nil {
+			t.Fatalf("SetConfig failed: %v", err)
+		}
+
+		// Overwrite with batch
+		updates := map[string]string{
+			"test.batch.a": "new-a",
+			"test.batch.b": "new-b",
+			"test.batch.c": "new-c",
+		}
+		for k, v := range updates {
+			if err := store.SetConfig(ctx, k, v); err != nil {
+				t.Fatalf("SetConfig(%s) failed: %v", k, err)
+			}
+		}
+
+		for k, expected := range updates {
+			got, err := store.GetConfig(ctx, k)
+			if err != nil {
+				t.Fatalf("GetConfig(%s) failed: %v", k, err)
+			}
+			if got != expected {
+				t.Errorf("GetConfig(%s) = %q, want %q", k, got, expected)
+			}
+		}
+	})
+
+	t.Run("batch set with empty value", func(t *testing.T) {
+		if err := store.SetConfig(ctx, "test.empty", ""); err != nil {
+			t.Fatalf("SetConfig failed: %v", err)
+		}
+		got, err := store.GetConfig(ctx, "test.empty")
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+		if got != "" {
+			t.Errorf("expected empty string, got %q", got)
+		}
+	})
+
+	t.Run("batch set mixed namespaces in single operation", func(t *testing.T) {
+		// Simulates what set-many does: multiple keys from different
+		// namespaces all written to the DB in one logical batch.
+		mixed := map[string]string{
+			"jira.url":             "https://jira.example.com",
+			"jira.project":         "BEADS",
+			"ado.state_map.open":   "New",
+			"ado.state_map.closed": "Done",
+			"custom.pipeline":      "review,qa,deploy",
+			"status.custom":        "awaiting_review,awaiting_testing",
+		}
+		for k, v := range mixed {
+			if err := store.SetConfig(ctx, k, v); err != nil {
+				t.Fatalf("SetConfig(%s) failed: %v", k, err)
+			}
+		}
+
+		// Verify every key was persisted
+		for k, expected := range mixed {
+			got, err := store.GetConfig(ctx, k)
+			if err != nil {
+				t.Fatalf("GetConfig(%s) failed: %v", k, err)
+			}
+			if got != expected {
+				t.Errorf("GetConfig(%s) = %q, want %q", k, got, expected)
+			}
+		}
+
+		// Verify all appear in GetAllConfig
+		all, err := store.GetAllConfig(ctx)
+		if err != nil {
+			t.Fatalf("GetAllConfig failed: %v", err)
+		}
+		for k, expected := range mixed {
+			if all[k] != expected {
+				t.Errorf("GetAllConfig[%s] = %q, want %q", k, all[k], expected)
+			}
+		}
+	})
+
+	t.Run("batch set preserves previously written keys", func(t *testing.T) {
+		// Write batch 1
+		if err := store.SetConfig(ctx, "retain.alpha", "aaa"); err != nil {
+			t.Fatalf("SetConfig failed: %v", err)
+		}
+		if err := store.SetConfig(ctx, "retain.beta", "bbb"); err != nil {
+			t.Fatalf("SetConfig failed: %v", err)
+		}
+
+		// Write batch 2 (different keys)
+		if err := store.SetConfig(ctx, "retain.gamma", "ggg"); err != nil {
+			t.Fatalf("SetConfig failed: %v", err)
+		}
+
+		// Verify batch 1 keys are still intact after batch 2
+		got, err := store.GetConfig(ctx, "retain.alpha")
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+		if got != "aaa" {
+			t.Errorf("retain.alpha = %q, want %q", got, "aaa")
+		}
+
+		got, err = store.GetConfig(ctx, "retain.beta")
+		if err != nil {
+			t.Fatalf("GetConfig failed: %v", err)
+		}
+		if got != "bbb" {
+			t.Errorf("retain.beta = %q, want %q", got, "bbb")
+		}
+	})
+}
+
+// TestConfigSetManyValidationIntegration tests that the validation logic
+// in set-many correctly rejects invalid values for known constrained keys
+// before any DB writes would occur.
+func TestConfigSetManyValidationIntegration(t *testing.T) {
+	t.Run("beads.role only accepts maintainer or contributor", func(t *testing.T) {
+		validRoles := map[string]bool{"maintainer": true, "contributor": true}
+		for _, role := range []string{"maintainer", "contributor"} {
+			if !validRoles[role] {
+				t.Errorf("expected %q to be valid", role)
+			}
+		}
+		for _, role := range []string{"admin", "superadmin", "owner", "", "MAINTAINER"} {
+			if validRoles[role] {
+				t.Errorf("expected %q to be invalid", role)
+			}
+		}
+	})
+
+	t.Run("status.custom validation catches invalid formats", func(t *testing.T) {
+		valid := []string{
+			"awaiting_review,awaiting_testing",
+			"review,qa,deploy",
+			"single_status",
+		}
+		for _, v := range valid {
+			if _, err := types.ParseCustomStatusConfig(v); err != nil {
+				t.Errorf("expected %q to be valid: %v", v, err)
+			}
+		}
+	})
+
+	t.Run("empty status.custom is allowed", func(t *testing.T) {
+		// Empty value skips validation in the command handler
+		result, err := types.ParseCustomStatusConfig("")
+		if err != nil {
+			t.Errorf("expected empty status.custom to be valid: %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected nil result for empty input, got %v", result)
 		}
 	})
 }

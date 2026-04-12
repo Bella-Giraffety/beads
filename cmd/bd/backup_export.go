@@ -13,35 +13,18 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 )
 
-// backupState tracks watermarks for incremental backup.
-type backupCounts struct {
-	Issues       int `json:"issues"`
-	Events       int `json:"events"`
-	Comments     int `json:"comments"`
-	Dependencies int `json:"dependencies"`
-	Labels       int `json:"labels"`
-	Config       int `json:"config"`
-}
-
+// backupState tracks watermarks for backup change detection.
 type backupState struct {
 	LastDoltCommit string    `json:"last_dolt_commit"`
 	Timestamp      time.Time `json:"timestamp"`
-	Counts         struct {
-		Issues       int `json:"issues"`
-		Events       int `json:"events"`
-		Comments     int `json:"comments"`
-		Dependencies int `json:"dependencies"`
-		Labels       int `json:"labels"`
-		Config       int `json:"config"`
-	} `json:"counts"`
 }
 
 // backupDir returns the backup directory path, creating it if needed.
 // When backup.git-repo is set to a valid git repo, returns a backup/ subdirectory
-// inside that repo. Otherwise falls back to .beads/backup/.
+// inside that repo. Otherwise it requires an active beads workspace and uses its
+// backup/ subdirectory.
 func backupDir() (string, error) {
 	gitRepo := config.GetString("backup.git-repo")
 	if gitRepo != "" {
@@ -50,7 +33,7 @@ func backupDir() (string, error) {
 			gitRepo = filepath.Join(home, gitRepo[2:])
 		}
 		if _, err := os.Stat(filepath.Join(gitRepo, ".git")); err != nil {
-			debug.Logf("backup: git-repo %s is not a git repo, falling back to .beads/backup\n", gitRepo)
+			fmt.Fprintf(os.Stderr, "Warning: backup.git-repo %s is not a git repo, falling back to .beads/backup\n", gitRepo)
 		} else {
 			dir := filepath.Join(gitRepo, "backup")
 			if err := os.MkdirAll(dir, 0700); err != nil {
@@ -61,7 +44,7 @@ func backupDir() (string, error) {
 	}
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
-		beadsDir = ".beads"
+		return "", fmt.Errorf("%s; %s", activeWorkspaceNotFoundError(), diagHint())
 	}
 	dir := filepath.Join(beadsDir, "backup")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -126,25 +109,8 @@ func atomicWriteFile(path string, data []byte) error {
 	return nil
 }
 
-// getBackupPrefix returns the issue prefix for the current project.
-// It checks the YAML config first (authoritative in shared-server mode),
-// then falls back to the database config table.
-func getBackupPrefix(ctx context.Context) string {
-	if yamlPrefix := config.GetString("issue-prefix"); yamlPrefix != "" {
-		return yamlPrefix
-	}
-	if store != nil {
-		if dbPrefix, err := store.GetConfig(ctx, "issue_prefix"); err == nil && dbPrefix != "" {
-			return dbPrefix
-		}
-	}
-	return ""
-}
-
-// runBackupExport exports all tables to JSONL files in .beads/backup/.
+// runBackupExport performs a Dolt-native backup to .beads/backup/.
 // Returns the updated state.
-// When a project prefix is configured, only issues belonging to this project
-// are exported. This prevents cross-project contamination on shared Dolt servers.
 func runBackupExport(ctx context.Context, force bool) (*backupState, error) {
 	dir, err := backupDir()
 	if err != nil {
@@ -168,26 +134,14 @@ func runBackupExport(ctx context.Context, force bool) (*backupState, error) {
 		}
 	}
 
-	// Resolve the project prefix for scoping.
-	// On shared Dolt servers, the database contains issues from ALL projects.
-	// We must filter by prefix to avoid exporting (and later restoring) foreign issues.
-	prefix := getBackupPrefix(ctx)
-
-	bs, ok := store.(storage.BackupStore)
+	bs, ok := storage.UnwrapStore(store).(storage.BackupStore)
 	if !ok {
 		return nil, fmt.Errorf("storage backend does not support backup operations")
 	}
 
-	counts, err := bs.BackupExportTables(ctx, dir, prefix)
-	if err != nil {
+	if err := bs.BackupDatabase(ctx, dir); err != nil {
 		return nil, err
 	}
-	state.Counts.Issues = counts.Issues
-	state.Counts.Events = counts.Events
-	state.Counts.Comments = counts.Comments
-	state.Counts.Dependencies = counts.Dependencies
-	state.Counts.Labels = counts.Labels
-	state.Counts.Config = counts.Config
 
 	// Update watermarks
 	currentCommit, err := store.GetCurrentCommit(ctx)
@@ -211,7 +165,3 @@ func truncateHash(h string) string {
 	}
 	return h
 }
-
-// normalizeValue delegates to the shared versioncontrolops implementation.
-// Kept as a package-level alias for test compatibility.
-var normalizeValue = versioncontrolops.NormalizeExportValue

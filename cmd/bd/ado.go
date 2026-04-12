@@ -19,10 +19,11 @@ import (
 
 // ADOConfig holds Azure DevOps connection configuration.
 type ADOConfig struct {
-	PAT     string // Personal access token
-	Org     string // Organization name
-	Project string // Project name
-	URL     string // Custom base URL (for on-prem)
+	PAT      string   // Personal access token
+	Org      string   // Organization name
+	Project  string   // Primary project name (backward compat)
+	Projects []string // All project names
+	URL      string   // Custom base URL (for on-prem)
 }
 
 // adoCmd is the root command for Azure DevOps operations.
@@ -32,10 +33,11 @@ var adoCmd = &cobra.Command{
 	Long: `Commands for syncing issues between beads and Azure DevOps.
 
 Configuration can be set via 'bd config' or environment variables:
-  ado.org / AZURE_DEVOPS_ORG         - Organization name
-  ado.project / AZURE_DEVOPS_PROJECT - Project name
-  ado.pat / AZURE_DEVOPS_PAT         - Personal access token
-  ado.url / AZURE_DEVOPS_URL         - Custom base URL (on-prem)`,
+  ado.org / AZURE_DEVOPS_ORG              - Organization name
+  ado.project / AZURE_DEVOPS_PROJECT      - Project name (single)
+  ado.projects / AZURE_DEVOPS_PROJECTS    - Project names (comma-separated)
+  ado.pat / AZURE_DEVOPS_PAT              - Personal access token
+  ado.url / AZURE_DEVOPS_URL              - Custom base URL (on-prem)`,
 }
 
 // adoSyncCmd synchronizes issues between beads and Azure DevOps.
@@ -50,8 +52,11 @@ By default, performs bidirectional sync:
 
 Use --pull-only or --push-only to limit direction.
 
-Pull filters (--area-path, --iteration-path, --types, --states) restrict
-which ADO work items are fetched. Filters can also be persisted via config:
+Filters (--area-path, --iteration-path, --types, --states) restrict
+which work items are synced. On pull, they limit the WIQL query. On push,
+--types and --states filter local beads before pushing to ADO. Use
+--no-create with push to skip creating new ADO work items (only update
+existing linked items). Filters can also be persisted via config:
   ado.filter.area_path, ado.filter.iteration_path,
   ado.filter.types, ado.filter.states
 CLI flags override config values when both are set.`,
@@ -148,7 +153,7 @@ func init() {
 
 	// Additional sync options
 	adoSyncCmd.Flags().BoolVar(&adoBootstrapMatch, "bootstrap-match", false, "Enable heuristic matching for first sync")
-	adoSyncCmd.Flags().BoolVar(&adoNoCreate, "no-create", false, "Pull-only mode: never create issues in ADO")
+	adoSyncCmd.Flags().BoolVar(&adoNoCreate, "no-create", false, "Never create new items in either direction (pull or push)")
 	adoSyncCmd.Flags().BoolVar(&adoReconcile, "reconcile", false, "Force reconciliation scan for deleted items")
 
 	// Pull filter flags (override config keys ado.filter.*)
@@ -156,6 +161,8 @@ func init() {
 	adoSyncCmd.Flags().StringVar(&adoFilterIterationPath, "iteration-path", "", "Filter to ADO iteration path (e.g., \"Project\\Sprint 1\")")
 	adoSyncCmd.Flags().StringVar(&adoFilterTypes, "types", "", "Filter to work item types, comma-separated (e.g., \"Bug,Task,User Story\")")
 	adoSyncCmd.Flags().StringVar(&adoFilterStates, "states", "", "Filter to ADO states, comma-separated (e.g., \"New,Active,Resolved\")")
+	adoSyncCmd.Flags().StringSlice("project", nil, "Project name(s) to sync (overrides configured project/projects)")
+	registerSelectiveSyncFlags(adoSyncCmd)
 
 	// Register ado command with root
 	rootCmd.AddCommand(adoCmd)
@@ -168,8 +175,15 @@ func getADOConfig() ADOConfig {
 
 	cfg.PAT = getADOConfigValue(ctx, "ado.pat")
 	cfg.Org = getADOConfigValue(ctx, "ado.org")
-	cfg.Project = getADOConfigValue(ctx, "ado.project")
 	cfg.URL = getADOConfigValue(ctx, "ado.url")
+
+	// Resolve projects from all sources.
+	pluralVal := getADOConfigValue(ctx, "ado.projects")
+	singularVal := getADOConfigValue(ctx, "ado.project")
+	cfg.Projects = tracker.ResolveProjectIDs(nil, pluralVal, singularVal)
+	if len(cfg.Projects) > 0 {
+		cfg.Project = cfg.Projects[0]
+	}
 
 	return cfg
 }
@@ -213,6 +227,8 @@ func adoConfigToEnvVar(key string) string {
 		return "AZURE_DEVOPS_ORG"
 	case "ado.project":
 		return "AZURE_DEVOPS_PROJECT"
+	case "ado.projects":
+		return "AZURE_DEVOPS_PROJECTS"
 	case "ado.url":
 		return "AZURE_DEVOPS_URL"
 	default:
@@ -223,13 +239,13 @@ func adoConfigToEnvVar(key string) string {
 // validateADOConfig checks that required configuration is present.
 func validateADOConfig(cfg ADOConfig) error {
 	if cfg.PAT == "" {
-		return fmt.Errorf("ado.pat not configured: set via 'bd config ado.pat <token>' or AZURE_DEVOPS_PAT env var")
+		return fmt.Errorf("ado.pat not configured: set via 'bd config set ado.pat <token>' or AZURE_DEVOPS_PAT env var")
 	}
 	if cfg.Org == "" && cfg.URL == "" {
-		return fmt.Errorf("ado.org not configured: set via 'bd config ado.org <org>' or AZURE_DEVOPS_ORG env var")
+		return fmt.Errorf("ado.org not configured: set via 'bd config set ado.org <org>' or AZURE_DEVOPS_ORG env var")
 	}
-	if cfg.Project == "" {
-		return fmt.Errorf("ado.project not configured: set via 'bd config ado.project <project>' or AZURE_DEVOPS_PROJECT env var")
+	if len(cfg.Projects) == 0 {
+		return fmt.Errorf("no ADO project configured\nSet via 'bd config set ado.project <project>'\nOr:  'bd config set ado.projects \"proj1,proj2\"'\nOr: AZURE_DEVOPS_PROJECT env var")
 	}
 	return nil
 }
@@ -328,12 +344,13 @@ func buildADOPullFilters(ctx context.Context, cmd *cobra.Command) *ado.PullFilte
 
 // adoStatusResult holds the JSON output for the ado status command.
 type adoStatusResult struct {
-	Org        string `json:"org"`
-	Project    string `json:"project"`
-	HasToken   bool   `json:"has_token"`
-	URL        string `json:"url,omitempty"`
-	Configured bool   `json:"configured"`
-	Error      string `json:"error,omitempty"`
+	Org        string   `json:"org"`
+	Project    string   `json:"project"`
+	Projects   []string `json:"projects,omitempty"`
+	HasToken   bool     `json:"has_token"`
+	URL        string   `json:"url,omitempty"`
+	Configured bool     `json:"configured"`
+	Error      string   `json:"error,omitempty"`
 }
 
 // runADOStatus implements the ado status command.
@@ -344,6 +361,7 @@ func runADOStatus(cmd *cobra.Command, _ []string) error {
 		result := adoStatusResult{
 			Org:      cfg.Org,
 			Project:  cfg.Project,
+			Projects: cfg.Projects,
 			HasToken: cfg.PAT != "",
 			URL:      cfg.URL,
 		}
@@ -361,7 +379,11 @@ func runADOStatus(cmd *cobra.Command, _ []string) error {
 	_, _ = fmt.Fprintln(out, "Azure DevOps Configuration")
 	_, _ = fmt.Fprintln(out, "==========================")
 	_, _ = fmt.Fprintf(out, "Organization: %s\n", cfg.Org)
-	_, _ = fmt.Fprintf(out, "Project:      %s\n", cfg.Project)
+	if len(cfg.Projects) <= 1 {
+		_, _ = fmt.Fprintf(out, "Project:      %s\n", cfg.Project)
+	} else {
+		_, _ = fmt.Fprintf(out, "Projects:     %s (%d projects)\n", strings.Join(cfg.Projects, ", "), len(cfg.Projects))
+	}
 	_, _ = fmt.Fprintf(out, "PAT:          %s\n", maskADOToken(cfg.PAT))
 	if cfg.URL != "" {
 		_, _ = fmt.Fprintf(out, "Base URL:     %s\n", cfg.URL)
@@ -382,10 +404,10 @@ func runADOStatus(cmd *cobra.Command, _ []string) error {
 func runADOProjects(cmd *cobra.Command, _ []string) error {
 	cfg := getADOConfig()
 	if cfg.PAT == "" {
-		return fmt.Errorf("ado.pat not configured: set via 'bd config ado.pat <token>' or AZURE_DEVOPS_PAT env var")
+		return fmt.Errorf("ado.pat not configured: set via 'bd config set ado.pat <token>' or AZURE_DEVOPS_PAT env var")
 	}
 	if cfg.Org == "" && cfg.URL == "" {
-		return fmt.Errorf("ado.org not configured: set via 'bd config ado.org <org>' or AZURE_DEVOPS_ORG env var")
+		return fmt.Errorf("ado.org not configured: set via 'bd config set ado.org <org>' or AZURE_DEVOPS_ORG env var")
 	}
 
 	out := cmd.OutOrStdout()
@@ -471,6 +493,10 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 
 	// Create and initialize the ADO tracker
 	at := &ado.Tracker{}
+	cliProjects, _ := cmd.Flags().GetStringSlice("project")
+	if len(cliProjects) > 0 {
+		at.SetProjects(tracker.DeduplicateStrings(cliProjects))
+	}
 	if err := at.Init(ctx, store); err != nil {
 		return fmt.Errorf("initializing Azure DevOps tracker: %w", err)
 	}
@@ -499,6 +525,9 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 	var bootstrapMatched int
 	engine.PullHooks = buildADOPullHooks(ctx, at, adoBootstrapMatch, adoNoCreate, &bootstrapMatched, engine.OnWarning)
 
+	// Set up ADO-specific push hooks (type/state/no-create filtering for push)
+	engine.PushHooks = buildADOPushHooks(at.FieldMapper(), at.IsExternalRef, filters, adoNoCreate)
+
 	// Build sync options from CLI flags
 	pull := !adoSyncPushOnly
 	push := !adoSyncPullOnly
@@ -507,6 +536,10 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 		Pull:   pull,
 		Push:   push,
 		DryRun: adoSyncDryRun,
+	}
+
+	if err := applySelectiveSyncFlags(cmd, &opts, push); err != nil {
+		return err
 	}
 
 	// Map conflict resolution
@@ -669,6 +702,13 @@ func runADOSync(cmd *cobra.Command, _ []string) error {
 	if adoSyncDryRun {
 		_, _ = fmt.Fprintln(out)
 		_, _ = fmt.Fprintln(out, "Run without --dry-run to apply changes")
+	}
+
+	// Embedded mode: flush Dolt commit after sync writes.
+	if isEmbeddedMode() && !adoSyncDryRun && store != nil {
+		if _, commitErr := store.CommitPending(rootCtx, actor); commitErr != nil {
+			return fmt.Errorf("failed to commit: %w", commitErr)
+		}
 	}
 
 	return nil
@@ -851,4 +891,51 @@ func buildADOPullHooks(ctx context.Context, at *ado.Tracker, bootstrapMatch, noC
 	}
 
 	return hooks
+}
+
+// buildADOPushHooks creates PushHooks for ADO-specific push filtering.
+// When --types or --states are set, local beads are filtered before pushing
+// to ADO by mapping the ADO filter values to beads types/statuses.
+// When noCreate is true, only issues already linked to ADO work items
+// are pushed (no new work items are created).
+func buildADOPushHooks(mapper tracker.FieldMapper, isExternalRef func(string) bool, filters *ado.PullFilters, noCreate bool) *tracker.PushHooks {
+	var allowedTypes map[types.IssueType]bool
+	var allowedStatuses map[types.Status]bool
+
+	if filters != nil && len(filters.WorkItemTypes) > 0 {
+		allowedTypes = make(map[types.IssueType]bool, len(filters.WorkItemTypes))
+		for _, adoType := range filters.WorkItemTypes {
+			beadsType := mapper.TypeToBeads(adoType)
+			allowedTypes[beadsType] = true
+		}
+	}
+
+	if filters != nil && len(filters.States) > 0 {
+		allowedStatuses = make(map[types.Status]bool, len(filters.States))
+		for _, adoState := range filters.States {
+			beadsStatus := mapper.StatusToBeads(adoState)
+			allowedStatuses[beadsStatus] = true
+		}
+	}
+
+	if allowedTypes == nil && allowedStatuses == nil && !noCreate {
+		return nil
+	}
+
+	return &tracker.PushHooks{
+		ShouldPush: func(issue *types.Issue) bool {
+			if allowedTypes != nil && !allowedTypes[issue.IssueType] {
+				return false
+			}
+			if allowedStatuses != nil && !allowedStatuses[issue.Status] {
+				return false
+			}
+			if noCreate {
+				if issue.ExternalRef == nil || *issue.ExternalRef == "" || !isExternalRef(*issue.ExternalRef) {
+					return false
+				}
+			}
+			return true
+		},
+	}
 }

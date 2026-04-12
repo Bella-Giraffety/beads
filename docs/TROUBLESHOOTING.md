@@ -309,8 +309,9 @@ Another bd process is accessing the database. Solutions:
 ps aux | grep bd
 kill <pid>
 
-# Remove a stale lock file
-rm .beads/dolt/.dolt/lock
+# WARNING: Do NOT remove files inside .dolt/ directories (including noms/LOCK).
+# These are Dolt-internal files — removing them WILL cause unrecoverable
+# data corruption. Dolt manages these files itself.
 
 # For server mode: restart the Dolt server
 # (server mode handles concurrent access natively)
@@ -447,10 +448,8 @@ For **physical database corruption** (disk failures, power loss, filesystem erro
 mv .beads/dolt .beads/dolt.backup
 bd init
 bd dolt pull    # Pull from Dolt remote if configured
-# Or restore from a local backup snapshot:
-# bd backup restore
-# Or fetch one from a backup branch:
-# bd backup fetch-git
+# Or restore from a backup:
+# bd backup restore [path] --force
 ```
 
 For **logical consistency issues** (ID collisions from branch merges, parallel workers):
@@ -674,7 +673,7 @@ bd dolt push
 bd dolt pull
 
 # Check sync configuration
-bd config get sync.git-remote
+bd config get sync.remote
 ```
 
 ## Ready Work and Dependencies

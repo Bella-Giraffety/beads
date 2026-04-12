@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
-	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -185,6 +184,16 @@ Examples:
   bd doctor --migration=post   # Validate Dolt migration completed
   bd doctor --migration=pre --json  # Machine-parseable migration validation`,
 	Run: func(cmd *cobra.Command, args []string) {
+		if isEmbeddedMode() {
+			fmt.Fprintln(os.Stderr, "Note: 'bd doctor' is not yet supported in embedded mode.")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "For embedded mode troubleshooting:")
+			fmt.Fprintln(os.Stderr, "  • Verify database exists:  ls -la .beads/embeddeddolt/")
+			fmt.Fprintln(os.Stderr, "  • Check bd version:        bd version")
+			fmt.Fprintln(os.Stderr, "  • Reinitialize if needed:  bd init --force")
+			fmt.Fprintln(os.Stderr, "  • Switch to server mode:   bd init --server")
+			os.Exit(0)
+		}
 		// Use global jsonOutput set by PersistentPreRun
 
 		// Determine path to check
@@ -206,12 +215,12 @@ Examples:
 		}
 
 		// Guardrail: never run mutating bd doctor fix from orchestrator workspace root.
-		// Town-level repair must go through `gt doctor --fix` because workspace roots
-		// have additional invariants beyond beads-only repos.
+		// Workspace roots have additional invariants beyond single-project repos;
+		// repairs should go through the orchestrator's own doctor command.
 		if doctorFix && isOrchestratorRoot(absPath) {
 			FatalErrorWithHint(
 				"refusing to run 'bd doctor --fix' at orchestrator workspace root",
-				"Use 'gt doctor --fix' from workspace root, or run 'bd doctor --fix' inside a specific rig clone (e.g. <rig>/mayor/rig)",
+				"Run the orchestrator's doctor command from workspace root, or run 'bd doctor --fix' inside a specific project clone",
 			)
 		}
 
@@ -274,12 +283,7 @@ Examples:
 		if doctorDryRun {
 			previewFixes(result)
 		} else if doctorFix {
-			// Release any Dolt locks left by diagnostics before applying fixes.
-			releaseDiagnosticLocks(absPath)
 			applyFixes(result)
-			// Re-run diagnostics to verify fixes were applied correctly.
-			// Release any locks that may have been left by the fix phase.
-			releaseDiagnosticLocks(absPath)
 			fmt.Println("\nVerifying fixes...")
 			result = runDiagnostics(absPath)
 		}
@@ -334,37 +338,8 @@ func init() {
 	doctorCmd.Flags().BoolVar(&doctorAgent, "agent", false, "Agent-facing diagnostic mode: rich context for AI agents (ZFC-compliant)")
 }
 
-// releaseDiagnosticLocks removes stale noms LOCK files that the diagnostics
-// phase may have left behind. CloseWithTimeout can leave goroutines (and
-// their LOCK files) behind when it times out.
-func releaseDiagnosticLocks(path string) {
-	beadsDir := filepath.Join(path, ".beads")
-	beadsDir = beads.FollowRedirect(beadsDir)
-
-	cfg, err := configfile.Load(beadsDir)
-	if err != nil || cfg == nil {
-		return // Can't determine config, skip cleanup
-	}
-
-	// Only clean up for Dolt backend.
-	if cfg.GetBackend() != configfile.BackendDolt {
-		return
-	}
-
-	doltPath := cfg.DatabasePath(beadsDir)
-	entries, err := os.ReadDir(doltPath)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		nomsLock := filepath.Join(doltPath, entry.Name(), ".dolt", "noms", "LOCK")
-		if _, err := os.Stat(nomsLock); err == nil {
-			_ = os.Remove(nomsLock)
-		}
-	}
+func shouldSkipDoctorNetworkChecks() bool {
+	return jsonOutput || !ui.IsTerminal()
 }
 
 func runDiagnostics(path string) doctorResult {
@@ -376,7 +351,8 @@ func runDiagnostics(path string) doctorResult {
 
 	// Auto-detect orchestrator mode: routes.jsonl is only created by orchestrator workspaces
 	if !doctorOrchestrator {
-		routesFile := filepath.Join(path, ".beads", "routes.jsonl")
+		resolvedBeadsDir := doctor.ResolveBeadsDirForRepo(path)
+		routesFile := filepath.Join(resolvedBeadsDir, "routes.jsonl")
 		if _, err := os.Stat(routesFile); err == nil {
 			doctorOrchestrator = true
 		}
@@ -440,12 +416,6 @@ func runDiagnostics(path string) doctorResult {
 			Category: doctor.CategoryCore,
 		})
 	}
-
-	// GH#1981: Run lock health check BEFORE any checks that open embedded
-	// Dolt databases. Earlier checks (CheckDatabaseVersion, CheckSchemaCompatibility,
-	// etc.) create noms LOCK files via flock(); if CheckLockHealth runs after them,
-	// it detects those same-process locks as "held by another process" (false positive).
-	earlyLockCheck := doctor.CheckLockHealth(path)
 
 	// bd-jgxi: Auto-migrate database version before checking it.
 	// Since doctor skips PersistentPreRun DB init (it's in noDbCommands),
@@ -514,13 +484,22 @@ func runDiagnostics(path string) doctorResult {
 		result.OverallOK = false
 	}
 
-	// Check 4: CLI version (GitHub)
-	versionCheck := convertWithCategory(doctor.CheckCLIVersion(Version), doctor.CategoryCore)
+	// Network-based update checks are skipped in machine-readable and other
+	// non-interactive contexts so doctor remains deterministic under wrappers.
+	versionCheckFn := doctor.CheckCLIVersion
+	pluginCheckFn := doctor.CheckClaudePlugin
+	if shouldSkipDoctorNetworkChecks() {
+		versionCheckFn = doctor.CheckCLIVersionLocalOnly
+		pluginCheckFn = doctor.CheckClaudePluginLocalOnly
+	}
+
+	// Check 4: CLI version
+	versionCheck := convertWithCategory(versionCheckFn(Version), doctor.CategoryCore)
 	result.Checks = append(result.Checks, versionCheck)
 	// Don't fail overall check for outdated CLI, just warn
 
 	// Check 4.5: Claude plugin version (if running in Claude Code)
-	pluginCheck := convertWithCategory(doctor.CheckClaudePlugin(), doctor.CategoryIntegration)
+	pluginCheck := convertWithCategory(pluginCheckFn(), doctor.CategoryIntegration)
 	result.Checks = append(result.Checks, pluginCheck)
 	// Don't fail overall check for outdated plugin, just warn
 
@@ -560,15 +539,20 @@ func runDiagnostics(path string) doctorResult {
 		result.OverallOK = false
 	}
 
+	// Check 7e2: Stale circuit breaker files
+	circuitCheck := convertDoctorCheck(doctor.CheckCircuitBreaker())
+	result.Checks = append(result.Checks, circuitCheck)
+	if circuitCheck.Status == statusWarning || circuitCheck.Status == statusError {
+		result.OverallOK = false
+	}
+
 	// Check 7f: Remote consistency (SQL vs CLI)
 	remoteCheck := convertWithCategory(doctor.CheckRemoteConsistency(path), doctor.CategoryData)
 	result.Checks = append(result.Checks, remoteCheck)
 	// Don't fail overall for remote discrepancies, just warn
 
 	// Dolt health checks (connection, schema, issue count, status).
-	// GH#1981: Pass the pre-computed lock check (run before any embedded Dolt
-	// opens) to avoid false positives from doctor's own noms LOCK files.
-	for _, dc := range doctor.RunDoltHealthChecksWithLock(path, earlyLockCheck) {
+	for _, dc := range doctor.RunDoltHealthChecks(path) {
 		result.Checks = append(result.Checks, convertDoctorCheck(dc))
 	}
 
@@ -804,10 +788,13 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, classicArtifactsCheck)
 	// Don't fail overall check for classic artifacts, just warn
 
-	// Check 36: Embedded mode concurrency issues (GH#2086)
-	concurrencyCheck := convertWithCategory(doctor.CheckEmbeddedModeConcurrency(path), doctor.CategoryRuntime)
-	result.Checks = append(result.Checks, concurrencyCheck)
-	// Don't fail overall — this is a recommendation, not a broken state
+	// Check 34: Linux btrfs NoCOW on .beads/ (GH nocow-beads-dolt-init)
+	// Warns when the dolt data directory sits on btrfs without FS_NOCOW_FL,
+	// which causes kworker thrashing on the hot append-only write path. Safe
+	// no-op on non-Linux and non-btrfs filesystems.
+	btrfsNoCowCheck := convertDoctorCheck(doctor.CheckBtrfsNoCOW(path))
+	result.Checks = append(result.Checks, btrfsNoCowCheck)
+	// Don't fail overall check for btrfs NoCOW, just warn
 
 	// GH#1095: Filter out suppressed checks (doctor.suppress.<slug> = true)
 	suppressed := doctor.GetSuppressedChecksWithStore(sharedStore)

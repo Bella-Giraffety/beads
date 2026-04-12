@@ -35,12 +35,26 @@ const (
 	MaxPages = 1000
 )
 
+// IssueFilter holds optional filters for fetching issues.
+// All fields are optional; zero values mean "no filter".
+type IssueFilter struct {
+	Labels    string // Comma-separated label names (AND logic)
+	ProjectID int    // Filter to issues from this project (client-side, group mode only)
+	Milestone string // Milestone title
+	Assignee  string // Assignee username
+}
+
 // Client provides methods to interact with the GitLab REST API.
 type Client struct {
 	Token      string       // GitLab personal access token or OAuth token
 	BaseURL    string       // GitLab instance URL (e.g., "https://gitlab.com/api/v4")
 	ProjectID  string       // Project ID or URL-encoded path (e.g., "group/project")
+	GroupID    string       // Optional group ID or path for group-level issue fetching
 	HTTPClient *http.Client // Optional custom HTTP client
+
+	// taskTypeID caches the GraphQL GID for the "Task" work item type.
+	// Populated lazily on first call to getTaskWorkItemTypeID.
+	taskTypeID string
 }
 
 // Issue represents an issue from the GitLab API.
@@ -68,6 +82,10 @@ type Issue struct {
 
 	// Links contains related URLs (populated in some API responses)
 	Links *IssueLinks `json:"links,omitempty"`
+
+	// IssueLinksData holds related issue links fetched via the /issues/:iid/links API.
+	// Not part of the standard issue response; populated separately during sync.
+	IssueLinksData []IssueLink `json:"-"`
 }
 
 // IssueLinks contains related URLs for an issue.

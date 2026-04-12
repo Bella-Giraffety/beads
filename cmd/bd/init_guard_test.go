@@ -14,56 +14,53 @@ func TestInitGuardServerMessage(t *testing.T) {
 		host           string
 		port           int
 		prefix         string
-		syncGitRemote  string
+		syncRemote     string
 		wantContains   []string
 		wantNotContain []string
 	}{
-		"DB missing, no sync.git-remote configured (FR-010, FR-011)": {
-			dbName:        "acf_beads",
-			host:          "127.0.0.1",
-			port:          3309,
-			prefix:        "acf",
-			syncGitRemote: "",
+		"DB missing, no sync.remote configured (FR-010, FR-011)": {
+			dbName:     "acf_beads",
+			host:       "127.0.0.1",
+			port:       3309,
+			prefix:     "acf",
+			syncRemote: "",
 			wantContains: []string{
 				`"acf_beads"`,
 				"127.0.0.1:3309",
 				"not found on server",
-				"server is running but this database hasn't been created yet",
 				"bd doctor",
 				"bd dolt status",
-				"bd init --prefix acf",
-				"set sync.git-remote",
+				"bd bootstrap",
+				"set sync.remote",
 				".beads/config.yaml",
 				"Aborting",
 				"--force destroys ALL existing issues",
 			},
 			wantNotContain: []string{
-				"sync.git-remote is configured",
+				"sync.remote is configured",
 				// GH#2363: must NOT suggest --force as the primary action
 				"bd init --force --prefix",
 			},
 		},
-		"DB missing, sync.git-remote IS configured (FR-010, FR-011)": {
-			dbName:        "beads_kc",
-			host:          "192.168.1.50",
-			port:          3307,
-			prefix:        "kc",
-			syncGitRemote: "https://doltremoteapi.dolthub.com/myorg/beads",
+		"DB missing, sync.remote IS configured (FR-010, FR-011)": {
+			dbName:     "beads_kc",
+			host:       "192.168.1.50",
+			port:       3307,
+			prefix:     "kc",
+			syncRemote: "https://doltremoteapi.dolthub.com/myorg/beads",
 			wantContains: []string{
 				`"beads_kc"`,
 				"192.168.1.50:3307",
 				"not found on server",
-				"server is running but this database hasn't been created yet",
 				"bd doctor",
 				"bd dolt status",
-				"bd init --prefix kc",
-				"sync.git-remote is configured",
+				"bd bootstrap",
+				"sync.remote is configured",
 				"https://doltremoteapi.dolthub.com/myorg/beads",
-				"existing data is preserved",
 				"--force destroys ALL existing issues",
 			},
 			wantNotContain: []string{
-				"set sync.git-remote",
+				"set sync.remote",
 				// GH#2363: must NOT suggest --force as the primary action
 				"bd init --force --prefix",
 				"bd init --force to bootstrap",
@@ -73,7 +70,7 @@ func TestInitGuardServerMessage(t *testing.T) {
 
 	for name, tt := range tests {
 		t.Run(name, func(t *testing.T) {
-			err := initGuardServerMessage(tt.dbName, tt.host, tt.port, tt.prefix, tt.syncGitRemote)
+			err := initGuardServerMessage(tt.dbName, tt.host, tt.port, tt.prefix, tt.syncRemote)
 			if err == nil {
 				t.Fatal("expected non-nil error")
 			}
@@ -124,6 +121,9 @@ func TestInitGuardDBCheck_ExistsPath(t *testing.T) {
 		if !strings.Contains(err.Error(), "not found on server") {
 			t.Errorf("expected 'not found on server' in message, got:\n%s", err.Error())
 		}
+		if !strings.Contains(err.Error(), "bd bootstrap") {
+			t.Errorf("expected bootstrap-first recovery guidance, got:\n%s", err.Error())
+		}
 	})
 }
 
@@ -131,7 +131,7 @@ func TestInitGuardDBCheck_ServerUnreachable(t *testing.T) {
 	// FR-030: When server is unreachable, should return Reachable=false
 	// so caller falls through to existing error path without panic.
 
-	result := checkDatabaseOnServer("127.0.0.1", 1, "root", "", "nonexistent_db")
+	result := checkDatabaseOnServer("127.0.0.1", 1, "root", "", "nonexistent_db", false)
 	if result.Reachable {
 		t.Fatal("expected Reachable=false for connection refused")
 	}
@@ -147,6 +147,11 @@ func TestInitGuard_FreshCloneWithMetadataJSON(t *testing.T) {
 	// as a fresh clone and allow init to proceed.
 
 	t.Run("server_mode_metadata_no_dolt_dir_allows_init", func(t *testing.T) {
+		// Switch to server mode for this subtest
+		oldServerMode := serverMode
+		serverMode = true
+		defer func() { serverMode = oldServerMode }()
+
 		tmpDir := t.TempDir()
 		beadsDir := filepath.Join(tmpDir, ".beads")
 		if err := os.MkdirAll(beadsDir, 0755); err != nil {
@@ -176,6 +181,11 @@ func TestInitGuard_FreshCloneWithMetadataJSON(t *testing.T) {
 	})
 
 	t.Run("server_mode_with_dolt_dir_blocks_init", func(t *testing.T) {
+		// Switch to server mode for this subtest
+		oldServerMode := serverMode
+		serverMode = true
+		defer func() { serverMode = oldServerMode }()
+
 		tmpDir := t.TempDir()
 		beadsDir := filepath.Join(tmpDir, ".beads")
 		if err := os.MkdirAll(beadsDir, 0755); err != nil {
@@ -203,6 +213,66 @@ func TestInitGuard_FreshCloneWithMetadataJSON(t *testing.T) {
 		err := checkExistingBeadsDataAt(beadsDir, "myproject")
 		if err == nil {
 			t.Error("existing dolt directory should block init")
+		}
+		if err != nil && !strings.Contains(err.Error(), "already initialized") {
+			t.Errorf("expected 'already initialized' message, got: %v", err)
+		}
+	})
+
+	t.Run("embedded_mode_no_embeddeddolt_dir_allows_init", func(t *testing.T) {
+		// Embedded mode is the default — no need to set serverMode
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write metadata.json with embedded mode
+		metadata := map[string]interface{}{
+			"database":  "dolt",
+			"backend":   "dolt",
+			"dolt_mode": "embedded",
+		}
+		data, _ := json.Marshal(metadata)
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// No embeddeddolt/ directory — simulates fresh clone
+		err := checkExistingBeadsDataAt(beadsDir, "test")
+		if err != nil {
+			t.Errorf("fresh clone with embedded metadata should allow init, got: %v", err)
+		}
+	})
+
+	t.Run("embedded_mode_with_existing_db_blocks_init", func(t *testing.T) {
+		// Embedded mode is the default — no need to set serverMode
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write metadata.json with embedded mode
+		metadata := map[string]interface{}{
+			"database":  "dolt",
+			"backend":   "dolt",
+			"dolt_mode": "embedded",
+		}
+		data, _ := json.Marshal(metadata)
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), data, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create embeddeddolt/<db>/.dolt/ to simulate an existing embedded database
+		dbDir := filepath.Join(beadsDir, "embeddeddolt", "beads", ".dolt")
+		if err := os.MkdirAll(dbDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		err := checkExistingBeadsDataAt(beadsDir, "test")
+		if err == nil {
+			t.Error("existing embedded database should block init")
 		}
 		if err != nil && !strings.Contains(err.Error(), "already initialized") {
 			t.Errorf("expected 'already initialized' message, got: %v", err)

@@ -9,11 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/termenv"
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/ui"
 )
 
 // managedHookNames lists the git hooks managed by beads.
@@ -547,12 +548,16 @@ func installHooksWithOptions(hookNames []string, force bool, shared bool, chain 
 		// Use .beads/hooks/ directory (preferred for Dolt backend)
 		beadsDir := beads.FindBeadsDir()
 		if beadsDir == "" {
-			return fmt.Errorf("not in a beads workspace (no .beads directory found)")
+			return fmt.Errorf("%s", activeWorkspaceNotFoundError())
 		}
 		hooksDir = filepath.Join(beadsDir, "hooks")
 	} else if shared {
 		// Use versioned directory for shared hooks
-		hooksDir = ".beads-hooks"
+		if mainRoot, err := git.GetMainRepoRoot(); err == nil && mainRoot != "" {
+			hooksDir = filepath.Join(mainRoot, ".beads-hooks")
+		} else {
+			hooksDir = ".beads-hooks"
+		}
 	} else {
 		// Use common git directory for hooks (shared across worktrees)
 		var err error
@@ -664,7 +669,10 @@ func preservePreexistingHooks(targetDir string) {
 	}
 
 	// If current dir is already a beads-managed directory, skip.
-	repoRoot := git.GetRepoRoot()
+	repoRoot, _ := git.GetMainRepoRoot()
+	if repoRoot == "" {
+		repoRoot = git.GetRepoRoot()
+	}
 	if repoRoot != "" {
 		absBeadsHooks, _ := filepath.Abs(filepath.Join(repoRoot, ".beads", "hooks"))
 		absSharedHooks, _ := filepath.Abs(filepath.Join(repoRoot, ".beads-hooks"))
@@ -717,8 +725,10 @@ func configureSharedHooksPath() error {
 	// Set git config core.hooksPath to an absolute path pointing to .beads-hooks.
 	// Using an absolute path is critical for git worktrees (GH#2414):
 	// git resolves relative core.hooksPath relative to the working tree root.
-	// Note: This may run before .beads exists, so it uses git.GetRepoRoot() directly.
-	repoRoot := git.GetRepoRoot()
+	repoRoot, _ := git.GetMainRepoRoot()
+	if repoRoot == "" {
+		repoRoot = git.GetRepoRoot()
+	}
 	if repoRoot == "" {
 		return fmt.Errorf("not in a git repository")
 	}
@@ -737,7 +747,10 @@ func configureBeadsHooksPath() error {
 	// git resolves relative core.hooksPath relative to the working tree root,
 	// so in a worktree ".beads/hooks" would resolve to <worktree>/.beads/hooks/
 	// which doesn't exist — the hooks live in the main repo's .beads/hooks/.
-	repoRoot := git.GetRepoRoot()
+	repoRoot, _ := git.GetMainRepoRoot()
+	if repoRoot == "" {
+		repoRoot = git.GetRepoRoot()
+	}
 	if repoRoot == "" {
 		return fmt.Errorf("not in a git repository")
 	}
@@ -816,7 +829,10 @@ func uninstallHooks() error {
 // resetHooksPathIfBeadsManaged unsets core.hooksPath if it points to a
 // beads-managed hooks directory (.beads/hooks or .beads-hooks).
 func resetHooksPathIfBeadsManaged() error {
-	repoRoot := git.GetRepoRoot()
+	repoRoot, _ := git.GetMainRepoRoot()
+	if repoRoot == "" {
+		repoRoot = git.GetRepoRoot()
+	}
 	if repoRoot == "" {
 		return nil // not in a git repo
 	}
@@ -903,7 +919,70 @@ func runPreCommitHook() int {
 	if exitCode := runChainedHook("pre-commit", nil); exitCode != 0 {
 		return exitCode
 	}
+
+	// GH#2489, GH#1863: Export JSONL before commit so issue state lands in
+	// the same commit as code changes.  maybeAutoExport() skips when
+	// BD_GIT_HOOK=1, so we invoke `bd export` as a subprocess instead.
+	exportJSONLForCommit()
+
 	return 0
+}
+
+// exportJSONLForCommit exports Dolt issue state to the git-tracked JSONL file
+// when export.auto is enabled. Called from the pre-commit hook so that the
+// exported file can be staged and included in the pending commit.
+//
+// Errors are logged as warnings but never block the commit.
+func exportJSONLForCommit() {
+	if !config.GetBool("export.auto") {
+		return
+	}
+
+	beadsDir := beads.FindBeadsDir()
+	if beadsDir == "" {
+		return
+	}
+
+	exportPath := config.GetString("export.path")
+	if exportPath == "" {
+		exportPath = "export.jsonl"
+	}
+	fullPath := filepath.Join(beadsDir, exportPath)
+
+	debug.Logf("pre-commit: exporting JSONL to %s\n", fullPath)
+
+	// Shell out to `bd export` which initializes its own store.
+	// Clear BD_GIT_HOOK from the subprocess env so that its
+	// PersistentPostRun auto-export path does not also fire.
+	cmd := exec.Command("bd", "export", "-o", fullPath)
+	cmd.Dir = beadsDir
+	cmd.Env = filterEnv(os.Environ(), "BD_GIT_HOOK")
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "beads: pre-commit export warning: %v\n", err)
+		return
+	}
+
+	// Stage the exported file if configured.
+	if config.GetBool("export.git-add") {
+		addCmd := exec.Command("git", "add", fullPath)
+		addCmd.Dir = filepath.Dir(fullPath)
+		if err := addCmd.Run(); err != nil {
+			debug.Logf("pre-commit: git add failed: %v\n", err)
+		}
+	}
+}
+
+// filterEnv returns a copy of env with entries matching the given key removed.
+func filterEnv(env []string, key string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // runPostMergeHook runs chained hooks after merge.
@@ -1037,10 +1116,10 @@ installed bd version - upgrading bd automatically updates hook behavior.`,
 		// Disable terminal color probing to prevent OSC 11 escape sequence leaks (GH#1303).
 		// Our shell shims set BD_GIT_HOOK=1 before invoking bd, but third-party hook
 		// runners (lefthook, husky, etc.) call 'bd hooks run' directly without it.
-		// By this point ui.init() has already run, so we must also reset the lipgloss
-		// color profile — the env var alone only helps if set before process start.
+		// By this point ui.init() has already run, so we must also reset styles
+		// to suppress ANSI output — the env var alone only helps if set before process start.
 		_ = os.Setenv("BD_GIT_HOOK", "1")
-		lipgloss.SetColorProfile(termenv.Ascii)
+		ui.DisableColors()
 
 		hookName := args[0]
 		hookArgs := args[1:]

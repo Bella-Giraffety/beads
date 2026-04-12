@@ -1,4 +1,4 @@
-//go:build embeddeddolt
+//go:build cgo
 
 package main
 
@@ -36,6 +36,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	store.Close()
+	_ = store.Close()
 	fmt.Println("ok")
 }

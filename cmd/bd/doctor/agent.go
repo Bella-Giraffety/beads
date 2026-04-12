@@ -113,15 +113,12 @@ var agentEnrichers = map[string]enricher{
 	"Dolt Schema":                  enrichDoltSchema,
 	"Dolt Issue Count":             enrichDoltIssueCount,
 	"Dolt Status":                  enrichDoltStatus,
-	"Dolt Locks":                   enrichDoltLocks,
-	"Dolt Lock Health":             enrichLockHealth,
 	"Dependency Cycles":            enrichDependencyCycles,
 	"Duplicate Issues":             enrichDuplicateIssues,
 	"Test Pollution":               enrichTestPollution,
 	"Orphaned Dependencies":        enrichOrphanedDeps,
 	"Child-Parent Dependencies":    enrichChildParentDeps,
 	"Classic Artifacts":            enrichClassicArtifacts,
-	"Embedded Mode Concurrency":    enrichEmbeddedConcurrency,
 	"Pending Migrations":           enrichPendingMigrations,
 	"KV Sync Status":               enrichKVSync,
 	"Stale Closed Issues":          enrichStaleClosedIssues,
@@ -309,13 +306,13 @@ func enrichGitUpstream(dc DoctorCheck) agentEnrichment {
 }
 
 func enrichFreshClone(dc DoctorCheck) agentEnrichment {
-	commands := []string{"bd init"}
-	explanation := fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the local database hasn't been initialized. Run bd init to bootstrap from the tracked config.", dc.Message)
+	commands := []string{"bd bootstrap"}
+	explanation := fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the local database has not been recovered yet. Run bd bootstrap as the safe existing-project recovery entry point.", dc.Message)
 
-	// When the message mentions sync.git-remote, include it in the suggested commands.
-	if strings.Contains(dc.Message, "sync.git-remote") {
-		explanation = fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the database is not found on the configured server. Consider setting sync.git-remote in .beads/config.yaml to bootstrap from a Dolt remote, then run bd init.", dc.Message)
-		commands = []string{"Set sync.git-remote in .beads/config.yaml", "bd init"}
+	// When the message mentions sync.remote, include it in the suggested commands.
+	if strings.Contains(dc.Message, "sync.remote") {
+		explanation = fmt.Sprintf("Fresh clone detected: %s. The .beads/ directory exists (committed to git) but the database is not found on the configured server. Run bd bootstrap as the safe entry point; if bootstrap cannot find the expected remote automatically, then set sync.remote in .beads/config.yaml and rerun bd bootstrap.", dc.Message)
+		commands = []string{"bd bootstrap", "Set sync.remote in .beads/config.yaml if bootstrap cannot find the expected remote"}
 	}
 
 	return agentEnrichment{
@@ -415,28 +412,6 @@ func enrichDoltStatus(dc DoctorCheck) agentEnrichment {
 	}
 }
 
-func enrichDoltLocks(dc DoctorCheck) agentEnrichment {
-	return agentEnrichment{
-		severity:    "degraded",
-		explanation: fmt.Sprintf("Dolt lock issue: %s. Noms LOCK files prevent concurrent database access. If no bd process is running, these are stale and safe to remove.", dc.Message),
-		observed:    dc.Message + "\n" + dc.Detail,
-		expected:    "No stale noms LOCK files in .beads/dolt/",
-		commands:    []string{"bd doctor --fix", "find .beads/dolt -name LOCK -delete"},
-		sourceFiles: []string{"cmd/bd/doctor/migration_validation.go:CheckDoltLocks"},
-	}
-}
-
-func enrichLockHealth(dc DoctorCheck) agentEnrichment {
-	return agentEnrichment{
-		severity:    "degraded",
-		explanation: fmt.Sprintf("Lock health issue: %s. Database lock files may be held by another process or left from a crash. Check if another bd/dolt process is running before removing.", dc.Message),
-		observed:    dc.Message + "\n" + dc.Detail,
-		expected:    "No active or stale lock files",
-		commands:    []string{"lsof +D .beads/dolt 2>/dev/null | grep LOCK", "bd doctor --fix"},
-		sourceFiles: []string{"cmd/bd/doctor/dolt.go:CheckLockHealth"},
-	}
-}
-
 func enrichDependencyCycles(dc DoctorCheck) agentEnrichment {
 	return agentEnrichment{
 		severity:    "degraded",
@@ -500,17 +475,6 @@ func enrichClassicArtifacts(dc DoctorCheck) agentEnrichment {
 		expected:    "No classic artifacts present (JSONL files, SQLite database, cruft directories)",
 		commands:    []string{"bd doctor --check=artifacts", "bd doctor --check=artifacts --clean"},
 		sourceFiles: []string{"cmd/bd/doctor/artifacts.go:CheckClassicArtifacts"},
-	}
-}
-
-func enrichEmbeddedConcurrency(dc DoctorCheck) agentEnrichment {
-	return agentEnrichment{
-		severity:    "advisory",
-		explanation: fmt.Sprintf("Embedded Dolt concurrency concern: %s. Multiple bd processes accessing the same embedded Dolt database can cause lock contention. Consider switching to Dolt server mode for concurrent access.", dc.Message),
-		observed:    dc.Message + "\n" + dc.Detail,
-		expected:    "Either single-process access or Dolt server mode configured",
-		commands:    []string{"gt dolt start", "bd config set dolt.server-mode true"},
-		sourceFiles: []string{"cmd/bd/doctor/broken_migration.go:CheckEmbeddedModeConcurrency"},
 	}
 }
 

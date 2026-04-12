@@ -12,6 +12,7 @@ import (
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
 )
 
 // --- Dolt-native backup commands ---
@@ -25,30 +26,29 @@ import (
 const defaultDoltBackupName = "default"
 
 var backupInitCmd = &cobra.Command{
-	Use:   "init <path>",
-	Short: "Set up a Dolt backup destination",
-	Long: `Configure a filesystem path as a Dolt backup destination.
+	Use:     "init <path>",
+	Aliases: []string{"add"},
+	Short:   "Set up a Dolt backup destination",
+	Long: `Configure a filesystem path or URL as a backup destination.
 
 The path can be a local directory (external drive, NAS, Dropbox folder) or a
-DoltHub remote URL.
+DoltHub remote URL. If the destination was previously configured, it is
+updated to the new path.
 
 Filesystem examples:
-  bd backup init /mnt/usb/beads-backup
-  bd backup init ~/Dropbox/beads-backup
+  bd backup add /mnt/usb/beads-backup
+  bd backup add ~/Dropbox/beads-backup
 
 DoltHub (recommended for cloud backup):
-  bd backup init https://doltremoteapi.dolthub.com/myuser/beads-backup
+  bd backup add https://doltremoteapi.dolthub.com/myuser/beads-backup
 
-After initializing, run 'bd backup sync' to push your data.
-
-Under the hood this calls DOLT_BACKUP('add', ...) to register the destination.`,
+After adding, run 'bd backup sync' to push your data.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := rootCtx
 		rawPath := args[0]
 
-		st := getStore()
-		if st == nil {
+		if store == nil {
 			return fmt.Errorf("no store available")
 		}
 
@@ -56,19 +56,24 @@ Under the hood this calls DOLT_BACKUP('add', ...) to register the destination.`,
 		// DoltHub URLs are passed through as-is.
 		backupURL := resolveDoltBackupURL(rawPath)
 
-		bs, ok := st.(storage.BackupStore)
+		bs, ok := storage.UnwrapStore(store).(storage.BackupStore)
 		if !ok {
 			return fmt.Errorf("storage backend does not support backup operations")
 		}
 
 		// Register the backup with Dolt
 		if err := bs.BackupAdd(ctx, defaultDoltBackupName, backupURL); err != nil {
-			// Check if backup already exists
 			if strings.Contains(err.Error(), "already exists") {
-				// Remove and re-add to update the URL
+				// Same name, different URL — remove and re-add to update
 				_ = bs.BackupRemove(ctx, defaultDoltBackupName)
 				if err := bs.BackupAdd(ctx, defaultDoltBackupName, backupURL); err != nil {
 					return fmt.Errorf("failed to update backup destination: %w", err)
+				}
+			} else if conflict := versioncontrolops.ExtractAddressConflictName(err); conflict != "" {
+				// Different name (e.g. "backup_export") points at same URL — remove it, re-add as "default"
+				_ = bs.BackupRemove(ctx, conflict)
+				if err := bs.BackupAdd(ctx, defaultDoltBackupName, backupURL); err != nil {
+					return fmt.Errorf("failed to add backup destination: %w", err)
 				}
 			} else {
 				return fmt.Errorf("failed to add backup destination: %w", err)
@@ -110,18 +115,17 @@ The backup is atomic — if the sync fails, the previous backup state is preserv
 Run 'bd backup init <path>' first to configure a destination.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := rootCtx
-		st := getStore()
-		if st == nil {
+		if store == nil {
 			return fmt.Errorf("no store available")
 		}
 
-		bs, ok := st.(storage.BackupStore)
+		bs, ok := storage.UnwrapStore(store).(storage.BackupStore)
 		if !ok {
 			return fmt.Errorf("storage backend does not support backup operations")
 		}
 
 		// First, commit any pending changes so they're included in the backup
-		committer, ok := st.(storage.PendingCommitter)
+		committer, ok := storage.UnwrapStore(store).(storage.PendingCommitter)
 		if !ok {
 			return fmt.Errorf("storage backend does not support pending commits")
 		}
@@ -206,7 +210,7 @@ type doltBackupState struct {
 func doltBackupConfigPath() (string, error) {
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
-		return "", fmt.Errorf("not in a beads repository")
+		return "", fmt.Errorf("%s", activeWorkspaceNotFoundError())
 	}
 	return filepath.Join(beadsDir, "dolt-backup.json"), nil
 }
@@ -214,7 +218,7 @@ func doltBackupConfigPath() (string, error) {
 func doltBackupStatePath() (string, error) {
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
-		return "", fmt.Errorf("not in a beads repository")
+		return "", fmt.Errorf("%s", activeWorkspaceNotFoundError())
 	}
 	return filepath.Join(beadsDir, "dolt-backup-state.json"), nil
 }
@@ -342,7 +346,7 @@ func showDoltBackupStatusJSON() map[string]interface{} {
 func doltBackupSize() (int64, error) {
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
-		return 0, fmt.Errorf("not in a beads repository")
+		return 0, fmt.Errorf("%s", activeWorkspaceNotFoundError())
 	}
 	dataDir := doltserver.ResolveDoltDir(beadsDir)
 	return dirSize(dataDir)
@@ -384,7 +388,55 @@ func showDBSizeJSON() map[string]interface{} {
 	}
 }
 
+var backupRemoveCmd = &cobra.Command{
+	Use:   "remove",
+	Short: "Remove the configured backup destination",
+	Long: `Remove the configured backup destination.
+
+This unregisters the backup remote from Dolt and removes the local
+backup configuration. The backup data at the destination is not deleted.`,
+	Aliases: []string{"rm"},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := rootCtx
+		if store == nil {
+			return fmt.Errorf("no store available")
+		}
+
+		bs, ok := storage.UnwrapStore(store).(storage.BackupStore)
+		if !ok {
+			return fmt.Errorf("storage backend does not support backup operations")
+		}
+
+		if err := bs.BackupRemove(ctx, defaultDoltBackupName); err != nil {
+			if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "no backup") {
+				return fmt.Errorf("no backup destination configured")
+			}
+			return fmt.Errorf("failed to remove backup: %w", err)
+		}
+
+		// Also remove backup_export if it exists (auto-export may have created it at same URL)
+		_ = bs.BackupRemove(ctx, "backup_export")
+
+		// Remove local config
+		if path, err := doltBackupConfigPath(); err == nil {
+			_ = os.Remove(path)
+		}
+		if path, err := doltBackupStatePath(); err == nil {
+			_ = os.Remove(path)
+		}
+
+		if jsonOutput {
+			outputJSON(map[string]interface{}{"removed": true})
+			return nil
+		}
+
+		fmt.Println("Backup destination removed.")
+		return nil
+	},
+}
+
 func init() {
 	backupCmd.AddCommand(backupInitCmd)
 	backupCmd.AddCommand(backupSyncCmd)
+	backupCmd.AddCommand(backupRemoveCmd)
 }

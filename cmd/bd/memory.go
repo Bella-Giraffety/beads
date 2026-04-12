@@ -91,6 +91,9 @@ Examples:
 		if err := store.SetConfig(ctx, storageKey, insight); err != nil {
 			FatalErrorRespectJSON("storing memory: %v", err)
 		}
+		if _, err := store.CommitPending(ctx, getActor()); err != nil {
+			WarnError("failed to commit memory: %v", err)
+		}
 
 		if jsonOutput {
 			outputJSON(map[string]string{
@@ -230,6 +233,9 @@ Examples:
 		if err := store.DeleteConfig(ctx, storageKey); err != nil {
 			FatalErrorRespectJSON("forgetting memory: %v", err)
 		}
+		if _, err := store.CommitPending(ctx, getActor()); err != nil {
+			WarnError("failed to commit forget: %v", err)
+		}
 
 		if jsonOutput {
 			outputJSON(map[string]string{
@@ -298,7 +304,7 @@ func truncateMemory(s string, maxLen int) string {
 }
 
 func init() {
-	rememberCmd.Flags().StringVar(&memoryKeyFlag, "key", "", "Explicit key for the memory (auto-generated from content if not set)")
+	rememberCmd.Flags().StringVar(&memoryKeyFlag, "key", "", "Explicit key for the memory (auto-generated from content if not set). If a memory with this key already exists, it will be updated in place")
 
 	rootCmd.AddCommand(rememberCmd)
 	rootCmd.AddCommand(memoriesCmd)

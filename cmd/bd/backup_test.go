@@ -3,15 +3,16 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/steveyegge/beads/internal/testutil"
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/git"
 )
 
 func TestBackupStateRoundTrip(t *testing.T) {
@@ -30,8 +31,6 @@ func TestBackupStateRoundTrip(t *testing.T) {
 	// Save and reload
 	state.LastDoltCommit = "abc123"
 	state.Timestamp = time.Date(2026, 2, 26, 12, 0, 0, 0, time.UTC)
-	state.Counts.Issues = 10
-	state.Counts.Events = 100
 
 	if err := saveBackupState(dir, state); err != nil {
 		t.Fatalf("saveBackupState: %v", err)
@@ -43,9 +42,6 @@ func TestBackupStateRoundTrip(t *testing.T) {
 	}
 	if loaded.LastDoltCommit != "abc123" {
 		t.Errorf("commit = %q, want abc123", loaded.LastDoltCommit)
-	}
-	if loaded.Counts.Issues != 10 {
-		t.Errorf("issues = %d, want 10", loaded.Counts.Issues)
 	}
 }
 
@@ -68,379 +64,104 @@ func TestBackupAtomicWrite(t *testing.T) {
 	}
 }
 
-func TestBackupNormalizeValue(t *testing.T) {
-	t.Parallel()
+func TestBackupDir_NoWorkspaceReturnsActiveWorkspaceError(t *testing.T) {
+	tmpDir := t.TempDir()
+	t.Chdir(tmpDir)
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BD_BACKUP_GIT_REPO", filepath.Join(tmpDir, "not-a-repo"))
 
-	tests := []struct {
-		name string
-		in   interface{}
-		want interface{}
-	}{
-		{"nil", nil, nil},
-		{"string bytes", []byte("hello"), "hello"},
-		{"int", int64(42), int64(42)},
-		{"zero time", time.Time{}, nil},
-		{"time", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC), "2026-01-01T00:00:00Z"},
+	beads.ResetCaches()
+	git.ResetCaches()
+	t.Cleanup(func() {
+		beads.ResetCaches()
+		git.ResetCaches()
+	})
+
+	dir, err := backupDir()
+	if err == nil {
+		t.Fatalf("backupDir() = %q, want error", dir)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := normalizeValue(tt.in)
-			if got != tt.want {
-				t.Errorf("normalizeValue(%v) = %v, want %v", tt.in, got, tt.want)
-			}
-		})
+	if !strings.Contains(err.Error(), activeWorkspaceNotFoundError()) {
+		t.Fatalf("backupDir() error = %q, want active workspace wording", err)
+	}
+	if !strings.Contains(err.Error(), diagHint()) {
+		t.Fatalf("backupDir() error = %q, want diag hint", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(tmpDir, ".beads")); !os.IsNotExist(statErr) {
+		t.Fatalf("backupDir() should not create local .beads, stat err = %v", statErr)
 	}
 }
 
-func TestBackupExport(t *testing.T) {
-	if testDoltServerPort == 0 {
-		t.Skip("Dolt test server not available")
-	}
-	if testutil.DoltContainerCrashed() {
-		t.Skipf("Dolt test server crashed: %v", testutil.DoltContainerCrashError())
-	}
-
-	ensureTestMode(t)
-	saved := saveAndRestoreGlobals(t)
-	_ = saved
-
+func TestBackupDir_UsesWorktreeFallback(t *testing.T) {
 	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
+	mainRepoDir := filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0o755); err != nil {
+		t.Fatalf("mkdir main repo: %v", err)
 	}
 
-	// Set up working directory so beads.FindBeadsDir() works
-	origWd, _ := os.Getwd()
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(origWd) })
-
-	// Create test store with some data
-	dbName := uniqueTestDBName(t)
-	testDBPath := filepath.Join(beadsDir, "dolt")
-	writeTestMetadata(t, testDBPath, dbName)
-	s := newTestStore(t, testDBPath)
-	store = s
-	storeMutex.Lock()
-	storeActive = true
-	storeMutex.Unlock()
-	t.Cleanup(func() {
-		store = nil
-		storeMutex.Lock()
-		storeActive = false
-		storeMutex.Unlock()
-	})
-
-	ctx := context.Background()
-
-	// Create some test issues
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		"test-1", "Test Issue 1", "desc1", "", "", "", "open", 2, "task"); err != nil {
-		t.Fatalf("insert issue: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		"test-2", "Test Issue 2", "desc2", "", "", "", "done", 1, "bug"); err != nil {
-		t.Fatalf("insert issue: %v", err)
-	}
-
-	// Create a label
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO labels (issue_id, label) VALUES (?, ?)`,
-		"test-1", "backend"); err != nil {
-		t.Fatalf("insert label: %v", err)
-	}
-
-	// Create an event
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO events (issue_id, event_type, actor) VALUES (?, ?, ?)`,
-		"test-1", "created", "tester"); err != nil {
-		t.Fatalf("insert event: %v", err)
-	}
-
-	depMetadata := `{"gate":"any-children","spawner_id":"test-1"}`
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO dependencies (issue_id, depends_on_id, type, created_by, metadata) VALUES (?, ?, ?, ?, ?)`,
-		"test-2", "test-1", "blocks", "tester", depMetadata); err != nil {
-		t.Fatalf("insert dependency: %v", err)
-	}
-
-	// Commit so GetCurrentCommit returns something
-	if _, err := s.DB().ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'test data')"); err != nil {
-		t.Fatalf("dolt commit: %v", err)
-	}
-
-	// Run backup
-	state, err := runBackupExport(ctx, false)
-	if err != nil {
-		t.Fatalf("runBackupExport: %v", err)
-	}
-
-	if state.Counts.Issues != 2 {
-		t.Errorf("issues = %d, want 2", state.Counts.Issues)
-	}
-	if state.Counts.Labels != 1 {
-		t.Errorf("labels = %d, want 1", state.Counts.Labels)
-	}
-	if state.Counts.Events != 1 {
-		t.Errorf("events = %d, want 1", state.Counts.Events)
-	}
-	if state.Counts.Dependencies != 1 {
-		t.Errorf("dependencies = %d, want 1", state.Counts.Dependencies)
-	}
-	if state.LastDoltCommit == "" {
-		t.Error("expected non-empty dolt commit")
-	}
-
-	// Verify files exist
-	backupPath := filepath.Join(beadsDir, "backup")
-	for _, file := range []string{"issues.jsonl", "events.jsonl", "dependencies.jsonl", "labels.jsonl", "config.jsonl", "backup_state.json"} {
-		path := filepath.Join(backupPath, file)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			t.Errorf("expected file %s to exist", file)
+	run := func(dir string, args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
 		}
 	}
 
-	// Verify issues.jsonl content
-	issuesData, err := os.ReadFile(filepath.Join(backupPath, "issues.jsonl"))
-	if err != nil {
-		t.Fatalf("read issues.jsonl: %v", err)
+	run(mainRepoDir, "init")
+	run(mainRepoDir, "config", "user.email", "test@example.com")
+	run(mainRepoDir, "config", "user.name", "Test User")
+	if err := os.WriteFile(filepath.Join(mainRepoDir, "README.md"), []byte("# Test\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
 	}
-	lines := splitJSONL(issuesData)
-	if len(lines) != 2 {
-		t.Errorf("issues.jsonl has %d lines, want 2", len(lines))
-	}
+	run(mainRepoDir, "add", "README.md")
+	run(mainRepoDir, "commit", "-m", "Initial commit")
 
-	depsData, err := os.ReadFile(filepath.Join(backupPath, "dependencies.jsonl"))
-	if err != nil {
-		t.Fatalf("read dependencies.jsonl: %v", err)
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	cmd := exec.Command("git", "worktree", "add", worktreeDir, "HEAD")
+	cmd.Dir = mainRepoDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git worktree add failed: %v\n%s", err, out)
 	}
-	depLines := splitJSONL(depsData)
-	if len(depLines) != 1 {
-		t.Fatalf("dependencies.jsonl has %d lines, want 1", len(depLines))
-	}
-	var depRow struct {
-		IssueID     string `json:"issue_id"`
-		DependsOnID string `json:"depends_on_id"`
-		Metadata    string `json:"metadata"`
-	}
-	if err := json.Unmarshal(depLines[0], &depRow); err != nil {
-		t.Fatalf("unmarshal dependency row: %v", err)
-	}
-	if depRow.IssueID != "test-2" || depRow.DependsOnID != "test-1" {
-		t.Fatalf("dependency row = %s -> %s, want test-2 -> test-1", depRow.IssueID, depRow.DependsOnID)
-	}
-	if depRow.Metadata != depMetadata {
-		t.Errorf("dependency metadata = %q, want %q", depRow.Metadata, depMetadata)
-	}
-
-	// Second export with no changes should be a no-op
-	state2, err := runBackupExport(ctx, false)
-	if err != nil {
-		t.Fatalf("second runBackupExport: %v", err)
-	}
-	if state2.LastDoltCommit != state.LastDoltCommit {
-		t.Error("expected same commit on second export with no changes")
-	}
-}
-
-func TestBackupIncremental(t *testing.T) {
-	if testDoltServerPort == 0 {
-		t.Skip("Dolt test server not available")
-	}
-	if testutil.DoltContainerCrashed() {
-		t.Skipf("Dolt test server crashed: %v", testutil.DoltContainerCrashError())
-	}
-
-	ensureTestMode(t)
-	saved := saveAndRestoreGlobals(t)
-	_ = saved
-
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	origWd, _ := os.Getwd()
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(origWd) })
-
-	dbName := uniqueTestDBName(t)
-	testDBPath := filepath.Join(beadsDir, "dolt")
-	writeTestMetadata(t, testDBPath, dbName)
-	s := newTestStore(t, testDBPath)
-	store = s
-	storeMutex.Lock()
-	storeActive = true
-	storeMutex.Unlock()
 	t.Cleanup(func() {
-		store = nil
-		storeMutex.Lock()
-		storeActive = false
-		storeMutex.Unlock()
+		cleanupCmd := exec.Command("git", "worktree", "remove", "--force", worktreeDir)
+		cleanupCmd.Dir = mainRepoDir
+		_ = cleanupCmd.Run()
 	})
 
-	ctx := context.Background()
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(mainBeadsDir, "dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir main beads dir: %v", err)
+	}
+	_ = os.RemoveAll(filepath.Join(worktreeDir, ".beads"))
 
-	// Create an issue and event
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		"inc-1", "Inc Issue", "desc", "", "", "", "open", 2, "task"); err != nil {
-		t.Fatalf("insert issue: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO events (issue_id, event_type, actor) VALUES (?, ?, ?)`,
-		"inc-1", "created", "tester"); err != nil {
-		t.Fatalf("insert event: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'initial')"); err != nil {
-		t.Fatalf("dolt commit: %v", err)
-	}
+	t.Chdir(worktreeDir)
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BD_BACKUP_GIT_REPO", filepath.Join(tmpDir, "not-a-repo"))
 
-	// First export
-	state, err := runBackupExport(ctx, false)
-	if err != nil {
-		t.Fatalf("first export: %v", err)
-	}
-	if state.Counts.Events != 1 {
-		t.Errorf("first export events = %d, want 1", state.Counts.Events)
-	}
-
-	// Add another event
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO events (issue_id, event_type, actor) VALUES (?, ?, ?)`,
-		"inc-1", "status_changed", "tester"); err != nil {
-		t.Fatalf("insert event 2: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'second event')"); err != nil {
-		t.Fatalf("dolt commit 2: %v", err)
-	}
-
-	// Second export should include all events (full re-export)
-	state2, err := runBackupExport(ctx, false)
-	if err != nil {
-		t.Fatalf("second export: %v", err)
-	}
-	if state2.Counts.Events != 2 {
-		t.Errorf("second export events = %d, want 2", state2.Counts.Events)
-	}
-
-	// Events file should have 2 lines total (full re-export)
-	eventsData, err := os.ReadFile(filepath.Join(beadsDir, "backup", "events.jsonl"))
-	if err != nil {
-		t.Fatalf("read events.jsonl: %v", err)
-	}
-	lines := splitJSONL(eventsData)
-	if len(lines) != 2 {
-		t.Errorf("events.jsonl has %d lines, want 2", len(lines))
-	}
-}
-
-func TestBackupExportFiltersByIssuePrefix(t *testing.T) {
-	if testDoltServerPort == 0 {
-		t.Skip("Dolt test server not available")
-	}
-	if testutil.DoltContainerCrashed() {
-		t.Skipf("Dolt test server crashed: %v", testutil.DoltContainerCrashError())
-	}
-
-	ensureTestMode(t)
-	saved := saveAndRestoreGlobals(t)
-	_ = saved
-
-	tmpDir := t.TempDir()
-	beadsDir := filepath.Join(tmpDir, ".beads")
-	if err := os.MkdirAll(beadsDir, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	origWd, _ := os.Getwd()
-	if err := os.Chdir(tmpDir); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(origWd) })
-
-	dbName := uniqueTestDBName(t)
-	testDBPath := filepath.Join(beadsDir, "dolt")
-	writeTestMetadata(t, testDBPath, dbName)
-	s := newTestStoreWithPrefix(t, testDBPath, "alpha")
-	store = s
-	storeMutex.Lock()
-	storeActive = true
-	storeMutex.Unlock()
+	beads.ResetCaches()
+	git.ResetCaches()
 	t.Cleanup(func() {
-		store = nil
-		storeMutex.Lock()
-		storeActive = false
-		storeMutex.Unlock()
+		beads.ResetCaches()
+		git.ResetCaches()
 	})
 
-	ctx := context.Background()
-
-	for _, issueID := range []string{"alpha-1", "beta-1"} {
-		if _, err := s.DB().ExecContext(ctx, `INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			issueID, issueID+" title", "desc", "", "", "", "open", 2, "task"); err != nil {
-			t.Fatalf("insert issue %s: %v", issueID, err)
-		}
-	}
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO labels (issue_id, label) VALUES (?, ?)`, "alpha-1", "keep"); err != nil {
-		t.Fatalf("insert alpha label: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO labels (issue_id, label) VALUES (?, ?)`, "beta-1", "drop"); err != nil {
-		t.Fatalf("insert beta label: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO dependencies (issue_id, depends_on_id, type, created_by, metadata) VALUES (?, ?, ?, ?, ?)`,
-		"alpha-1", "alpha-root", "blocks", "tester", `{}`); err != nil {
-		t.Fatalf("insert alpha dependency: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, `INSERT INTO dependencies (issue_id, depends_on_id, type, created_by, metadata) VALUES (?, ?, ?, ?, ?)`,
-		"beta-1", "beta-root", "blocks", "tester", `{}`); err != nil {
-		t.Fatalf("insert beta dependency: %v", err)
-	}
-	if _, err := s.DB().ExecContext(ctx, "CALL DOLT_COMMIT('-Am', 'mixed prefix test data')"); err != nil {
-		t.Fatalf("dolt commit: %v", err)
-	}
-
-	state, err := runBackupExport(ctx, true)
+	dir, err := backupDir()
 	if err != nil {
-		t.Fatalf("runBackupExport: %v", err)
+		t.Fatalf("backupDir() error = %v", err)
 	}
-
-	if state.Counts.Issues != 1 {
-		t.Fatalf("exported issues = %d, want 1", state.Counts.Issues)
-	}
-	if state.Counts.Labels != 1 {
-		t.Fatalf("exported labels = %d, want 1", state.Counts.Labels)
-	}
-	if state.Counts.Dependencies != 1 {
-		t.Fatalf("exported dependencies = %d, want 1", state.Counts.Dependencies)
-	}
-
-	backupPath := filepath.Join(beadsDir, "backup")
-	issuesData, err := os.ReadFile(filepath.Join(backupPath, "issues.jsonl"))
+	gotResolved, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		t.Fatalf("read issues.jsonl: %v", err)
+		t.Fatalf("EvalSymlinks(%q): %v", dir, err)
 	}
-	if strings.Contains(string(issuesData), `"id":"beta-1"`) {
-		t.Fatalf("issues.jsonl should not contain beta issue:\n%s", issuesData)
-	}
-	if !strings.Contains(string(issuesData), `"id":"alpha-1"`) {
-		t.Fatalf("issues.jsonl missing alpha issue:\n%s", issuesData)
-	}
-
-	labelsData, err := os.ReadFile(filepath.Join(backupPath, "labels.jsonl"))
+	wantResolved, err := filepath.EvalSymlinks(filepath.Join(mainBeadsDir, "backup"))
 	if err != nil {
-		t.Fatalf("read labels.jsonl: %v", err)
+		t.Fatalf("EvalSymlinks(%q): %v", filepath.Join(mainBeadsDir, "backup"), err)
 	}
-	if strings.Contains(string(labelsData), `"issue_id":"beta-1"`) {
-		t.Fatalf("labels.jsonl should not contain beta label:\n%s", labelsData)
-	}
-
-	depsData, err := os.ReadFile(filepath.Join(backupPath, "dependencies.jsonl"))
-	if err != nil {
-		t.Fatalf("read dependencies.jsonl: %v", err)
-	}
-	if strings.Contains(string(depsData), `"issue_id":"beta-1"`) {
-		t.Fatalf("dependencies.jsonl should not contain beta dependency:\n%s", depsData)
+	if gotResolved != wantResolved {
+		t.Fatalf("backupDir() = %q (resolved %q), want resolved %q", dir, gotResolved, wantResolved)
 	}
 }
 

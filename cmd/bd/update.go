@@ -10,7 +10,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/audit"
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/timeparsing"
 	"github.com/steveyegge/beads/internal/types"
@@ -449,16 +448,8 @@ create, update, show, or close operation).`,
 				}
 			}
 
-			// Run update hook
-			updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID) // Best effort: nil issue handled by subsequent nil check
-			if updatedIssue != nil && hookRunner != nil {
-				hookRunner.Run(hooks.EventUpdate, updatedIssue)
-				// Also fire on_close hook when status actually transitions to closed (GH#2630)
-				if updatedIssue.Status == types.StatusClosed && issue.Status != types.StatusClosed {
-					hookRunner.Run(hooks.EventClose, updatedIssue)
-				}
-			}
-
+			// Re-fetch for display
+			updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID)
 			updateTitle := ""
 			if updatedIssue != nil {
 				updateTitle = updatedIssue.Title
@@ -481,7 +472,7 @@ create, update, show, or close operation).`,
 
 		// Embedded mode: flush Dolt commit. DoltStore commits
 		// inline during UpdateIssue so this is only needed for EmbeddedDoltStore.
-		if isEmbeddedDolt && firstUpdatedID != "" && store != nil {
+		if isEmbeddedMode() && firstUpdatedID != "" && store != nil {
 			if _, err := store.CommitPending(ctx, actor); err != nil {
 				FatalErrorRespectJSON("failed to commit: %v", err)
 			}
@@ -613,7 +604,7 @@ func init() {
 	updateCmd.Flags().StringSlice("remove-label", nil, "Remove labels (repeatable)")
 	updateCmd.Flags().StringSlice("set-labels", nil, "Set labels, replacing all existing (repeatable)")
 	updateCmd.Flags().String("parent", "", "New parent issue ID (reparents the issue, use empty string to remove parent)")
-	updateCmd.Flags().Bool("claim", false, "Atomically claim the issue (sets assignee to you, status to in_progress; fails if already claimed)")
+	updateCmd.Flags().Bool("claim", false, "Atomically claim the issue (sets assignee to you, status to in_progress; idempotent if already claimed by you)")
 	updateCmd.Flags().String("session", "", "Claude Code session ID for status=closed (or set CLAUDE_SESSION_ID env var)")
 	// Time-based scheduling flags (GH#820)
 	// Examples:

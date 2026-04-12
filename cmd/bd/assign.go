@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
@@ -57,20 +56,16 @@ Examples:
 		}
 
 		// Flush Dolt commit for embedded mode
-		if isEmbeddedDolt && store != nil {
+		if isEmbeddedMode() && store != nil {
 			if _, err := store.CommitPending(ctx, actor); err != nil {
 				FatalErrorRespectJSON("failed to commit: %v", err)
 			}
 		}
 
-		// Run update hook
-		updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID)
-		if updatedIssue != nil && hookRunner != nil {
-			hookRunner.Run(hooks.EventUpdate, updatedIssue)
-		}
-
 		SetLastTouchedID(result.ResolvedID)
 
+		// Re-fetch for display
+		updatedIssue, _ := issueStore.GetIssue(ctx, result.ResolvedID)
 		title := ""
 		if updatedIssue != nil {
 			title = updatedIssue.Title

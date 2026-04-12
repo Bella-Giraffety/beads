@@ -62,8 +62,16 @@ gt dolt start
 cd ~/.dolt-data/beads && dolt sql-server --port 3307
 ```
 
+```bash
+# Initialize in server mode
+bd init --server
+
+# Or switch via environment variable
+export BEADS_DOLT_SERVER_MODE=1
+```
+
 ```yaml
-# .beads/config.yaml
+# .beads/config.yaml (server mode settings)
 dolt:
   mode: server
   host: 127.0.0.1
@@ -71,10 +79,89 @@ dolt:
   user: root
 ```
 
-Server mode is required for:
+Switch to server mode when you need:
 - Multiple agents writing simultaneously
 - Orchestrator multi-rig setups
 - Federation with remote peers
+
+## Migrating Between Backends
+
+You can migrate data between embedded mode and server mode using `bd backup`.
+Both directions preserve full Dolt commit history.
+
+### Server → Embedded
+
+1. **Create a backup from the server-mode project:**
+
+   ```bash
+   # In the server-mode project directory
+   bd backup init /path/to/backup-dir
+   bd backup sync
+   ```
+
+2. **Create a new embedded-mode project and restore:**
+
+   ```bash
+   mkdir new-project && cd new-project
+   bd init                  # creates an embedded-mode project by default
+   bd backup restore --force /path/to/backup-dir
+   ```
+
+   `--force` overwrites the freshly-initialized database with the backup
+   contents. The restore automatically:
+   - Updates `metadata.json` to match the restored project identity
+   - Registers the backup directory for future `bd backup sync`
+   - Backfills the embedded migration tracker (`schema_migrations`)
+
+3. **Verify:**
+
+   ```bash
+   bd list
+   bd backup status
+   ```
+
+### Embedded → Server
+
+1. **Create a backup from the embedded-mode project:**
+
+   ```bash
+   # In the embedded-mode project directory
+   bd backup init /path/to/backup-dir
+   bd backup sync
+   ```
+
+2. **Create a new server-mode project and restore:**
+
+   ```bash
+   mkdir new-project && cd new-project
+   bd init --server         # creates a server-mode project
+   bd backup restore --force /path/to/backup-dir
+   ```
+
+3. **Verify:**
+
+   ```bash
+   bd list
+   bd backup status
+   ```
+
+### Backup Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `bd backup init <path>` | Register a backup destination (filesystem or DoltHub URL) |
+| `bd backup sync` | Push database to the configured backup destination |
+| `bd backup restore [path]` | Restore from a backup directory (`--force` to overwrite) |
+| `bd backup remove` | Unregister the backup destination |
+| `bd backup status` | Show backup configuration and last sync time |
+
+### Notes
+
+- Data locations differ between modes: `.beads/embeddeddolt/` (embedded) vs `.beads/dolt/` (server)
+- The backup directory is a full Dolt backup — it can be on a local drive, NAS, or DoltHub
+- You can also migrate via Dolt remotes (`bd dolt push` / `bd dolt pull`) if both projects share a remote
+
+See also [DOLT-BACKEND.md](DOLT-BACKEND.md#migrating-between-backends).
 
 ## Federation (Peer-to-Peer Sync)
 
@@ -157,9 +244,10 @@ When someone clones a repository that uses Dolt backend:
 - Clones the Dolt database from the remote (instead of creating a fresh one)
 - Configures the Dolt remote for future `bd dolt push`/`pull`
 
-If `sync.git-remote` is set in `.beads/config.yaml`, that takes precedence
-over auto-detection. `bd init` will warn if it detects `refs/dolt/data` on
-origin and suggest using `bd bootstrap` instead.
+If `sync.remote` is set in `.beads/config.yaml`, that takes precedence
+over auto-detection. Any Dolt-compatible remote URL is supported (DoltHub,
+S3, GCS, file, or git). `bd init` will warn if it detects `refs/dolt/data`
+on origin and suggest using `bd bootstrap` instead.
 
 ### Verifying Bootstrap Worked
 
@@ -229,13 +317,8 @@ bd doctor --server         # Server mode checks (if applicable)
 
 **Symptom:** "database is locked" errors.
 
-Embedded mode is single-writer. If you need concurrent access:
-
-```bash
-# Switch to server mode
-gt dolt start
-bd config set dolt.mode server
-```
+Embedded mode is single-writer (enforced via file lock). If you need concurrent
+access, switch to server mode. See [Migrating Between Backends](#migrating-between-backends).
 
 ## Configuration Reference
 
@@ -247,12 +330,13 @@ dolt:
   # Auto-commit Dolt history after writes (default: on for embedded, off for server)
   auto-commit: on        # on | off
 
-  # Server mode settings (when mode: server)
+  # Storage mode (default: embedded)
   mode: embedded         # embedded | server
+  # Server mode settings (only used when mode: server)
   host: 127.0.0.1
   port: 3307
   user: root
-  # Password via BEADS_DOLT_PASSWORD env var
+  # Password: env var or credentials file (see below)
 
   # Shared server mode (GH#2377): all projects share a single Dolt server
   # at ~/.beads/shared-server/. Each project uses its own database (prefix-based).
@@ -267,7 +351,8 @@ dolt:
 
 | Variable | Purpose |
 |----------|---------|
-| `BEADS_DOLT_PASSWORD` | Server mode password |
+| `BEADS_DOLT_PASSWORD` | Server mode password (highest priority) |
+| `BEADS_CREDENTIALS_FILE` | Path to credentials file (overrides default location) |
 | `BEADS_DOLT_SERVER_MODE` | Enable server mode (set to "1") |
 | `BEADS_DOLT_SERVER_HOST` | Server host (default: 127.0.0.1) |
 | `BEADS_DOLT_SERVER_PORT` | Server port (default: 3307, or 3308 in shared mode) |
@@ -277,6 +362,49 @@ dolt:
 | `DOLT_REMOTE_USER` | Push/pull auth user |
 | `DOLT_REMOTE_PASSWORD` | Push/pull auth password |
 | `BD_DOLT_AUTO_COMMIT` | Override auto-commit setting |
+
+### Credentials File
+
+For multi-server setups, you can store passwords in an INI-style credentials file
+instead of juggling environment variables per project. Passwords are looked up by
+`[host:port]` section, so each project automatically gets the right password based
+on its configured server.
+
+**Password resolution order:**
+1. `BEADS_DOLT_PASSWORD` env var (highest priority, existing behavior)
+2. Credentials file lookup by `[host:port]` (using the resolved runtime port)
+3. Empty string (no password)
+
+**Port resolution note:** The `[host:port]` used for credential lookup matches the
+resolved runtime port (from the port file, env var, or config — in that priority
+order), not necessarily the port stored in `metadata.json`. This matters when using
+IAP tunnels: if your tunnel maps remote:3307 to localhost:3308, store your password
+under `[127.0.0.1:3308]` and the credentials file will match the actual connection.
+
+**Default location:** `~/.config/beads/credentials` (Linux/macOS), `%APPDATA%\beads\credentials` (Windows)
+
+**Override location:** Set `BEADS_CREDENTIALS_FILE` env var.
+
+**File format:**
+
+```ini
+# ~/.config/beads/credentials
+[127.0.0.1:3307]
+password=localDevPassword
+
+[beads.company.com:3307]
+password=teamServerPassword
+
+[10.0.1.50:3308]
+password=officePassword
+```
+
+**Permissions:** On Linux/macOS, a warning is printed to stderr if the file is
+readable by group or others (mirrors ssh behavior). Set permissions with:
+
+```bash
+chmod 600 ~/.config/beads/credentials
+```
 
 ## Dolt Version Control
 

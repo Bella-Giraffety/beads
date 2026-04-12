@@ -157,7 +157,6 @@ func TestInitCommand(t *testing.T) {
 					"*.db-shm",
 					"bd.sock",
 					"dolt/",
-					"dolt-access.lock",
 				}
 				for _, pattern := range expectedPatterns {
 					if !strings.Contains(gitignoreStr, pattern) {
@@ -428,8 +427,8 @@ func TestSetupClaudeSettings_InvalidJSON(t *testing.T) {
 		t.Error("Original file content should be preserved")
 	}
 
-	if strings.Contains(string(content), "bd onboard") {
-		t.Error("File should NOT contain bd onboard prompt after error")
+	if strings.Contains(string(content), "bd prime") {
+		t.Error("File should NOT contain bd prime prompt after error")
 	}
 }
 
@@ -476,8 +475,8 @@ func TestSetupClaudeSettings_ValidJSON(t *testing.T) {
 	contentStr := string(content)
 
 	// Should contain the new prompt
-	if !strings.Contains(contentStr, "bd onboard") {
-		t.Error("File should contain bd onboard prompt")
+	if !strings.Contains(contentStr, "bd prime") {
+		t.Error("File should contain bd prime prompt")
 	}
 
 	// Should preserve existing permissions
@@ -516,8 +515,8 @@ func TestSetupClaudeSettings_NoExistingFile(t *testing.T) {
 		t.Fatalf("Failed to read settings file: %v", err)
 	}
 
-	if !strings.Contains(string(content), "bd onboard") {
-		t.Error("File should contain bd onboard prompt")
+	if !strings.Contains(string(content), "bd prime") {
+		t.Error("File should contain bd prime prompt")
 	}
 }
 
@@ -941,6 +940,48 @@ func TestInitContributorSetsBeadsRoleContributor(t *testing.T) {
 	}
 	if role != "contributor" {
 		t.Fatalf("beads.role = %q, want %q", role, "contributor")
+	}
+}
+
+// TestInitNonInteractiveAlwaysSetsRole verifies that bd init --non-interactive
+// always leaves beads.role set, even when no --role flag is provided (GH#2950).
+// This is the safety net for the init flow.
+func TestInitNonInteractiveAlwaysSetsRole(t *testing.T) {
+	skipIfNoDolt(t)
+
+	origDBPath := dbPath
+	defer func() { dbPath = origDBPath }()
+	dbPath = ""
+
+	beads.ResetCaches()
+	git.ResetCaches()
+	defer func() {
+		beads.ResetCaches()
+		git.ResetCaches()
+	}()
+
+	initCmd.Flags().Set("contributor", "false")
+	initCmd.Flags().Set("team", "false")
+	initCmd.Flags().Set("force", "false")
+	initCmd.Flags().Set("role", "")
+
+	tmpDir := newGitRepo(t)
+	t.Chdir(tmpDir)
+
+	// Ensure no role is set before init
+	exec.Command("git", "config", "--unset", "beads.role").Run() //nolint:errcheck
+
+	rootCmd.SetArgs([]string{"init", "--prefix", "test", "--quiet", "--non-interactive"})
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("init --non-interactive failed: %v", err)
+	}
+
+	role, hasRole := getBeadsRole()
+	if !hasRole {
+		t.Fatal("expected beads.role to be configured after non-interactive init (GH#2950)")
+	}
+	if role != "maintainer" {
+		t.Fatalf("beads.role = %q, want %q (default for non-interactive)", role, "maintainer")
 	}
 }
 
@@ -1450,12 +1491,11 @@ func TestInit_WithBEADS_DIR_DoltBackend(t *testing.T) {
 		t.Fatalf("Init with BEADS_DIR and Dolt backend failed: %v", err)
 	}
 
-	// Verify Dolt database was created at BEADS_DIR
-	expectedDoltPath := filepath.Join(beadsDirPath, "dolt")
-	if info, err := os.Stat(expectedDoltPath); os.IsNotExist(err) {
-		t.Errorf("Dolt database was not created at BEADS_DIR path: %s", expectedDoltPath)
-	} else if !info.IsDir() {
-		t.Errorf("Expected Dolt path to be a directory: %s", expectedDoltPath)
+	// In embedded mode (default), the engine creates .beads/embeddeddolt/ —
+	// .beads/dolt/ should NOT be created (GH#2903).
+	unexpectedDoltPath := filepath.Join(beadsDirPath, "dolt")
+	if _, err := os.Stat(unexpectedDoltPath); err == nil {
+		t.Errorf("Empty .beads/dolt/ should not be created in embedded mode: %s", unexpectedDoltPath)
 	}
 
 	// Verify database was NOT created at CWD
@@ -1889,6 +1929,50 @@ func TestInitDatabaseFlag(t *testing.T) {
 		}
 	})
 
+	t.Run("shared_server_flag_selects_server_mode", func(t *testing.T) {
+		tmpDir := t.TempDir()
+
+		cmd := exec.Command(bd, "init", "--shared-server", "--prefix", "shared-mode-test", "--skip-hooks")
+		cmd.Dir = tmpDir
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("bd init --shared-server failed: %v\n%s", err, out)
+		}
+
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		cfg, err := configfile.Load(beadsDir)
+		if err != nil {
+			t.Fatalf("Failed to load metadata.json: %v", err)
+		}
+		if cfg == nil {
+			t.Fatal("metadata.json not found")
+		}
+
+		if cfg.DoltMode != configfile.DoltModeServer {
+			t.Errorf("Expected DoltMode %q, got %q", configfile.DoltModeServer, cfg.DoltMode)
+		}
+
+		configYAML, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml"))
+		if err != nil {
+			t.Fatalf("Failed to read config.yaml: %v", err)
+		}
+		if !strings.Contains(string(configYAML), "dolt.shared-server: true") {
+			t.Fatalf("expected config.yaml to enable shared server, got:\n%s", configYAML)
+		}
+
+		outStr := string(out)
+		if !strings.Contains(outStr, "Shared server mode enabled") {
+			t.Fatalf("expected init output to mention shared server mode, got:\n%s", outStr)
+		}
+		if !strings.Contains(outStr, "Mode: server") {
+			t.Fatalf("expected init output to report server mode, got:\n%s", outStr)
+		}
+		if strings.Contains(outStr, "Mode: embedded") {
+			t.Fatalf("init output should not report embedded mode when --shared-server is set:\n%s", outStr)
+		}
+	})
+
 	t.Run("validation_invalid_name", func(t *testing.T) {
 		tmpDir := t.TempDir()
 
@@ -2082,4 +2166,99 @@ func TestInitBackendFlag(t *testing.T) {
 			t.Errorf("Expected backend %q, got %q", configfile.BackendDolt, cfg.Backend)
 		}
 	})
+}
+
+// TestInitDatabaseAdoptsExistingProjectID verifies that bd init --database adopts
+// the _project_id from an existing server database instead of generating a new one.
+// This prevents PROJECT IDENTITY MISMATCH errors when multiple users connect to
+// a shared remote Dolt server. (GH#2922)
+func TestInitDatabaseAdoptsExistingProjectID(t *testing.T) {
+	skipIfNoDolt(t)
+
+	// Reset global state
+	origDBPath := dbPath
+	origStore := store
+	defer func() {
+		if store != nil && store != origStore {
+			store.Close()
+		}
+		store = origStore
+		dbPath = origDBPath
+	}()
+	dbPath = ""
+	store = nil
+
+	ctx := context.Background()
+
+	// Create a database with a known _project_id (simulates first user's init)
+	database := uniqueTestDBName(t)
+	firstBeadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(firstBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	doltNewMutex.Lock()
+	firstStore, err := dolt.New(ctx, &dolt.Config{
+		Path:            filepath.Join(firstBeadsDir, "dolt"),
+		BeadsDir:        firstBeadsDir,
+		ServerHost:      "127.0.0.1",
+		ServerPort:      testDoltServerPort,
+		Database:        database,
+		CreateIfMissing: true,
+	})
+	doltNewMutex.Unlock()
+	if err != nil {
+		t.Fatalf("create first store: %v", err)
+	}
+
+	knownProjectID := "test-known-project-id-gh2922"
+	if err := firstStore.SetMetadata(ctx, "_project_id", knownProjectID); err != nil {
+		t.Fatalf("set _project_id: %v", err)
+	}
+	if err := firstStore.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("set issue_prefix: %v", err)
+	}
+	firstStore.Close()
+
+	t.Cleanup(func() {
+		dropTestDatabase(database, testDoltServerPort)
+	})
+
+	// Simulate second user — init with --database pointing at the existing DB
+	secondDir := t.TempDir()
+	t.Chdir(secondDir)
+
+	// Set up minimal git repo (init expects it for repo_id)
+	if err := exec.Command("git", "-C", secondDir, "init").Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	_ = exec.Command("git", "-C", secondDir, "config", "user.email", "test@test.com").Run()
+	_ = exec.Command("git", "-C", secondDir, "config", "user.name", "Test").Run()
+
+	rootCmd.SetArgs([]string{
+		"init",
+		"--server",
+		"--server-host", "127.0.0.1",
+		"--server-port", fmt.Sprintf("%d", testDoltServerPort),
+		"--database", database,
+		"--prefix", "second",
+		"--quiet",
+		"--skip-hooks",
+		"--skip-agents",
+	})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("second init failed: %v", err)
+	}
+
+	// Verify the second user's metadata.json adopted the existing project_id
+	secondBeadsDir := filepath.Join(secondDir, ".beads")
+	cfg, err := configfile.Load(secondBeadsDir)
+	if err != nil {
+		t.Fatalf("load metadata.json: %v", err)
+	}
+
+	if cfg.ProjectID != knownProjectID {
+		t.Errorf("ProjectID = %q, want %q (should adopt existing project_id from server)", cfg.ProjectID, knownProjectID)
+	}
 }

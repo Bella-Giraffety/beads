@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Beads (bd) installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 #
 # ⚠️ IMPORTANT: This script must be EXECUTED, never SOURCED
 # ❌ WRONG: source install.sh (will exit your shell on errors)
@@ -19,19 +19,97 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 log_info() {
-    echo -e "${BLUE}==>${NC} $1"
+    echo -e "${BLUE}==>${NC} $1" >&2
 }
 
 log_success() {
-    echo -e "${GREEN}==>${NC} $1"
+    echo -e "${GREEN}==>${NC} $1" >&2
 }
 
 log_warning() {
-    echo -e "${YELLOW}==>${NC} $1"
+    echo -e "${YELLOW}==>${NC} $1" >&2
 }
 
 log_error() {
     echo -e "${RED}Error:${NC} $1" >&2
+}
+
+append_env_flag() {
+    local var_name=$1
+    local flag_value=$2
+    local current_value
+
+    current_value=${!var_name:-}
+    if [ -n "$current_value" ]; then
+        export "$var_name=$current_value $flag_value"
+    else
+        export "$var_name=$flag_value"
+    fi
+}
+
+configure_cgo_build_env() {
+    local system
+    system=$(uname -s)
+
+    case "$system" in
+        Darwin)
+            if command -v brew &> /dev/null; then
+                local icu_prefix
+                icu_prefix=$(brew --prefix icu4c 2>/dev/null || true)
+                if [ -n "$icu_prefix" ]; then
+                    append_env_flag CGO_CFLAGS "-I${icu_prefix}/include"
+                    append_env_flag CGO_CPPFLAGS "-I${icu_prefix}/include"
+                    append_env_flag CGO_LDFLAGS "-L${icu_prefix}/lib -Wl,-rpath,${icu_prefix}/lib"
+                    log_info "Configured CGO to use Homebrew icu4c at ${icu_prefix}"
+                fi
+            fi
+            ;;
+        Linux|FreeBSD)
+            if command -v pkg-config &> /dev/null && pkg-config --exists icu-i18n; then
+                local icu_cflags
+                local icu_libs
+                icu_cflags=$(pkg-config --cflags icu-i18n)
+                icu_libs=$(pkg-config --libs icu-i18n)
+                if [ -n "$icu_cflags" ]; then
+                    append_env_flag CGO_CFLAGS "$icu_cflags"
+                    append_env_flag CGO_CPPFLAGS "$icu_cflags"
+                fi
+                if [ -n "$icu_libs" ]; then
+                    append_env_flag CGO_LDFLAGS "$icu_libs"
+                fi
+                log_info "Configured CGO to use pkg-config ICU flags"
+            elif command -v brew &> /dev/null; then
+                local icu_prefix
+                icu_prefix=$(brew --prefix icu4c 2>/dev/null || true)
+                if [ -n "$icu_prefix" ]; then
+                    append_env_flag CGO_CFLAGS "-I${icu_prefix}/include"
+                    append_env_flag CGO_CPPFLAGS "-I${icu_prefix}/include"
+                    append_env_flag CGO_LDFLAGS "-L${icu_prefix}/lib -Wl,-rpath,${icu_prefix}/lib"
+                    log_info "Configured CGO to use Homebrew icu4c at ${icu_prefix}"
+                fi
+            fi
+            ;;
+    esac
+}
+
+print_missing_icu_help() {
+    local system
+    system=$(uname -s)
+
+    case "$system" in
+        Darwin)
+            log_warning "Missing ICU headers. Install them with: brew install icu4c zstd"
+            log_warning "If icu4c is already installed, rerun this installer; it now auto-detects Homebrew's keg-only prefix."
+            ;;
+        Linux)
+            log_warning "Missing ICU headers. Install them with your package manager, for example:"
+            log_warning "  Debian/Ubuntu: sudo apt-get install -y libicu-dev libzstd-dev"
+            log_warning "  Fedora/RHEL: sudo dnf install -y libicu-devel libzstd-devel"
+            ;;
+        FreeBSD)
+            log_warning "Missing ICU headers. Install them with: pkg install -y icu zstd"
+            ;;
+    esac
 }
 
 release_has_asset() {
@@ -91,7 +169,7 @@ verify_release_checksum() {
     local archive_path=$4
 
     local checksums_name="checksums.txt"
-    local checksums_url="https://github.com/steveyegge/beads/releases/download/${version}/${checksums_name}"
+    local checksums_url="https://github.com/gastownhall/beads/releases/download/${version}/${checksums_name}"
 
     if ! release_has_asset "$release_json" "$checksums_name"; then
         log_error "Release metadata is missing ${checksums_name}; refusing to install unverified binary"
@@ -123,6 +201,24 @@ verify_release_checksum() {
 
     log_success "Checksum verified for ${archive_name}"
     return 0
+}
+
+find_extracted_bd() {
+    local search_dir=$1
+
+    if [ -x "$search_dir/bd" ]; then
+        printf '%s\n' "$search_dir/bd"
+        return 0
+    fi
+
+    local extracted_bd
+    extracted_bd=$(find "$search_dir" -mindepth 2 -maxdepth 2 -type f -name bd | head -n 1)
+    if [ -n "$extracted_bd" ] && [ -x "$extracted_bd" ]; then
+        printf '%s\n' "$extracted_bd"
+        return 0
+    fi
+
+    return 1
 }
 
 # Re-sign binary for macOS only when explicitly requested.
@@ -167,11 +263,11 @@ detect_platform() {
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*)
             log_error "Windows detected ($(uname -s))."
-            echo ""
-            echo "  This bash installer is for macOS/Linux. On Windows, use the PowerShell installer:"
-            echo ""
-            echo "    irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex"
-            echo ""
+            echo "" >&2
+            echo "  This bash installer is for macOS/Linux. On Windows, use the PowerShell installer:" >&2
+            echo "" >&2
+            echo "    irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex" >&2
+            echo "" >&2
             exit 1
             ;;
     esac
@@ -181,18 +277,18 @@ detect_platform() {
     # which is not accessible from native Windows tools.
     if [ -f /proc/version ] && grep -qi 'microsoft\|wsl' /proc/version 2>/dev/null; then
         log_warning "WSL (Windows Subsystem for Linux) detected."
-        echo ""
-        echo "  This will install the Linux version of bd, usable only inside WSL."
-        echo "  If you want bd available in native Windows (PowerShell, cmd), use:"
-        echo ""
-        echo "    irm https://raw.githubusercontent.com/steveyegge/beads/main/install.ps1 | iex"
-        echo ""
+        echo "" >&2
+        echo "  This will install the Linux version of bd, usable only inside WSL." >&2
+        echo "  If you want bd available in native Windows (PowerShell, cmd), use:" >&2
+        echo "" >&2
+        echo "    irm https://raw.githubusercontent.com/gastownhall/beads/main/install.ps1 | iex" >&2
+        echo "" >&2
         # Only show interactive message and pause if running in a terminal (skip in CI/non-interactive shells)
         if [ -t 0 ]; then
-            echo "  Continuing with Linux install for WSL in 5 seconds... (Ctrl+C to cancel)"
+            echo "  Continuing with Linux install for WSL in 5 seconds... (Ctrl+C to cancel)" >&2
             sleep 5
         else
-            echo "  Continuing with Linux install (non-interactive mode)..."
+            echo "  Continuing with Linux install (non-interactive mode)..." >&2
         fi
     fi
 
@@ -255,7 +351,7 @@ install_from_release() {
 
     # Get latest release version
     log_info "Fetching latest release..."
-    local latest_url="https://api.github.com/repos/steveyegge/beads/releases/latest"
+    local latest_url="https://api.github.com/repos/gastownhall/beads/releases/latest"
     local version
     local release_json
 
@@ -279,7 +375,7 @@ install_from_release() {
 
     # Download URL
     local archive_name="beads_${version#v}_${platform}.tar.gz"
-    local download_url="https://github.com/steveyegge/beads/releases/download/${version}/${archive_name}"
+    local download_url="https://github.com/gastownhall/beads/releases/download/${version}/${archive_name}"
 
     if ! release_has_asset "$release_json" "$archive_name"; then
         log_warning "No prebuilt archive available for platform ${platform}. Falling back to source installation methods."
@@ -312,6 +408,14 @@ install_from_release() {
         return 1
     fi
 
+    local extracted_bd
+    if ! extracted_bd=$(find_extracted_bd "$tmp_dir"); then
+        log_error "Extracted archive does not contain an executable 'bd' binary"
+        cd - > /dev/null || cd "$HOME"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
     # Determine install location
     local install_dir
     if [[ -w /usr/local/bin ]]; then
@@ -324,9 +428,19 @@ install_from_release() {
     # Install binary
     log_info "Installing to $install_dir..."
     if [[ -w "$install_dir" ]]; then
-        mv bd "$install_dir/"
+        if ! mv "$extracted_bd" "$install_dir/bd"; then
+            log_error "Failed to install bd to $install_dir"
+            cd - > /dev/null || cd "$HOME"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
     else
-        sudo mv bd "$install_dir/"
+        if ! sudo mv "$extracted_bd" "$install_dir/bd"; then
+            log_error "Failed to install bd to $install_dir"
+            cd - > /dev/null || cd "$HOME"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
     fi
 
     # Optional local ad-hoc re-sign for macOS (off by default)
@@ -336,6 +450,10 @@ install_from_release() {
     create_beads_alias "$install_dir"
 
     log_success "bd installed to $install_dir/bd"
+
+    # Record where we installed the binary so PATH precedence warnings can
+    # point to the newly installed release binary.
+    LAST_INSTALL_PATH="$install_dir/bd"
 
     # Check if install_dir is in PATH
     if [[ ":$PATH:" != *":$install_dir:"* ]]; then
@@ -406,8 +524,9 @@ verify_binary_has_cgo() {
 # Install using go install (fallback)
 install_with_go() {
     log_info "Installing bd using 'go install'..."
+    configure_cgo_build_env
 
-    if CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest; then
+    if CGO_ENABLED=1 go install github.com/gastownhall/beads/cmd/bd@latest; then
         log_success "bd installed successfully via go install"
 
         # Record where we expect the binary to have been installed
@@ -443,7 +562,7 @@ install_with_go() {
         return 0
     else
         log_error "go install failed"
-        log_warning "If you see 'unicode/uregex.h' missing, install ICU headers (macOS: brew install icu4c; Linux: libicu-dev or libicu-devel) and try again."
+        print_missing_icu_help
         return 1
     fi
 }
@@ -451,6 +570,7 @@ install_with_go() {
 # Build from source (last resort)
 build_from_source() {
     log_info "Building bd from source..."
+    configure_cgo_build_env
 
     local tmp_dir
     tmp_dir=$(mktemp -d)
@@ -458,11 +578,11 @@ build_from_source() {
     cd "$tmp_dir"
     log_info "Cloning repository..."
 
-    if git clone --depth 1 https://github.com/steveyegge/beads.git; then
+    if git clone --depth 1 https://github.com/gastownhall/beads.git; then
         cd beads
         log_info "Building binary..."
 
-        if CGO_ENABLED=1 go build -o bd ./cmd/bd; then
+        if CGO_ENABLED=1 go build -tags gms_pure_go -o bd ./cmd/bd; then
             if ! verify_binary_has_cgo "./bd" "source build"; then
                 cd - > /dev/null || cd "$HOME"
                 rm -rf "$tmp_dir"
@@ -510,7 +630,7 @@ build_from_source() {
             return 0
         else
             log_error "Build failed"
-            log_warning "If you see 'unicode/uregex.h' missing, install ICU headers (macOS: brew install icu4c; Linux: libicu-dev or libicu-devel) and try again."
+            print_missing_icu_help
     cd - > /dev/null || cd "$HOME"
             cd - > /dev/null
             rm -rf "$tmp_dir"
@@ -673,15 +793,16 @@ main() {
     log_error "Installation failed"
     echo ""
     echo "Manual installation:"
-    echo "  1. Download from https://github.com/steveyegge/beads/releases/latest"
+    echo "  1. Download from https://github.com/gastownhall/beads/releases/latest"
     echo "  2. Verify SHA256 checksum against checksums.txt"
     echo "  3. Extract and move 'bd' to your PATH"
     echo ""
     echo "Or install from source:"
     echo "  1. Install Go from https://go.dev/dl/"
-    echo "  2. Run: CGO_ENABLED=1 go install github.com/steveyegge/beads/cmd/bd@latest"
+    echo "  2. Run: CGO_ENABLED=1 go install github.com/gastownhall/beads/cmd/bd@latest"
     echo ""
     exit 1
 }
 
 main "$@"
+

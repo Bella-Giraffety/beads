@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -15,6 +16,21 @@ import (
 	"strings"
 	"time"
 )
+
+// APIError represents an HTTP error response from the Azure DevOps API.
+// It carries the HTTP status code so callers can use errors.As to inspect
+// the status without fragile string matching.
+type APIError struct {
+	// StatusCode is the HTTP status code returned by the API.
+	StatusCode int
+	// Body is the response body text.
+	Body string
+}
+
+// Error implements the error interface.
+func (e *APIError) Error() string {
+	return fmt.Sprintf("API error: %s (status %d)", e.Body, e.StatusCode)
+}
 
 // PullFilters configures which work items to pull from ADO.
 // All filter values are validated before use in WIQL queries.
@@ -207,6 +223,9 @@ func (c *Client) doRequest(ctx context.Context, method, urlStr, contentType stri
 			lastErr = fmt.Errorf("request failed (attempt %d/%d): %w", attempt+1, maxAttempts+1, err)
 			if attempt < maxAttempts {
 				delay := RetryDelay * time.Duration(1<<uint(attempt))
+				if half := int64(delay / 2); half > 0 {
+					delay += time.Duration(rand.Int64N(half)) //nolint:gosec // G404: jitter for retry backoff does not need crypto rand
+				}
 				select {
 				case <-ctx.Done():
 					return nil, ctx.Err()
@@ -230,7 +249,7 @@ func (c *Client) doRequest(ctx context.Context, method, urlStr, contentType stri
 		// Permanent failures — no retry.
 		switch resp.StatusCode {
 		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
-			return nil, fmt.Errorf("API error: %s (status %d)", string(respBody), resp.StatusCode)
+			return nil, &APIError{StatusCode: resp.StatusCode, Body: string(respBody)}
 		}
 
 		// Retry on 429 and 5xx server errors (idempotent requests only).
@@ -239,9 +258,17 @@ func (c *Client) doRequest(ctx context.Context, method, urlStr, contentType stri
 
 		if retriable && attempt < maxAttempts {
 			delay := RetryDelay * time.Duration(1<<uint(attempt))
+			useServerDelay := false
 			if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
 				if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil {
 					delay = time.Duration(seconds) * time.Second
+					useServerDelay = true
+				}
+			}
+			// Only add jitter to our own exponential backoff, not server-mandated delays
+			if !useServerDelay {
+				if half := int64(delay / 2); half > 0 {
+					delay += time.Duration(rand.Int64N(half)) //nolint:gosec // G404: jitter for retry backoff does not need crypto rand
 				}
 			}
 			lastErr = fmt.Errorf("transient error %d (attempt %d/%d)", resp.StatusCode, attempt+1, maxAttempts+1)
@@ -253,7 +280,7 @@ func (c *Client) doRequest(ctx context.Context, method, urlStr, contentType stri
 			}
 		}
 
-		return nil, fmt.Errorf("API error: %s (status %d)", string(respBody), resp.StatusCode)
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(respBody)}
 	}
 
 	return nil, fmt.Errorf("max retries (%d) exceeded: %w", maxAttempts+1, lastErr)
@@ -277,6 +304,14 @@ type listResponse struct {
 func escapeWIQL(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	return strings.ReplaceAll(s, "'", "''")
+}
+
+// formatWIQLDate formats a time.Time for use in WIQL datetime literals.
+// WIQL expects UTC ISO 8601 dates in single quotes: 'YYYY-MM-DDTHH:MM:SSZ'.
+// The time is converted to UTC and formatted with time.RFC3339, which uses
+// the proper Z07:00 timezone placeholder (outputs "Z" for UTC).
+func formatWIQLDate(t time.Time) string {
+	return t.UTC().Format(time.RFC3339)
 }
 
 // buildPatchOps converts a field map into sorted JSON Patch operations.
@@ -336,14 +371,29 @@ func (c *Client) FetchWorkItems(ctx context.Context, ids []int) ([]WorkItem, err
 // buildPullWIQL constructs a safe WIQL query from validated filter fields.
 // All values are escaped via escapeWIQL before interpolation.
 func (c *Client) buildPullWIQL(since *time.Time, filters *PullFilters) string {
+	return c.buildPullWIQLMulti([]string{c.Project}, since, filters)
+}
+
+// buildPullWIQLMulti builds a WIQL query that can filter across multiple projects.
+func (c *Client) buildPullWIQLMulti(projects []string, since *time.Time, filters *PullFilters) string {
+	var projectClause string
+	if len(projects) == 1 {
+		projectClause = fmt.Sprintf("[System.TeamProject] = '%s'", escapeWIQL(projects[0]))
+	} else {
+		quoted := make([]string, len(projects))
+		for i, p := range projects {
+			quoted[i] = "'" + escapeWIQL(p) + "'"
+		}
+		projectClause = fmt.Sprintf("[System.TeamProject] IN (%s)", strings.Join(quoted, ", "))
+	}
 	clauses := []string{
-		fmt.Sprintf("[System.TeamProject] = '%s'", escapeWIQL(c.Project)),
+		projectClause,
 		"[System.IsDeleted] = false",
 	}
 	if since != nil {
 		clauses = append(clauses, fmt.Sprintf(
 			"[System.ChangedDate] >= '%s'",
-			since.UTC().Format("2006-01-02T15:04:05Z"),
+			formatWIQLDate(*since),
 		))
 	}
 	if filters != nil {
@@ -410,24 +460,34 @@ func (c *Client) fetchWorkItemsByWIQL(ctx context.Context, query string) ([]Work
 // FetchWorkItemsSince retrieves work items changed since the given time using WIQL.
 // Pass nil for filters to fetch all work item types and states.
 func (c *Client) FetchWorkItemsSince(ctx context.Context, since time.Time, filters *PullFilters) ([]WorkItem, error) {
+	return c.FetchWorkItemsSinceMulti(ctx, since, []string{c.Project}, filters)
+}
+
+// FetchWorkItemsSinceMulti retrieves work items from multiple projects changed since the given time.
+func (c *Client) FetchWorkItemsSinceMulti(ctx context.Context, since time.Time, projects []string, filters *PullFilters) ([]WorkItem, error) {
 	if filters != nil {
 		if err := filters.Validate(); err != nil {
 			return nil, fmt.Errorf("invalid pull filters: %w", err)
 		}
 	}
-	query := c.buildPullWIQL(&since, filters)
+	query := c.buildPullWIQLMulti(projects, &since, filters)
 	return c.fetchWorkItemsByWIQL(ctx, query)
 }
 
 // FetchAllWorkItems retrieves all work items matching the given filters.
 // Used for initial sync or reconciliation.
 func (c *Client) FetchAllWorkItems(ctx context.Context, filters *PullFilters) ([]WorkItem, error) {
+	return c.FetchAllWorkItemsMulti(ctx, []string{c.Project}, filters)
+}
+
+// FetchAllWorkItemsMulti retrieves all work items from multiple projects.
+func (c *Client) FetchAllWorkItemsMulti(ctx context.Context, projects []string, filters *PullFilters) ([]WorkItem, error) {
 	if filters != nil {
 		if err := filters.Validate(); err != nil {
 			return nil, fmt.Errorf("invalid pull filters: %w", err)
 		}
 	}
-	query := c.buildPullWIQL(nil, filters)
+	query := c.buildPullWIQLMulti(projects, nil, filters)
 	return c.fetchWorkItemsByWIQL(ctx, query)
 }
 

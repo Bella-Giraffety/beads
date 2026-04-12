@@ -11,7 +11,7 @@ import (
 // GitignoreTemplate is the canonical .beads/.gitignore content
 const GitignoreTemplate = `# Dolt database (managed by Dolt, not git)
 dolt/
-dolt-access.lock
+embeddeddolt/
 
 # Runtime files
 bd.sock
@@ -46,6 +46,7 @@ redirect
 # These files are machine-specific and should not be shared across clones
 .sync.lock
 export-state/
+export-state.json
 
 # Ephemeral store (SQLite - wisps/molecules, intentionally not versioned)
 ephemeral.sqlite3
@@ -103,8 +104,9 @@ var requiredPatterns = []string{
 	"bd.sock.startlock",
 	".sync.lock",
 	"export-state/",
+	"export-state.json",
 	"dolt/",
-	"dolt-access.lock",
+	"embeddeddolt/",
 	"ephemeral.sqlite3",
 	"dolt-server.pid",
 	"dolt-server.log",

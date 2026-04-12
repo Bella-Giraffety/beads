@@ -520,14 +520,17 @@ type IssueType string
 // Core work type constants - these are the built-in types that beads validates.
 // All other types require configuration via types.custom in config.yaml.
 const (
-	TypeBug      IssueType = "bug"
-	TypeFeature  IssueType = "feature"
-	TypeTask     IssueType = "task"
-	TypeEpic     IssueType = "epic"
-	TypeChore    IssueType = "chore"
-	TypeDecision IssueType = "decision"
-	TypeMessage  IssueType = "message"
-	TypeMolecule IssueType = "molecule" // Molecule type for swarm coordination (internal use)
+	TypeBug       IssueType = "bug"
+	TypeFeature   IssueType = "feature"
+	TypeTask      IssueType = "task"
+	TypeEpic      IssueType = "epic"
+	TypeChore     IssueType = "chore"
+	TypeDecision  IssueType = "decision"
+	TypeMessage   IssueType = "message"
+	TypeMolecule  IssueType = "molecule"  // Molecule type for swarm coordination (internal use)
+	TypeSpike     IssueType = "spike"     // Timeboxed investigation to reduce uncertainty
+	TypeStory     IssueType = "story"     // User story describing a feature from the user's perspective
+	TypeMilestone IssueType = "milestone" // Marks completion of a set of related issues (no work itself)
 )
 
 // TypeEvent is a system-internal type used by set-state for audit trail beads.
@@ -543,11 +546,12 @@ const TypeEvent IssueType = "event"
 // (message was re-promoted to built-in for inter-agent communication — GH#1347.)
 
 // IsValid checks if the issue type is a core work type.
-// Core work types (bug, feature, task, epic, chore, decision, message) and molecule type are built-in.
-// Other types (gate, convoy, etc.) require types.custom configuration.
+// Core work types (bug, feature, task, epic, chore, decision, message, spike, story, milestone)
+// and molecule type are built-in. Other types require types.custom configuration.
 func (t IssueType) IsValid() bool {
 	switch t {
-	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeDecision, TypeMessage, TypeMolecule:
+	case TypeBug, TypeFeature, TypeTask, TypeEpic, TypeChore, TypeDecision, TypeMessage, TypeMolecule,
+		TypeSpike, TypeStory, TypeMilestone:
 		return true
 	}
 	return false
@@ -585,6 +589,12 @@ func (t IssueType) Normalize() IssueType {
 		return TypeFeature
 	case "dec", "adr":
 		return TypeDecision
+	case "investigation", "timebox":
+		return TypeSpike
+	case "user-story", "user_story":
+		return TypeStory
+	case "ms":
+		return TypeMilestone
 	default:
 		return t
 	}
@@ -606,7 +616,7 @@ func (t IssueType) RequiredSections() []RequiredSection {
 			{Heading: "## Steps to Reproduce", Hint: "Describe how to reproduce the bug"},
 			{Heading: "## Acceptance Criteria", Hint: "Define criteria to verify the fix"},
 		}
-	case TypeTask, TypeFeature:
+	case TypeTask, TypeFeature, TypeStory:
 		return []RequiredSection{
 			{Heading: "## Acceptance Criteria", Hint: "Define criteria to verify completion"},
 		}
@@ -620,8 +630,13 @@ func (t IssueType) RequiredSections() []RequiredSection {
 			{Heading: "## Rationale", Hint: "Explain why this option was chosen"},
 			{Heading: "## Alternatives Considered", Hint: "List alternatives and why they were rejected"},
 		}
+	case TypeSpike:
+		return []RequiredSection{
+			{Heading: "## Goal", Hint: "What question does this spike answer?"},
+			{Heading: "## Findings", Hint: "What was learned? (fill in when complete)"},
+		}
 	default:
-		// Chore and custom types have no required sections
+		// Chore, milestone, and custom types have no required sections
 		return nil
 	}
 }
@@ -908,6 +923,33 @@ type Comment struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// UnmarshalJSON handles backward compatibility for Comment.
+// Pre-v1.0 exported Comment.ID as int64; current schema uses string.
+func (c *Comment) UnmarshalJSON(data []byte) error {
+	type commentAlias Comment // avoid recursion
+	var raw struct {
+		commentAlias
+		RawID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*c = Comment(raw.commentAlias)
+	if len(raw.RawID) > 0 {
+		// try string first, fall back to number
+		var s string
+		if err := json.Unmarshal(raw.RawID, &s); err == nil {
+			c.ID = s
+		} else {
+			var n json.Number
+			if err := json.Unmarshal(raw.RawID, &n); err == nil {
+				c.ID = n.String()
+			}
+		}
+	}
+	return nil
+}
+
 // Event represents an audit trail entry
 type Event struct {
 	ID        string    `json:"id"`
@@ -943,6 +985,138 @@ type BlockedIssue struct {
 	Issue
 	BlockedByCount int      `json:"blocked_by_count"`
 	BlockedBy      []string `json:"blocked_by"`
+}
+
+// ReadyExplanation provides reasoning for why issues are ready or blocked.
+type ReadyExplanation struct {
+	Ready   []ReadyItem    `json:"ready"`
+	Blocked []BlockedItem  `json:"blocked"`
+	Cycles  [][]string     `json:"cycles,omitempty"`
+	Summary ExplainSummary `json:"summary"`
+}
+
+// ReadyItem explains why a specific issue is ready for work.
+type ReadyItem struct {
+	*Issue
+	Reason           string   `json:"reason"`
+	ResolvedBlockers []string `json:"resolved_blockers"`
+	DependencyCount  int      `json:"dependency_count"`
+	DependentCount   int      `json:"dependent_count"`
+	Parent           *string  `json:"parent,omitempty"`
+}
+
+// BlockedItem explains why a specific issue is blocked.
+type BlockedItem struct {
+	Issue
+	BlockedBy      []BlockerInfo `json:"blocked_by"`
+	BlockedByCount int           `json:"blocked_by_count"`
+}
+
+// BlockerInfo provides details about a single blocker.
+type BlockerInfo struct {
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Status   Status `json:"status"`
+	Priority int    `json:"priority"`
+}
+
+// ExplainSummary provides aggregate statistics.
+type ExplainSummary struct {
+	TotalReady   int `json:"total_ready"`
+	TotalBlocked int `json:"total_blocked"`
+	CycleCount   int `json:"cycle_count"`
+}
+
+// BuildReadyExplanation constructs a ReadyExplanation from pre-fetched data.
+// This pure function is separated from CLI concerns for testability.
+func BuildReadyExplanation(
+	readyIssues []*Issue,
+	blockedIssues []*BlockedIssue,
+	depCounts map[string]*DependencyCounts,
+	allDeps map[string][]*Dependency,
+	blockerMap map[string]*Issue,
+	cycles [][]*Issue,
+) ReadyExplanation {
+	// Build ready items with explanations
+	readyItems := make([]ReadyItem, 0, len(readyIssues))
+	for _, issue := range readyIssues {
+		counts := depCounts[issue.ID]
+		if counts == nil {
+			counts = &DependencyCounts{}
+		}
+
+		// Find resolved blockers (closed issues that this depended on)
+		var resolvedBlockers []string
+		reason := "no blocking dependencies"
+		deps := allDeps[issue.ID]
+		for _, dep := range deps {
+			if dep.Type == DepBlocks || dep.Type == DepConditionalBlocks || dep.Type == DepWaitsFor {
+				resolvedBlockers = append(resolvedBlockers, dep.DependsOnID)
+			}
+		}
+		if len(resolvedBlockers) > 0 {
+			reason = fmt.Sprintf("%d blocker(s) resolved", len(resolvedBlockers))
+		}
+
+		// Compute parent
+		var parent *string
+		for _, dep := range deps {
+			if dep.Type == DepParentChild {
+				parent = &dep.DependsOnID
+				break
+			}
+		}
+
+		readyItems = append(readyItems, ReadyItem{
+			Issue:            issue,
+			Reason:           reason,
+			ResolvedBlockers: resolvedBlockers,
+			DependencyCount:  counts.DependencyCount,
+			DependentCount:   counts.DependentCount,
+			Parent:           parent,
+		})
+	}
+
+	// Build blocked items with blocker details
+	blockedItems := make([]BlockedItem, 0, len(blockedIssues))
+	for _, bi := range blockedIssues {
+		blockers := make([]BlockerInfo, 0, len(bi.BlockedBy))
+		for _, blockerID := range bi.BlockedBy {
+			info := BlockerInfo{ID: blockerID}
+			if blocker, ok := blockerMap[blockerID]; ok {
+				info.Title = blocker.Title
+				info.Status = blocker.Status
+				info.Priority = blocker.Priority
+			}
+			blockers = append(blockers, info)
+		}
+		blockedItems = append(blockedItems, BlockedItem{
+			Issue:          bi.Issue,
+			BlockedBy:      blockers,
+			BlockedByCount: bi.BlockedByCount,
+		})
+	}
+
+	// Build cycle info
+	var cycleIDs [][]string
+	for _, cycle := range cycles {
+		ids := make([]string, len(cycle))
+		for i, issue := range cycle {
+			ids[i] = issue.ID
+		}
+		cycleIDs = append(cycleIDs, ids)
+	}
+
+	return ReadyExplanation{
+		Ready:   readyItems,
+		Blocked: blockedItems,
+		Cycles:  cycleIDs,
+		Summary: ExplainSummary{
+			TotalReady:   len(readyItems),
+			TotalBlocked: len(blockedItems),
+			CycleCount:   len(cycleIDs),
+		},
+	}
 }
 
 // TreeNode represents a node in a dependency tree
@@ -991,6 +1165,7 @@ type Statistics struct {
 // IssueFilter is used to filter issue queries
 type IssueFilter struct {
 	Status       *Status
+	Statuses     []Status // Multiple status OR filter (from comma-separated --status)
 	Priority     *int
 	IssueType    *IssueType
 	Assignee     *string
@@ -1066,6 +1241,10 @@ type IssueFilter struct {
 	// Metadata field filtering (GH#1406)
 	MetadataFields map[string]string // Top-level key=value equality; AND semantics (all must match)
 	HasMetadataKey string            // Existence check: issue has this top-level key set (non-null)
+
+	// Hydration options — control which relational data is populated on returned issues.
+	// Labels are always hydrated. Dependencies are not by default (for performance).
+	IncludeDependencies bool // When true, populate Issue.Dependencies with []*Dependency records
 }
 
 // SortPolicy determines how ready work is ordered
@@ -1113,6 +1292,9 @@ type WorkFilter struct {
 	// Parent filtering: filter to descendants of a bead/epic (recursive)
 	ParentID *string // Show all descendants of this issue
 
+	// Molecule filtering: filter to direct children of this molecule
+	MoleculeID string // If set, only return issues that are children of this molecule
+
 	// Molecule type filtering
 	MolType *MolType // Filter by molecule type (nil = any, swarm/patrol/work)
 
@@ -1144,6 +1326,34 @@ type StaleFilter struct {
 	Limit  int    // Maximum issues to return
 }
 
+// WispFilter is used to filter ListWisps queries.
+// All fields are optional (zero value = no filter).
+// ListWisps always restricts to ephemeral issues (Ephemeral=true).
+type WispFilter struct {
+	// Type filters by issue type (e.g., "agent", "task", "patrol").
+	// nil = any type.
+	Type *IssueType
+
+	// Status filters by issue status.
+	// nil = non-closed only (open, in_progress, blocked).
+	Status *Status
+
+	// UpdatedAfter excludes wisps last updated before this time.
+	// Use this for age-based filtering (e.g., only wisps updated in the last hour).
+	UpdatedAfter *time.Time
+
+	// UpdatedBefore excludes wisps last updated after this time.
+	// Use this for staleness detection.
+	UpdatedBefore *time.Time
+
+	// IncludeClosed includes closed wisps in the results.
+	// When true and Status is nil, all statuses are returned.
+	IncludeClosed bool
+
+	// Limit caps the number of results returned (0 = no limit).
+	Limit int
+}
+
 // EpicStatus represents an epic with its completion status
 type EpicStatus struct {
 	Epic             *Issue `json:"epic"`
@@ -1159,6 +1369,24 @@ type BondRef struct {
 	SourceID  string `json:"source_id"`            // Source proto or molecule ID
 	BondType  string `json:"bond_type"`            // sequential, parallel, conditional
 	BondPoint string `json:"bond_point,omitempty"` // Attachment site (issue ID or empty for root)
+}
+
+// UnmarshalJSON handles backward compatibility for BondRef.
+// Pre-v0.63 used "proto_id" instead of "source_id".
+func (b *BondRef) UnmarshalJSON(data []byte) error {
+	type bondAlias BondRef // avoid recursion
+	var raw struct {
+		bondAlias
+		ProtoID string `json:"proto_id"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*b = BondRef(raw.bondAlias)
+	if b.SourceID == "" && raw.ProtoID != "" {
+		b.SourceID = raw.ProtoID
+	}
+	return nil
 }
 
 // Bond type constants for compound molecules

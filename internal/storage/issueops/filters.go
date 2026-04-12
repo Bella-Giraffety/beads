@@ -67,6 +67,14 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 		whereClauses = append(whereClauses, "status = ?")
 		args = append(args, *filter.Status)
 	}
+	if len(filter.Statuses) > 0 {
+		placeholders := make([]string, len(filter.Statuses))
+		for i, s := range filter.Statuses {
+			placeholders[i] = "?"
+			args = append(args, string(s))
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("status IN (%s)", strings.Join(placeholders, ",")))
+	}
 	if len(filter.ExcludeStatus) > 0 {
 		placeholders := make([]string, len(filter.ExcludeStatus))
 		for i, s := range filter.ExcludeStatus {
@@ -247,7 +255,7 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 			return nil, nil, err
 		}
 		whereClauses = append(whereClauses, "JSON_EXTRACT(metadata, ?) IS NOT NULL")
-		args = append(args, "$."+filter.HasMetadataKey)
+		args = append(args, storage.JSONMetadataPath(filter.HasMetadataKey))
 	}
 	if len(filter.MetadataFields) > 0 {
 		metaKeys := make([]string, 0, len(filter.MetadataFields))
@@ -260,7 +268,7 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 				return nil, nil, err
 			}
 			whereClauses = append(whereClauses, "JSON_UNQUOTE(JSON_EXTRACT(metadata, ?)) = ?")
-			args = append(args, "$."+k, filter.MetadataFields[k])
+			args = append(args, storage.JSONMetadataPath(k), filter.MetadataFields[k])
 		}
 	}
 

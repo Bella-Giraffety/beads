@@ -5,24 +5,13 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
-
-// getBeadsDir returns the .beads directory path, derived from the global dbPath.
-func getBeadsDir() string {
-	if dbPath != "" {
-		return filepath.Dir(dbPath)
-	}
-	return ""
-}
 
 // resolveIDWithRouting resolves a partial issue ID using prefix-based routing.
 // It returns the resolved full ID and the store that contains the issue.
@@ -162,7 +151,7 @@ Examples:
 			// Check for cycles after adding dependency
 			warnIfCyclesExist(fromStore)
 
-			if isEmbeddedDolt && fromStore != nil {
+			if isEmbeddedMode() && fromStore != nil {
 				if _, err := fromStore.CommitPending(ctx, actor); err != nil {
 					FatalErrorRespectJSON("failed to commit: %v", err)
 				}
@@ -277,11 +266,13 @@ Examples:
 			var toCleanup func()
 			toID, _, toCleanup, err = resolveIDWithRouting(ctx, store, dependsOnArg)
 			if err != nil {
-				// Resolution failed - try auto-converting to external ref
-				beadsDir := getBeadsDir()
-				if extRef := routing.ResolveToExternalRef(dependsOnArg, beadsDir); extRef != "" {
-					toID = extRef
-					isExternalRef = true
+				// Cross-prefix deps: if the target has a different prefix than
+				// the source, skip resolution and pass the raw ID through.
+				// The storage layer's isCrossPrefixDep() handles this correctly.
+				srcPrefix := types.ExtractPrefix(fromID)
+				tgtPrefix := types.ExtractPrefix(dependsOnArg)
+				if srcPrefix != "" && tgtPrefix != "" && srcPrefix != tgtPrefix {
+					toID = dependsOnArg
 				} else {
 					FatalErrorRespectJSON("resolving dependency ID %s: %v", dependsOnArg, err)
 				}
@@ -316,7 +307,7 @@ Examples:
 		// Check for cycles after adding dependency
 		warnIfCyclesExist(fromStore)
 
-		if isEmbeddedDolt && fromStore != nil {
+		if isEmbeddedMode() && fromStore != nil {
 			if _, err := fromStore.CommitPending(ctx, actor); err != nil {
 				FatalErrorRespectJSON("failed to commit: %v", err)
 			}
@@ -338,123 +329,169 @@ Examples:
 }
 
 var depListCmd = &cobra.Command{
-	Use:   "list [issue-id]",
-	Short: "List dependencies or dependents of an issue",
-	Long: `List dependencies or dependents of an issue with optional type filtering.
+	Use:   "list [issue-id...]",
+	Short: "List dependencies or dependents of one or more issues",
+	Long: `List dependencies or dependents of one or more issues with optional type filtering.
 
-By default shows dependencies (what this issue depends on). Use --direction to control:
+By default shows dependencies (what issues depend on). Use --direction to control:
   - down: Show dependencies (what this issue depends on) - default
   - up:   Show dependents (what depends on this issue)
+
+Multiple IDs can be provided for batch dep listing. With --json, the output
+is a flat array of dependency records across all requested issues.
 
 Use --type to filter by dependency type (e.g., tracks, blocks, parent-child).
 
 Examples:
   bd dep list gt-abc                     # Show what gt-abc depends on
+  bd dep list gt-abc gt-def              # Batch: deps for both issues
   bd dep list gt-abc --direction=up      # Show what depends on gt-abc
   bd dep list gt-abc --direction=up -t tracks  # Show what tracks gt-abc (convoy tracking)`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		ctx := rootCtx
-
-		// Resolve partial ID with cross-rig routing support
-		var fullID string
-		var depStore storage.DoltStorage // store to query dependencies from
-		var routedResult *RoutedResult
-		defer func() {
-			if routedResult != nil {
-				routedResult.Close()
-			}
-		}()
-
-		// Direct mode - use routing-aware resolution
-		var err error
-		routedResult, err = resolveAndGetIssueWithRouting(ctx, store, args[0])
-		if err != nil {
-			FatalErrorRespectJSON("resolving %s: %v", args[0], err)
-		}
-		if routedResult == nil || routedResult.Issue == nil {
-			FatalErrorRespectJSON("no issue found: %s", args[0])
-		}
-		fullID = routedResult.ResolvedID
-		if routedResult.Routed {
-			depStore = routedResult.Store
-		}
-
-		// If no routed store was used, use local storage
-		if depStore == nil {
-			depStore = store
-		}
-
 		direction, _ := cmd.Flags().GetString("direction")
 		typeFilter, _ := cmd.Flags().GetString("type")
-
 		if direction == "" {
 			direction = "down"
 		}
 
-		var issues []*types.IssueWithDependencyMetadata
-
-		if direction == "up" {
-			issues, err = depStore.GetDependentsWithMetadata(ctx, fullID)
-		} else {
-			issues, err = depStore.GetDependenciesWithMetadata(ctx, fullID)
+		// Resolve all IDs and group by store.
+		type resolvedID struct {
+			fullID string
+			store  storage.DoltStorage
+			result *RoutedResult
 		}
-		if err != nil {
-			FatalErrorRespectJSON("%v", err)
+		var resolved []resolvedID
+		for _, arg := range args {
+			routedResult, err := resolveAndGetIssueWithRouting(ctx, store, arg)
+			if err != nil {
+				FatalErrorRespectJSON("resolving %s: %v", arg, err)
+			}
+			if routedResult == nil || routedResult.Issue == nil {
+				FatalErrorRespectJSON("no issue found: %s", arg)
+			}
+			depStore := store
+			if routedResult.Routed && routedResult.Store != nil {
+				depStore = routedResult.Store
+			}
+			resolved = append(resolved, resolvedID{
+				fullID: routedResult.ResolvedID,
+				store:  depStore,
+				result: routedResult,
+			})
 		}
-
-		// Resolve external references (cross-rig dependencies)
-		// GetDependenciesWithMetadata only returns local issues, so we need to
-		// fetch raw dependency records and resolve external refs separately
-		if direction == "down" {
-			externalIssues := resolveExternalDependencies(ctx, depStore, fullID, typeFilter)
-			issues = append(issues, externalIssues...)
-		}
-
-		// Apply type filter if specified
-		if typeFilter != "" {
-			var filtered []*types.IssueWithDependencyMetadata
-			for _, iss := range issues {
-				if string(iss.DependencyType) == typeFilter {
-					filtered = append(filtered, iss)
+		defer func() {
+			for _, r := range resolved {
+				if r.result != nil {
+					r.result.Close()
 				}
 			}
-			issues = filtered
+		}()
+
+		// Batch path: if all IDs route to the same store and direction
+		// is "down", use GetDependencyRecordsForIssues for one query.
+		if len(resolved) > 1 && direction == "down" {
+			allSameStore := true
+			firstStore := resolved[0].store
+			for _, r := range resolved[1:] {
+				if r.store != firstStore {
+					allSameStore = false
+					break
+				}
+			}
+			if allSameStore {
+				ids := make([]string, len(resolved))
+				for i, r := range resolved {
+					ids[i] = r.fullID
+				}
+				depMap, err := firstStore.GetDependencyRecordsForIssues(ctx, ids)
+				if err == nil {
+					// Flatten and filter.
+					var allDeps []*types.Dependency
+					for _, id := range ids {
+						for _, dep := range depMap[id] {
+							if typeFilter == "" || string(dep.Type) == typeFilter {
+								allDeps = append(allDeps, dep)
+							}
+						}
+					}
+					if jsonOutput {
+						if allDeps == nil {
+							allDeps = []*types.Dependency{}
+						}
+						outputJSON(allDeps)
+						return
+					}
+					// Human-readable output grouped by issue.
+					for _, id := range ids {
+						deps := depMap[id]
+						if len(deps) == 0 {
+							fmt.Printf("\n%s has no dependencies\n", id)
+							continue
+						}
+						fmt.Printf("\n%s %s depends on:\n\n", ui.RenderAccent("📋"), id)
+						for _, dep := range deps {
+							if typeFilter != "" && string(dep.Type) != typeFilter {
+								continue
+							}
+							fmt.Printf("  %s via %s\n", dep.DependsOnID, dep.Type)
+						}
+					}
+					fmt.Println()
+					return
+				}
+				// Fall through to per-ID path on error.
+			}
+		}
+
+		// Per-ID path (single ID or mixed stores or "up" direction).
+		var allIssues []*types.IssueWithDependencyMetadata
+		for _, r := range resolved {
+			var issues []*types.IssueWithDependencyMetadata
+			var err error
+			if direction == "up" {
+				issues, err = r.store.GetDependentsWithMetadata(ctx, r.fullID)
+			} else {
+				issues, err = r.store.GetDependenciesWithMetadata(ctx, r.fullID)
+			}
+			if err != nil {
+				FatalErrorRespectJSON("%v", err)
+			}
+			if typeFilter != "" {
+				var filtered []*types.IssueWithDependencyMetadata
+				for _, iss := range issues {
+					if string(iss.DependencyType) == typeFilter {
+						filtered = append(filtered, iss)
+					}
+				}
+				issues = filtered
+			}
+			allIssues = append(allIssues, issues...)
 		}
 
 		if jsonOutput {
-			if issues == nil {
-				issues = []*types.IssueWithDependencyMetadata{}
+			if allIssues == nil {
+				allIssues = []*types.IssueWithDependencyMetadata{}
 			}
-			outputJSON(issues)
+			outputJSON(allIssues)
 			return
 		}
 
-		if len(issues) == 0 {
-			if typeFilter != "" {
+		if len(allIssues) == 0 {
+			if len(resolved) == 1 {
 				if direction == "up" {
-					fmt.Printf("\nNo issues depend on %s with type '%s'\n", fullID, typeFilter)
+					fmt.Printf("\nNo issues depend on %s\n", resolved[0].fullID)
 				} else {
-					fmt.Printf("\n%s has no dependencies of type '%s'\n", fullID, typeFilter)
+					fmt.Printf("\n%s has no dependencies\n", resolved[0].fullID)
 				}
 			} else {
-				if direction == "up" {
-					fmt.Printf("\nNo issues depend on %s\n", fullID)
-				} else {
-					fmt.Printf("\n%s has no dependencies\n", fullID)
-				}
+				fmt.Println("\nNo dependencies found")
 			}
 			return
 		}
 
-		if direction == "up" {
-			fmt.Printf("\n%s Issues that depend on %s:\n\n", ui.RenderAccent("📋"), fullID)
-		} else {
-			fmt.Printf("\n%s %s depends on:\n\n", ui.RenderAccent("📋"), fullID)
-		}
-
-		for _, iss := range issues {
-			// Color the ID based on status
+		for _, iss := range allIssues {
 			var idStr string
 			switch iss.Status {
 			case types.StatusOpen:
@@ -468,7 +505,6 @@ Examples:
 			default:
 				idStr = iss.ID
 			}
-
 			fmt.Printf("  %s: %s [P%d] (%s) via %s\n",
 				idStr, iss.Title, iss.Priority, iss.Status, iss.DependencyType)
 		}
@@ -505,10 +541,12 @@ var depRemoveCmd = &cobra.Command{
 			var toCleanup func()
 			toID, _, toCleanup, err = resolveIDWithRouting(ctx, store, args[1])
 			if err != nil {
-				// Resolution failed - try auto-converting to external ref
-				beadsDir := getBeadsDir()
-				if extRef := routing.ResolveToExternalRef(args[1], beadsDir); extRef != "" {
-					toID = extRef
+				// Cross-prefix deps: if the target has a different prefix than
+				// the source, skip resolution and pass the raw ID through.
+				srcPrefix := types.ExtractPrefix(fromID)
+				tgtPrefix := types.ExtractPrefix(args[1])
+				if srcPrefix != "" && tgtPrefix != "" && srcPrefix != tgtPrefix {
+					toID = args[1]
 				} else {
 					FatalErrorRespectJSON("resolving dependency ID %s: %v", args[1], err)
 				}
@@ -525,7 +563,7 @@ var depRemoveCmd = &cobra.Command{
 			FatalErrorRespectJSON("%v", err)
 		}
 
-		if isEmbeddedDolt && fromStore != nil {
+		if isEmbeddedMode() && fromStore != nil {
 			if _, err := fromStore.CommitPending(ctx, actor); err != nil {
 				FatalErrorRespectJSON("failed to commit: %v", err)
 			}
@@ -1066,106 +1104,6 @@ func ParseExternalRef(ref string) (project, capability string) {
 		return "", ""
 	}
 	return parts[1], parts[2]
-}
-
-// resolveExternalDependencies fetches issue metadata for external (cross-rig) dependencies.
-// It queries raw dependency records, finds external refs, and resolves them via routing.
-func resolveExternalDependencies(ctx context.Context, depStore storage.DoltStorage, issueID string, typeFilter string) []*types.IssueWithDependencyMetadata {
-	if depStore == nil {
-		return nil
-	}
-
-	// Get raw dependency records to find external refs
-	deps, err := depStore.GetDependencyRecords(ctx, issueID)
-	if err != nil {
-		if isVerbose() {
-			fmt.Fprintf(os.Stderr, "[external-deps] GetDependencyRecords error: %v\n", err)
-		}
-		return nil // Silently fail - local deps still work
-	}
-
-	if isVerbose() {
-		fmt.Fprintf(os.Stderr, "[external-deps] found %d raw deps for %s\n", len(deps), issueID)
-	}
-
-	var result []*types.IssueWithDependencyMetadata
-	beadsDir := getBeadsDir()
-
-	for _, dep := range deps {
-		if isVerbose() {
-			fmt.Fprintf(os.Stderr, "[external-deps] checking dep: %s -> %s (%s)\n", dep.IssueID, dep.DependsOnID, dep.Type)
-		}
-
-		// Skip non-external refs (already handled by GetDependenciesWithMetadata)
-		if !IsExternalRef(dep.DependsOnID) {
-			continue
-		}
-
-		// Apply type filter early if specified
-		if typeFilter != "" && string(dep.Type) != typeFilter {
-			if isVerbose() {
-				fmt.Fprintf(os.Stderr, "[external-deps] skipping due to type filter: %s != %s\n", dep.Type, typeFilter)
-			}
-			continue
-		}
-
-		// Parse external ref: external:<project>:<issue-id>
-		project, targetID := ParseExternalRef(dep.DependsOnID)
-		if project == "" || targetID == "" {
-			if isVerbose() {
-				fmt.Fprintf(os.Stderr, "[external-deps] failed to parse external ref: %s\n", dep.DependsOnID)
-			}
-			continue
-		}
-
-		if isVerbose() {
-			fmt.Fprintf(os.Stderr, "[external-deps] parsed: project=%s, targetID=%s\n", project, targetID)
-		}
-
-		// Resolve the beads directory for this project via routing
-		targetBeadsDir, _, err := routing.ResolveBeadsDirForRig(project, beadsDir)
-		if err != nil {
-			if isVerbose() {
-				fmt.Fprintf(os.Stderr, "[external-deps] routing error for %s: %v\n", project, err)
-			}
-			continue // Project not configured in routes
-		}
-
-		if isVerbose() {
-			fmt.Fprintf(os.Stderr, "[external-deps] resolved beads dir: %s\n", targetBeadsDir)
-		}
-
-		// Open storage for the target rig (auto-detect backend from metadata.json)
-		targetStore, err := dolt.NewFromConfig(ctx, targetBeadsDir)
-		if err != nil {
-			if isVerbose() {
-				fmt.Fprintf(os.Stderr, "[external-deps] failed to open target db %s: %v\n", targetBeadsDir, err)
-			}
-			continue // Can't open target database
-		}
-
-		// Fetch the issue from the target rig
-		issue, err := targetStore.GetIssue(ctx, targetID)
-		_ = targetStore.Close() // Best effort cleanup
-		if err != nil || issue == nil {
-			if isVerbose() {
-				fmt.Fprintf(os.Stderr, "[external-deps] issue not found: %s (err=%v)\n", targetID, err)
-			}
-			continue // Issue not found in target
-		}
-
-		if isVerbose() {
-			fmt.Fprintf(os.Stderr, "[external-deps] resolved issue: %s - %s\n", issue.ID, issue.Title)
-		}
-
-		// Convert to IssueWithDependencyMetadata
-		result = append(result, &types.IssueWithDependencyMetadata{
-			Issue:          *issue,
-			DependencyType: dep.Type,
-		})
-	}
-
-	return result
 }
 
 func init() {

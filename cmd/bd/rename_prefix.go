@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
@@ -64,17 +63,6 @@ NOTE: This is a rare operation. Most users never need this command.`,
 
 		ctx := rootCtx
 
-		// Block rename-prefix in worktrees (same guard as init.go:168-186)
-		if isGitRepo() && git.IsWorktree() {
-			mainRepoRoot, _ := git.GetMainRepoRoot()
-			fmt.Fprintf(os.Stderr, "Error: cannot run 'bd rename-prefix' from a git worktree\n\n")
-			fmt.Fprintf(os.Stderr, "Worktrees share the .beads database from the main repository.\n\n")
-			fmt.Fprintf(os.Stderr, "Run this command from the main repository instead:\n")
-			fmt.Fprintf(os.Stderr, "  cd %s\n", mainRepoRoot)
-			fmt.Fprintf(os.Stderr, "  bd rename-prefix %s\n", newPrefix)
-			os.Exit(1)
-		}
-
 		// rename-prefix requires direct database access
 		if store == nil {
 			if err := ensureStoreActive(); err != nil {
@@ -121,6 +109,11 @@ NOTE: This is a rare operation. Most users never need this command.`,
 			if err := repairPrefixes(ctx, store, actor, newPrefix, issues, prefixes, dryRun); err != nil {
 				FatalError("failed to repair prefixes: %v", err)
 			}
+			if isEmbeddedMode() && !dryRun && store != nil {
+				if _, err := store.CommitPending(ctx, actor); err != nil {
+					FatalError("failed to commit: %v", err)
+				}
+			}
 			return
 		}
 
@@ -135,6 +128,11 @@ NOTE: This is a rare operation. Most users never need this command.`,
 			if !dryRun {
 				if err := store.SetConfig(ctx, "issue_prefix", newPrefix); err != nil {
 					FatalError("failed to update prefix: %v", err)
+				}
+				if isEmbeddedMode() && store != nil {
+					if _, err := store.CommitPending(ctx, actor); err != nil {
+						FatalError("failed to commit: %v", err)
+					}
 				}
 			}
 			return
@@ -172,6 +170,13 @@ NOTE: This is a rare operation. Most users never need this command.`,
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")
 			_ = enc.Encode(result) // Best effort: JSON encoding of simple struct does not fail in practice
+		}
+
+		// Embedded mode: flush Dolt commit.
+		if isEmbeddedMode() && store != nil {
+			if _, err := store.CommitPending(ctx, actor); err != nil {
+				FatalError("failed to commit: %v", err)
+			}
 		}
 	},
 }

@@ -225,13 +225,27 @@ const (
 
 // IsDoltServerMode returns true if Dolt should connect via sql-server.
 // Server mode is the standard connection method.
-// Checks the BEADS_DOLT_SERVER_MODE env var first, then falls back to the
-// dolt_mode field in metadata.json. Only applies when backend is "dolt".
+//
+// Checks (in priority order):
+//  1. BEADS_DOLT_SERVER_MODE=1 env var
+//  2. BEADS_DOLT_SHARED_SERVER env var (shared-server implies server mode)
+//  3. dolt_mode field in metadata.json
+//
+// Runtime env vars take precedence over persisted metadata.json to prevent
+// stale dolt_mode=embedded from overriding active server intent (GH#2949).
 func (c *Config) IsDoltServerMode() bool {
-	if os.Getenv("BEADS_DOLT_SERVER_MODE") == "1" && c.GetBackend() == BackendDolt {
+	if c.GetBackend() != BackendDolt {
+		return false
+	}
+	if os.Getenv("BEADS_DOLT_SERVER_MODE") == "1" {
 		return true
 	}
-	return c.GetBackend() == BackendDolt && strings.ToLower(c.DoltMode) == DoltModeServer
+	// Shared-server mode implies server-backed storage. Check env var
+	// directly to avoid circular import with doltserver package.
+	if v := os.Getenv("BEADS_DOLT_SHARED_SERVER"); v == "1" || strings.EqualFold(v, "true") {
+		return true
+	}
+	return strings.ToLower(c.DoltMode) == DoltModeServer
 }
 
 // GetDoltMode returns the Dolt connection mode, defaulting to server.
@@ -304,9 +318,35 @@ func (c *Config) GetDoltDatabase() string {
 }
 
 // GetDoltServerPassword returns the Dolt server password.
-// Checks BEADS_DOLT_PASSWORD env var (password should never be stored in config files).
+// Checks in order:
+//  1. BEADS_DOLT_PASSWORD env var (highest priority, existing behavior)
+//  2. Credentials file lookup by [host:port] section
+//     (path from BEADS_CREDENTIALS_FILE env var, or ~/.config/beads/credentials)
+//  3. Empty string (no password)
+//
+// Note: uses the port from configfile (metadata.json / env var), which may differ
+// from the resolved runtime port (doltserver port file). If you have the resolved
+// port, prefer GetDoltServerPasswordForPort for correct credentials file lookup.
 func (c *Config) GetDoltServerPassword() string {
-	return os.Getenv("BEADS_DOLT_PASSWORD")
+	return c.GetDoltServerPasswordForPort(c.GetDoltServerPort())
+}
+
+// GetDoltServerPasswordForPort returns the Dolt server password using an explicit
+// port for the credentials file lookup. Use this when the resolved runtime port
+// (from doltserver.DefaultConfig) differs from the configfile port (metadata.json).
+//
+// This avoids a mismatch where metadata.json says port 3308 (tunnel) but the
+// doltserver port file says 3307 (local), causing the credentials file lookup
+// to use the wrong [host:port] section.
+func (c *Config) GetDoltServerPasswordForPort(port int) string {
+	if p := os.Getenv("BEADS_DOLT_PASSWORD"); p != "" {
+		return p
+	}
+	host := c.GetDoltServerHost()
+	if p := LookupCredentialsPassword(host, port); p != "" {
+		return p
+	}
+	return ""
 }
 
 // GetDoltServerTLS returns whether TLS is enabled for server connections.

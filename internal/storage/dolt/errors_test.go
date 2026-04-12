@@ -100,15 +100,15 @@ func TestDatabaseNotFoundHint(t *testing.T) {
 		ServerPort: 3309,
 	}
 
-	t.Run("hint suggests setting sync.git-remote when empty", func(t *testing.T) {
-		cfg := baseCfg // SyncGitRemote is empty by default
+	t.Run("hint suggests setting sync.remote when empty", func(t *testing.T) {
+		cfg := baseCfg // SyncRemote is empty by default
 		err := databaseNotFoundError(&cfg)
 
 		msg := err.Error()
 
 		// FR-001: Must contain the setup hint (line-wrapped in output)
-		if !strings.Contains(msg, "set sync.git-remote") {
-			t.Errorf("expected hint to set sync.git-remote, got:\n%s", msg)
+		if !strings.Contains(msg, "set sync.remote") {
+			t.Errorf("expected hint to set sync.remote, got:\n%s", msg)
 		}
 		if !strings.Contains(msg, ".beads/config.yaml") {
 			t.Errorf("expected .beads/config.yaml reference, got:\n%s", msg)
@@ -122,31 +122,34 @@ func TestDatabaseNotFoundHint(t *testing.T) {
 			t.Errorf("expected server address in error, got:\n%s", msg)
 		}
 
-		// Must contain existing suggestions
-		if !strings.Contains(msg, "bd init") {
-			t.Errorf("expected bd init suggestion, got:\n%s", msg)
+		// Must contain recovery suggestions
+		if !strings.Contains(msg, "bd bootstrap") {
+			t.Errorf("expected bd bootstrap suggestion, got:\n%s", msg)
 		}
 		if !strings.Contains(msg, "bd doctor") {
 			t.Errorf("expected bd doctor suggestion, got:\n%s", msg)
 		}
+		if strings.Contains(msg, "re-run bd init") {
+			t.Errorf("did not expect init-first recovery guidance, got:\n%s", msg)
+		}
 	})
 
-	t.Run("hint mentions configured sync.git-remote when set", func(t *testing.T) {
+	t.Run("hint mentions configured sync.remote when set", func(t *testing.T) {
 		cfg := baseCfg
-		cfg.SyncGitRemote = "https://doltremoteapi.dolthub.com/myorg/beads"
+		cfg.SyncRemote = "https://doltremoteapi.dolthub.com/myorg/beads"
 		err := databaseNotFoundError(&cfg)
 
 		msg := err.Error()
 
 		// FR-002: Must mention it's configured and show the URL
-		if !strings.Contains(msg, "sync.git-remote is configured") {
+		if !strings.Contains(msg, "sync.remote is configured") {
 			t.Errorf("expected configured hint, got:\n%s", msg)
 		}
 		if !strings.Contains(msg, "https://doltremoteapi.dolthub.com/myorg/beads") {
 			t.Errorf("expected remote URL in hint, got:\n%s", msg)
 		}
-		if !strings.Contains(msg, "bd init") {
-			t.Errorf("expected bd init suggestion, got:\n%s", msg)
+		if !strings.Contains(msg, "bd bootstrap") {
+			t.Errorf("expected bd bootstrap suggestion, got:\n%s", msg)
 		}
 	})
 
@@ -171,6 +174,9 @@ func TestDatabaseNotFoundHint(t *testing.T) {
 		}
 		if !strings.Contains(msg, "bd backup restore") {
 			t.Errorf("expected bd backup restore suggestion, got:\n%s", msg)
+		}
+		if !strings.Contains(msg, "bd bootstrap") {
+			t.Errorf("expected bd bootstrap suggestion, got:\n%s", msg)
 		}
 		// Should still mention branch switching as a common cause
 		if !strings.Contains(msg, "branch") {

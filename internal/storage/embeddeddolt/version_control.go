@@ -1,4 +1,4 @@
-//go:build embeddeddolt
+//go:build cgo
 
 package embeddeddolt
 
@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/versioncontrolops"
@@ -71,13 +72,23 @@ func (s *EmbeddedDoltStore) HasRemote(ctx context.Context, name string) (bool, e
 
 func (s *EmbeddedDoltStore) Branch(ctx context.Context, name string) error {
 	return s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
-		return versioncontrolops.CreateBranch(ctx, db, name)
+		if err := versioncontrolops.CreateBranch(ctx, db, name); err != nil {
+			return err
+		}
+		// dolt_ignore'd tables (wisps, wisp_*) don't carry over to new branches —
+		// ensure they exist on the newly created branch.
+		return versioncontrolops.EnsureIgnoredTables(ctx, db)
 	})
 }
 
 func (s *EmbeddedDoltStore) Checkout(ctx context.Context, branch string) error {
 	return s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
-		return versioncontrolops.CheckoutBranch(ctx, db, branch)
+		if err := versioncontrolops.CheckoutBranch(ctx, db, branch); err != nil {
+			return err
+		}
+		// dolt_ignore'd tables (wisps, wisp_*) may not exist on the target branch —
+		// ensure they exist after checkout.
+		return versioncontrolops.EnsureIgnoredTables(ctx, db)
 	})
 }
 
@@ -200,7 +211,7 @@ func (s *EmbeddedDoltStore) Push(ctx context.Context) error {
 
 func (s *EmbeddedDoltStore) Pull(ctx context.Context) error {
 	return s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
-		return versioncontrolops.Pull(ctx, db, defaultRemote)
+		return versioncontrolops.Pull(ctx, db, defaultRemote, s.branch)
 	})
 }
 
@@ -231,7 +242,7 @@ func (s *EmbeddedDoltStore) PullFrom(ctx context.Context, peer string) ([]storag
 
 	var conflicts []storage.Conflict
 	err := s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
-		if pullErr := versioncontrolops.Pull(ctx, db, peer); pullErr != nil {
+		if pullErr := versioncontrolops.Pull(ctx, db, peer, s.branch); pullErr != nil {
 			// Check if the error is due to merge conflicts.
 			c, conflictErr := versioncontrolops.GetConflicts(ctx, db)
 			if conflictErr == nil && len(c) > 0 {
@@ -267,22 +278,64 @@ func (s *EmbeddedDoltStore) BackupRemove(ctx context.Context, name string) error
 	})
 }
 
-func (s *EmbeddedDoltStore) BackupExportTables(ctx context.Context, dir, prefix string) (*storage.BackupCounts, error) {
-	var result *storage.BackupCounts
-	err := s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
-		var err error
-		result, err = versioncontrolops.ExportTables(ctx, db, dir, prefix)
+// BackupDatabase registers dir as a file:// Dolt backup remote and syncs
+// the database to it. The dir must exist locally. This preserves full Dolt
+// commit history.
+func (s *EmbeddedDoltStore) BackupDatabase(ctx context.Context, dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("backup destination does not exist: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("backup destination is not a directory: %s", dir)
+	}
+
+	backupURL, err := versioncontrolops.DirToFileURL(dir)
+	if err != nil {
 		return err
+	}
+	backupName := "backup_export"
+
+	return s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
+		// Register as a backup remote (idempotent — remove first if exists).
+		_ = versioncontrolops.BackupRemove(ctx, db, backupName)
+		if err := versioncontrolops.BackupAdd(ctx, db, backupName, backupURL); err != nil {
+			// Another backup (e.g. "default" registered by `bd backup init`) may
+			// already point to this URL. In that case, sync using the existing
+			// remote name rather than failing.
+			if conflict := versioncontrolops.ExtractAddressConflictName(err); conflict != "" {
+				if syncErr := versioncontrolops.BackupSync(ctx, db, conflict); syncErr != nil {
+					return fmt.Errorf("sync to backup: %w", syncErr)
+				}
+				return nil
+			}
+			return fmt.Errorf("register backup remote: %w", err)
+		}
+		if err := versioncontrolops.BackupSync(ctx, db, backupName); err != nil {
+			return fmt.Errorf("sync to backup: %w", err)
+		}
+		return nil
 	})
-	return result, err
 }
 
-func (s *EmbeddedDoltStore) BackupRestoreFromDir(ctx context.Context, dir, prefix string, dryRun bool) (*storage.BackupRestoreResult, error) {
-	var result *storage.BackupRestoreResult
-	err := s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
-		var err error
-		result, err = versioncontrolops.RestoreFromDir(ctx, db, s, dir, prefix, dryRun)
+// RestoreDatabase restores the database from a Dolt backup at dir.
+// The dir must exist locally and contain a valid Dolt backup.
+// When force is true, an existing database is overwritten.
+func (s *EmbeddedDoltStore) RestoreDatabase(ctx context.Context, dir string, force bool) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("backup source does not exist: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("backup source is not a directory: %s", dir)
+	}
+
+	backupURL, err := versioncontrolops.DirToFileURL(dir)
+	if err != nil {
 		return err
+	}
+
+	return s.withDBConn(ctx, func(db versioncontrolops.DBConn) error {
+		return versioncontrolops.BackupRestore(ctx, db, backupURL, s.database, force)
 	})
-	return result, err
 }

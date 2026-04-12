@@ -7,12 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/cmd/bd/doctor"
+	"github.com/steveyegge/beads/cmd/bd/setup"
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
@@ -20,6 +22,7 @@ import (
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
 	"github.com/steveyegge/beads/internal/templates/agents"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -45,10 +48,17 @@ With --stealth: configures per-repository git settings for invisible beads usage
   Perfect for personal use without affecting repo collaborators.
   To set up a specific AI tool, run: bd setup <claude|cursor|aider|...> --stealth
 
-Beads requires a running dolt sql-server for database operations. If a server is detected
-on port 3307 or 3306, it is used automatically. Set connection details with --server-host,
---server-port, and --server-user. Password should be set via BEADS_DOLT_PASSWORD
-environment variable.`,
+By default, beads uses an embedded Dolt engine (no external server needed).
+Pass --server to use an external dolt sql-server instead. In server mode,
+set connection details with --server-host, --server-port, and --server-user.
+Password should be set via BEADS_DOLT_PASSWORD environment variable.
+
+Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
+  Skips all interactive prompts, using sensible defaults:
+  • Role defaults to "maintainer" (override with --role)
+  • Fork exclude auto-configured when fork detected
+  • --contributor and --team flags are rejected (wizards require interaction)
+  Also auto-detected when stdin is not a terminal or CI=true is set.`,
 	Run: func(cmd *cobra.Command, _ []string) {
 		prefix, _ := cmd.Flags().GetString("prefix")
 		quiet, _ := cmd.Flags().GetBool("quiet")
@@ -58,16 +68,19 @@ environment variable.`,
 		skipHooks, _ := cmd.Flags().GetBool("skip-hooks")
 		skipAgents, _ := cmd.Flags().GetBool("skip-agents")
 		force, _ := cmd.Flags().GetBool("force")
+		nonInteractiveFlag, _ := cmd.Flags().GetBool("non-interactive")
+		roleFlag, _ := cmd.Flags().GetString("role")
 		fromJSONL, _ := cmd.Flags().GetBool("from-jsonl")
 		// Dolt server connection flags
 		backendFlag, _ := cmd.Flags().GetString("backend")
-		_, _ = cmd.Flags().GetBool("server") // no-op, kept for backward compatibility
+		initServerMode, _ := cmd.Flags().GetBool("server")
 		serverHost, _ := cmd.Flags().GetString("server-host")
 		serverPort, _ := cmd.Flags().GetInt("server-port")
 		serverUser, _ := cmd.Flags().GetString("server-user")
 		database, _ := cmd.Flags().GetString("database")
 		destroyToken, _ := cmd.Flags().GetString("destroy-token")
 		sharedServer, _ := cmd.Flags().GetBool("shared-server")
+		externalServer, _ := cmd.Flags().GetBool("external")
 
 		// Handle --backend flag: "dolt" is the only supported backend.
 		// "sqlite" is accepted for backward compatibility but prints a
@@ -92,8 +105,51 @@ environment variable.`,
 			}
 		}
 
+		// Resolve non-interactive mode: flag > env var > terminal detection.
+		// This must be computed before any interactive prompts.
+		nonInteractive := isNonInteractiveInit(nonInteractiveFlag)
+
+		// Validate --role flag value
+		if roleFlag != "" {
+			switch roleFlag {
+			case "maintainer", "contributor":
+				// valid
+			default:
+				FatalError("invalid --role %q: must be \"maintainer\" or \"contributor\"", roleFlag)
+			}
+		}
+
+		// Fail-fast: contributor/team wizards require interaction
+		if nonInteractive && contributor {
+			FatalError("--contributor requires interactive prompts and cannot be used with --non-interactive")
+		}
+		if nonInteractive && team {
+			FatalError("--team requires interactive prompts and cannot be used with --non-interactive")
+		}
+
 		// Dolt is the only supported backend
 		backend := configfile.BackendDolt
+
+		// Also treat BEADS_DOLT_SERVER_MODE=1 env var as --server.
+		if os.Getenv("BEADS_DOLT_SERVER_MODE") == "1" {
+			initServerMode = true
+		}
+
+		// Shared server mode still uses a Dolt sql-server, so it must select
+		// the server-backed store path during init. Without this, init can
+		// persist shared-server intent in YAML while still creating an embedded
+		// store and recording dolt_mode=embedded in metadata.json (GH#2946).
+		if sharedServer || strings.EqualFold(os.Getenv("BEADS_DOLT_SHARED_SERVER"), "true") || os.Getenv("BEADS_DOLT_SHARED_SERVER") == "1" {
+			initServerMode = true
+		}
+
+		// Set serverMode so isEmbeddedMode() returns the correct value.
+		// Both the global and cmdCtx must be set because PersistentPreRun
+		// creates a fresh cmdCtx (with ServerMode=false) before Run executes.
+		serverMode = initServerMode
+		if cmdCtx != nil {
+			cmdCtx.ServerMode = initServerMode
+		}
 
 		// Propagate --shared-server flag to env so that IsSharedServerMode(),
 		// ResolveDoltDir(), and DefaultConfig() all see shared mode immediately
@@ -143,9 +199,6 @@ environment variable.`,
 					expectedToken := fmt.Sprintf("DESTROY-%s", prefix)
 					if destroyToken == expectedToken {
 						fmt.Fprintf(os.Stderr, "Destroy token accepted. Proceeding with re-initialization.\n")
-					} else if quiet {
-						// Legacy --quiet behavior (deprecated path)
-						fmt.Fprintf(os.Stderr, "Warning: --force --quiet bypasses safety checks. Use --destroy-token=%s instead.\n", expectedToken)
 					} else {
 						fmt.Fprintf(os.Stderr, "Refusing to destroy %d issues in non-interactive mode.\n", count)
 						fmt.Fprintf(os.Stderr, "To proceed, use: bd init --force --destroy-token=%s\n", expectedToken)
@@ -191,11 +244,14 @@ environment variable.`,
 			prefix = filepath.Base(cwd)
 		}
 
-		// Normalize prefix: strip leading dots and trailing hyphens.
-		// Leading dots produce invalid Dolt database names (e.g. ".claude" -> "bd_.claude").
-		// The trailing hyphen is added automatically during ID generation.
+		// Normalize prefix before storing it in config or deriving the Dolt
+		// database name. Dots are not valid in issue prefixes and must match the
+		// underscore form used for DoltDatabase/metadata.json.
+		// Leading dots produce invalid names (e.g. ".claude" -> "claude"), and
+		// the trailing hyphen is added automatically during ID generation.
 		prefix = strings.TrimLeft(prefix, ".")
 		prefix = strings.TrimRight(prefix, "-")
+		prefix = strings.ReplaceAll(prefix, ".", "_")
 
 		// Sanitize prefix for use as a MySQL database name.
 		// Directory names like "001" (common in temp dirs) are invalid because
@@ -276,9 +332,34 @@ environment variable.`,
 		useLocalBeads := !hasExplicitBeadsDir || filepath.Clean(initDBDirAbs) == filepath.Clean(beadsDirAbs)
 
 		if useLocalBeads {
-			// Create .beads directory
-			if err := os.MkdirAll(beadsDir, 0750); err != nil {
+			// Create .beads directory with owner-only permissions (0700).
+			if err := os.MkdirAll(beadsDir, config.BeadsDirPerm); err != nil {
+				if os.IsPermission(err) {
+					if runtime.GOOS == "windows" {
+						FatalError("failed to create .beads directory: %v\n\n"+
+							"Windows Controlled Folder Access may be blocking bd.exe.\n"+
+							"To fix: Open Windows Security > Virus & threat protection >\n"+
+							"Ransomware protection > Allow an app through Controlled folder access\n"+
+							"and add bd.exe (typically %%USERPROFILE%%\\go\\bin\\bd.exe).", err)
+					} else {
+						FatalError("failed to create .beads directory: %v\n\n"+
+							"Permission denied. Check directory ownership and permissions:\n"+
+							"  ls -la %s\n"+
+							"  chmod 755 %s", err, filepath.Dir(beadsDir), filepath.Dir(beadsDir))
+					}
+				}
 				FatalError("failed to create .beads directory: %v", err)
+			}
+
+			// On Linux btrfs, disable transparent compression on .beads/ so that
+			// dolt's hot append-only write path (under .beads/dolt/ or
+			// .beads/embeddeddolt/) does not trigger kworker thrashing from
+			// read-modify-write-recompress cycles. New files created inside this
+			// directory inherit FS_NOCOW_FL automatically, so setting it here —
+			// before dolt writes anything — covers both server and embedded modes.
+			// No-op on non-Linux and non-btrfs filesystems (GH nocow-beads-dolt-init).
+			if err := applyNoCOW(beadsDir); err != nil && !quiet {
+				fmt.Fprintf(os.Stderr, "Warning: failed to set FS_NOCOW_FL on %s: %v\n", beadsDir, err)
 			}
 
 			// Create/update .gitignore in .beads directory (only if missing or outdated)
@@ -327,6 +408,9 @@ environment variable.`,
 			if output, err := gitInitCmd.CombinedOutput(); err != nil {
 				FatalError("failed to initialize git repository: %v\n%s", err, output)
 			}
+			// Clear cached git context so subsequent operations (e.g. hook
+			// installation) see the newly-created repository (GH#2899).
+			git.ResetCaches()
 			if !quiet {
 				fmt.Printf("  %s Initialized git repository\n", ui.RenderPass("✓"))
 			}
@@ -335,8 +419,18 @@ environment variable.`,
 		// Ensure storage directory exists (.beads/dolt).
 		// In server mode, dolt.New() connects via TCP and doesn't create local directories,
 		// so we create the marker directory explicitly.
-		if err := os.MkdirAll(initDBPath, 0750); err != nil {
-			FatalError("failed to create storage directory %s: %v", initDBPath, err)
+		// In embedded mode the engine creates its own directories under .beads/embeddeddolt/,
+		// so skip this to avoid leaving an empty .beads/dolt/ artifact (GH#2903).
+		if initServerMode {
+			if err := os.MkdirAll(initDBPath, config.BeadsDirPerm); err != nil {
+				FatalError("failed to create storage directory %s: %v", initDBPath, err)
+			}
+			// Linux btrfs: disable compression on the dolt data dir to avoid
+			// kworker thrashing on the append-only write path. Best-effort; a
+			// non-btrfs filesystem returns nil from applyNoCOW.
+			if err := applyNoCOW(initDBPath); err != nil && !quiet {
+				fmt.Fprintf(os.Stderr, "Warning: failed to set FS_NOCOW_FL on %s: %v\n", initDBPath, err)
+			}
 		}
 
 		ctx := rootCtx
@@ -365,33 +459,53 @@ environment variable.`,
 		if database != "" {
 			dbName = database
 		}
-		// Auto-bootstrap from git remote if sync.git-remote is configured.
-		// This enables the new-machine story: set sync.git-remote in config.yaml,
-		// run bd init, and the Dolt database is cloned from the git remote
-		// automatically — no manual dolt clone needed.
-		gitRemoteURL := config.GetString("sync.git-remote")
-		bootstrappedFromRemote := false
-		if gitRemoteURL != "" {
-			cloned, bootstrapErr := dolt.BootstrapFromGitRemoteWithDB(ctx, storagePath, gitRemoteURL, dbName)
-			if bootstrapErr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to bootstrap from git remote %s: %v\n", gitRemoteURL, bootstrapErr)
-				fmt.Fprintf(os.Stderr, "  Continuing with fresh database initialization.\n")
-				// Non-fatal: fall through to normal init
-			} else if cloned {
-				bootstrappedFromRemote = true
-				if !quiet {
-					fmt.Printf("  %s Bootstrapped from git remote: %s\n", ui.RenderPass("✓"), gitRemoteURL)
+
+		// Validate the auto-derived database name early so we can surface a clear,
+		// actionable error instead of a cryptic failure from the storage layer.
+		// The --database flag is already validated above; this catches cases where
+		// the directory name produces an invalid identifier after sanitization
+		// (e.g. spaces, '@', '!' that survive the hyphen/dot replacement).
+		// Skip when dbName came from an existing config — it was valid when stored.
+		if database == "" {
+			if existingCfg, _ := configfile.Load(beadsDir); existingCfg == nil || existingCfg.DoltDatabase == "" {
+				if err := dolt.ValidateDatabaseName(dbName); err != nil {
+					dirName := filepath.Base(cwd)
+					fmt.Fprintf(os.Stderr, "Error: directory name %q produces an invalid database name %q.\n", dirName, dbName)
+					fmt.Fprintf(os.Stderr, "Re-run with a valid prefix: bd init --prefix <name>\n")
+					fmt.Fprintf(os.Stderr, "(Database names must start with a letter or underscore and contain only letters, digits, underscores, or hyphens.)\n")
+					os.Exit(1)
 				}
 			}
-		} else if !force && isGitRepo() && !isBareGitRepo() {
-			// Warn if origin has an existing beads database.
-			// Don't auto-clone here — bd bootstrap handles that.
+		}
+
+		// Auto-bootstrap from git remote if sync.git-remote is configured
+		// or origin has refs/dolt/data. This makes bd init and bd bootstrap
+		// Auto-bootstrap from remote if sync.remote (or deprecated
+		// sync.git-remote) is configured, or git origin has Dolt data
+		// (refs/dolt/data). This makes bd init and bd bootstrap
+		// interchangeable — both clone from the remote when one exists.
+		syncURL := resolveSyncRemote()
+		bootstrappedFromRemote := false
+		syncFromRemote := false
+		if syncURL != "" {
+			syncURL = normalizeRemoteURL(syncURL)
+			syncFromRemote = true
+		} else if isGitRepo() && !isBareGitRepo() {
 			if originURL, err := gitRemoteGetURL("origin"); err == nil && originURL != "" {
-				if gitLsRemoteHasRef("origin", "refs/dolt/data") {
-					fmt.Fprintf(os.Stderr, "Note: origin has an existing beads database (refs/dolt/data).\n")
-					fmt.Fprintf(os.Stderr, "  Run 'bd bootstrap' instead to clone it.\n")
-					fmt.Fprintf(os.Stderr, "  Continuing with fresh database initialization.\n\n")
+				syncURL = normalizeRemoteURL(originURL)
+				if !force && gitLsRemoteHasRef("origin", "refs/dolt/data") {
+					syncFromRemote = true
 				}
+			}
+		}
+		if syncFromRemote {
+			if err := cloneFromRemote(ctx, beadsDir, syncURL, dbName); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			bootstrappedFromRemote = true
+			if !quiet {
+				fmt.Printf("  %s Bootstrapped from remote: %s\n", ui.RenderPass("✓"), syncURL)
 			}
 		}
 
@@ -421,8 +535,9 @@ environment variable.`,
 			BeadsDir:        beadsDir,
 			Database:        dbName,
 			ServerPort:      initPort,
+			ServerMode:      initServerMode,
 			CreateIfMissing: true, // bd init is the only path that should create databases
-			AutoStart:       os.Getenv("BEADS_DOLT_AUTO_START") != "0",
+			AutoStart:       initServerMode && os.Getenv("BEADS_DOLT_AUTO_START") != "0",
 		}
 		if serverHost != "" {
 			doltCfg.ServerHost = serverHost
@@ -434,39 +549,58 @@ environment variable.`,
 			doltCfg.ServerUser = serverUser
 		}
 
-		initLock, err := acquireEmbeddedLock(beadsDir)
+		initLock, err := acquireEmbeddedLock(beadsDir, initServerMode)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 		defer initLock.Unlock()
 
-		// Clean stale noms LOCK files from previously crashed processes
-		// before opening the Dolt server store. Without this, a crashed init
-		// leaves LOCK files that cause nil pointer dereference in DoltDB.
-		// Skipped for embedded mode — embedded dolt has its own locking model.
-		if !isEmbeddedDolt {
-			dolt.CleanStaleNomsLocks(doltserver.ResolveDoltDir(beadsDir))
+		// WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
+		// directory — including noms/LOCK files. These are Dolt-internal files.
+		// Removing them WILL cause unrecoverable data corruption and data loss.
+		// Dolt manages these files itself; external interference is never safe.
+
+		// In shared server mode, ensure the shared server is running before
+		// opening the store. EnsureRunning won't auto-start because
+		// ResolveServerMode returns ServerModeExternal, so start it
+		// explicitly via the shared server directory (GH#2946).
+		//
+		// --external skips this: the server is managed outside bd (e.g.
+		// Docker, systemd, testcontainers). The caller is responsible for
+		// ensuring the server is reachable and the port file exists.
+		if !externalServer && (sharedServer || doltserver.IsSharedServerMode()) {
+			if sharedDir, err := doltserver.SharedServerDir(); err == nil {
+				if state, _ := doltserver.IsRunning(sharedDir); state == nil || !state.Running {
+					if _, startErr := doltserver.Start(sharedDir); startErr != nil {
+						fmt.Fprintf(os.Stderr, "Error: failed to start shared Dolt server: %v\n", startErr)
+						os.Exit(1)
+					}
+					if !quiet {
+						fmt.Printf("  %s Shared Dolt server started\n", ui.RenderPass("✓"))
+					}
+				}
+			}
 		}
 
-		store, err := newDoltStore(ctx, doltCfg)
+		store, err := newDoltStore(ctx, doltCfg, embeddeddolt.WithLock(initLock))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: failed to open Dolt store: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Configure the git remote in the Dolt store so bd dolt push/pull
+		// Configure the remote in the Dolt store so bd dolt push/pull
 		// work immediately after bootstrap. Also add the remote when
-		// sync.git-remote is configured but bootstrap was skipped (DB already
+		// sync.remote is configured but bootstrap was skipped (DB already
 		// existed) — ensures the remote is always wired up.
-		if gitRemoteURL != "" {
+		if syncURL != "" {
 			hasRemote, _ := store.HasRemote(ctx, "origin")
 			if !hasRemote {
-				if err := store.AddRemote(ctx, "origin", gitRemoteURL); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to add git remote 'origin': %v\n", err)
+				if err := store.AddRemote(ctx, "origin", syncURL); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to add remote 'origin': %v\n", err)
 					// Non-fatal — user can add manually with: bd dolt remote add origin <url>
 				} else if !quiet {
-					fmt.Printf("  %s Configured Dolt remote: origin → %s\n", ui.RenderPass("✓"), gitRemoteURL)
+					fmt.Printf("  %s Configured Dolt remote: origin → %s\n", ui.RenderPass("✓"), syncURL)
 				}
 			}
 		}
@@ -480,7 +614,10 @@ environment variable.`,
 		// avoid clobbering when multiple rigs share the same Dolt database)
 		existing, _ := store.GetConfig(ctx, "issue_prefix")
 		if existing == "" {
-			if err := store.SetConfig(ctx, "issue_prefix", prefix); err != nil {
+			// Sanitize dots to underscores so issue IDs (e.g. "GPUPolynomials_jl-1")
+			// remain valid identifiers. Must match DoltDatabase sanitization above.
+			issuePrefix := strings.ReplaceAll(prefix, ".", "_")
+			if err := store.SetConfig(ctx, "issue_prefix", issuePrefix); err != nil {
 				_ = store.Close()
 				FatalError("failed to set issue prefix: %v", err)
 			}
@@ -537,8 +674,23 @@ environment variable.`,
 			// Generate project identity UUID if not already set (GH#2372).
 			// This UUID is stored in both metadata.json and the database,
 			// and verified on every connection to detect cross-project leakage.
+			//
+			// When --database is specified and the database already exists on the
+			// server, adopt the existing project_id instead of generating a new
+			// one. This prevents identity mismatch when a second user joins a
+			// shared remote Dolt server. (GH#2922)
 			if cfg.ProjectID == "" {
-				cfg.ProjectID = configfile.GenerateProjectID()
+				if database != "" && store != nil {
+					if existingID, err := store.GetMetadata(ctx, "_project_id"); err == nil && existingID != "" {
+						cfg.ProjectID = existingID
+						if !quiet {
+							fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
+						}
+					}
+				}
+				if cfg.ProjectID == "" {
+					cfg.ProjectID = configfile.GenerateProjectID()
+				}
 			}
 
 			// Always store backend explicitly in metadata.json
@@ -557,12 +709,16 @@ environment variable.`,
 				if database != "" {
 					cfg.DoltDatabase = database
 				} else if cfg.DoltDatabase == "" && prefix != "" {
-					// Sanitize hyphens to underscores for SQL-idiomatic names (GH#2142).
+					// Sanitize hyphens and dots to underscores for SQL-idiomatic names (GH#2142).
+					// Must match the sanitization applied to dbName above (lines 430-431),
+					// otherwise init creates a database with one name but metadata.json
+					// records a different name, causing reopens to fail.
 					cfg.DoltDatabase = strings.ReplaceAll(prefix, "-", "_")
+					cfg.DoltDatabase = strings.ReplaceAll(cfg.DoltDatabase, ".", "_")
 				}
 
 				// Persist the connection mode matching this build.
-				if isEmbeddedDolt {
+				if isEmbeddedMode() {
 					cfg.DoltMode = configfile.DoltModeEmbedded
 				} else {
 					cfg.DoltMode = configfile.DoltModeServer
@@ -594,6 +750,17 @@ environment variable.`,
 			if err := createConfigYaml(beadsDir, false, ""); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to create config.yaml: %v\n", err)
 				// Non-fatal - continue anyway
+			}
+
+			// Persist sync.remote to config.yaml so fresh clones can
+			// bootstrap from it (the Dolt database is gitignored).
+			// Must run AFTER createConfigYaml which creates the file.
+			if syncURL != "" {
+				if existing := config.GetYamlConfig("sync.remote"); existing == "" {
+					if err := config.SetYamlConfig("sync.remote", syncURL); err != nil {
+						FatalError("failed to persist sync.remote to config.yaml: %v", err)
+					}
+				}
 			}
 
 			// Enable shared server mode if requested via flag OR env var (GH#2377).
@@ -650,9 +817,10 @@ environment variable.`,
 
 		// Prompt for contributor mode if:
 		// - In a git repo (needed to set beads.role config)
-		// - Interactive terminal (stdin is TTY)
+		// - Interactive terminal (stdin is TTY) and not --non-interactive
 		// - No explicit --contributor or --team flag provided
-		if isGitRepo() && !contributor && !team && shouldPromptForRole() {
+		// - No explicit --role flag provided
+		if isGitRepo() && !contributor && !team && roleFlag == "" && !nonInteractive && shouldPromptForRole() {
 			promptedContributor, err := promptContributorMode()
 			if err != nil {
 				if isCanceled(err) {
@@ -670,11 +838,19 @@ environment variable.`,
 		} else if isGitRepo() && !contributor && !team {
 			// If prompt was skipped (non-interactive or CI environment),
 			// ensure beads.role is set to avoid "not configured" warning
-			// during diagnostics. Only set if not already configured.
+			// during diagnostics. Use --role flag if provided, otherwise default.
+			role := roleFlag
+			if role == "" {
+				role = "maintainer"
+			}
 			if _, hasRole := getBeadsRole(); !hasRole {
-				// Default to maintainer for non-interactive environments
-				if err := setBeadsRole("maintainer"); err != nil && !quiet {
+				if err := setBeadsRole(role); err != nil && !quiet {
 					fmt.Fprintf(os.Stderr, "Warning: failed to set default beads.role: %v\n", err)
+				}
+			} else if roleFlag != "" {
+				// Explicit --role flag overrides existing role
+				if err := setBeadsRole(role); err != nil && !quiet {
+					fmt.Fprintf(os.Stderr, "Warning: failed to set beads.role: %v\n", err)
 				}
 			}
 		}
@@ -717,6 +893,22 @@ environment variable.`,
 			}
 		}
 
+		// Safety net: ensure beads.role is always set when in a git repo (GH#2950).
+		// Earlier code paths may skip role-setting when BEADS_DIR is set,
+		// promptContributorMode fails, or edge-case flag combinations are used.
+		// This guarantees every init leaves a usable role-configured state.
+		if isGitRepo() {
+			if _, hasRole := getBeadsRole(); !hasRole {
+				fallbackRole := "maintainer"
+				if roleFlag != "" {
+					fallbackRole = roleFlag
+				}
+				if err := setBeadsRole(fallbackRole); err != nil && !quiet {
+					fmt.Fprintf(os.Stderr, "Warning: failed to set beads.role=%s: %v\n", fallbackRole, err)
+				}
+			}
+		}
+
 		// Auto-commit Dolt state so bd doctor doesn't warn about uncommitted
 		// changes and users don't need a separate "bd vc commit" step.
 		if err := store.Commit(ctx, "bd init"); err != nil {
@@ -730,11 +922,10 @@ environment variable.`,
 			fmt.Fprintf(os.Stderr, "Warning: failed to close database: %v\n", err)
 		}
 
-		// Clean up 0-byte noms LOCK files left behind by the store open/close cycle.
-		// NOTE: Intentionally skipped for embedded mode. See earlier note.
-		if !isEmbeddedDolt {
-			dolt.CleanStaleNomsLocks(doltserver.ResolveDoltDir(beadsDir))
-		}
+		// WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
+		// directory — including noms/LOCK files. These are Dolt-internal files.
+		// Removing them WILL cause unrecoverable data corruption and data loss.
+		// Dolt manages these files itself; external interference is never safe.
 
 		// Fork detection: offer to configure .git/info/exclude (GH#742)
 		setupExclude, _ := cmd.Flags().GetBool("setup-exclude")
@@ -746,16 +937,23 @@ environment variable.`,
 		} else if !stealth && isGitRepo() {
 			// Auto-detect fork and prompt (skip if stealth - it handles exclude already)
 			if isFork, upstreamURL := detectForkSetup(); isFork {
-				shouldExclude, err := promptForkExclude(upstreamURL, quiet)
-				if err != nil {
-					if isCanceled(err) {
-						fmt.Fprintln(os.Stderr, "Setup canceled.")
-						exitCanceled()
-					}
-				}
-				if shouldExclude {
+				if nonInteractive {
+					// In non-interactive mode, auto-configure fork exclude
 					if err := setupForkExclude(!quiet); err != nil {
 						fmt.Fprintf(os.Stderr, "Warning: failed to configure git exclude: %v\n", err)
+					}
+				} else {
+					shouldExclude, err := promptForkExclude(upstreamURL, quiet)
+					if err != nil {
+						if isCanceled(err) {
+							fmt.Fprintln(os.Stderr, "Setup canceled.")
+							exitCanceled()
+						}
+					}
+					if shouldExclude {
+						if err := setupForkExclude(!quiet); err != nil {
+							fmt.Fprintf(os.Stderr, "Warning: failed to configure git exclude: %v\n", err)
+						}
 					}
 				}
 			}
@@ -842,6 +1040,17 @@ environment variable.`,
 			}
 		}
 
+		// Auto-setup Claude hooks for project (writes to .claude/settings.json)
+		// so bd prime runs automatically. Skip in stealth mode or when agents are skipped.
+		if !stealth && !skipAgents && !isBareGitRepo() {
+			if err := setup.InstallClaudeProject(stealth); err != nil {
+				if !quiet {
+					fmt.Fprintf(os.Stderr, "Warning: failed to setup Claude hooks: %v\n", err)
+				}
+				// Non-fatal - continue with init
+			}
+		}
+
 		// Auto-stage and commit beads files so bd doctor doesn't warn about
 		// untracked files or dirty working tree in a clean room setup.
 		// Only runs when not stealth, in a git repo, and using local storage.
@@ -853,6 +1062,17 @@ environment variable.`,
 				if _, statErr := os.Stat(agentsFileToStage); statErr == nil {
 					agentsCmd := exec.Command("git", "add", agentsFileToStage)
 					_ = agentsCmd.Run()
+				}
+				// Also stage Claude settings if created by init
+				claudeSettingsPath := filepath.Join(".claude", "settings.json")
+				if _, statErr := os.Stat(claudeSettingsPath); statErr == nil {
+					claudeCmd := exec.Command("git", "add", claudeSettingsPath)
+					_ = claudeCmd.Run()
+				}
+				// Also stage CLAUDE.md if created by setup
+				if _, statErr := os.Stat("CLAUDE.md"); statErr == nil {
+					claudeMdCmd := exec.Command("git", "add", "CLAUDE.md")
+					_ = claudeMdCmd.Run()
 				}
 				// Also stage .gitignore if modified by EnsureProjectGitignore
 				if _, statErr := os.Stat(".gitignore"); statErr == nil {
@@ -867,12 +1087,10 @@ environment variable.`,
 				} else if !quiet {
 					fmt.Printf("  %s Committed beads files to git\n", ui.RenderPass("✓"))
 				}
-				// Clean up LOCK files again — the pre-commit hook may have
-				// reopened the database and left a new LOCK behind.
-				// NOTE: Intentionally skipped for embedded mode. See earlier note.
-				if !isEmbeddedDolt {
-					dolt.CleanStaleNomsLocks(doltserver.ResolveDoltDir(beadsDir))
-				}
+				// WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
+				// directory — including noms/LOCK files. These are Dolt-internal files.
+				// Removing them WILL cause unrecoverable data corruption and data loss.
+				// Dolt manages these files itself; external interference is never safe.
 			}
 		}
 
@@ -898,7 +1116,7 @@ environment variable.`,
 			fmt.Printf("\n%s bd initialized successfully!\n\n", ui.RenderPass("✓"))
 		}
 		fmt.Printf("  Backend: %s\n", ui.RenderAccent(backend))
-		if isEmbeddedDolt {
+		if isEmbeddedMode() {
 			fmt.Printf("  Mode: %s\n", ui.RenderAccent("embedded"))
 		} else {
 			host := serverHost
@@ -941,7 +1159,7 @@ environment variable.`,
 		// Skipped in embedded mode: diagnostics use dolt.NewFromConfigWithOptions
 		// which auto-starts a dolt sql-server. Embedded init already validates
 		// the database via initSchema.
-		if !isEmbeddedDolt {
+		if !isEmbeddedMode() {
 			doctorResult := runInitDiagnostics(cwd)
 			hasIssues := false
 			for _, check := range doctorResult.Checks {
@@ -979,16 +1197,21 @@ func init() {
 	initCmd.Flags().String("agents-profile", "", "AGENTS.md profile: 'minimal' (default, pointer to bd prime) or 'full' (complete command reference)")
 	initCmd.Flags().String("agents-file", "", "Custom filename for agent instructions (default: AGENTS.md)")
 
+	// Non-interactive mode for CI/cloud agents
+	initCmd.Flags().Bool("non-interactive", false, "Skip all interactive prompts (auto-detected in CI or non-TTY environments)")
+	initCmd.Flags().String("role", "", "Set beads role without prompting: \"maintainer\" or \"contributor\"")
+
 	// Backend selection (dolt is the only supported backend; sqlite accepted for deprecation notice)
 	initCmd.Flags().String("backend", "", "Storage backend (default: dolt). --backend=sqlite prints deprecation notice.")
 
 	// Dolt server connection flags
-	initCmd.Flags().Bool("server", false, "Use server mode (currently the default; embedded mode returning soon)")
+	initCmd.Flags().Bool("server", false, "Use external dolt sql-server instead of embedded engine")
 	initCmd.Flags().String("server-host", "", "Dolt server host (default: 127.0.0.1)")
 	initCmd.Flags().Int("server-port", 0, "Dolt server port (default: 3307)")
 	initCmd.Flags().String("server-user", "", "Dolt server MySQL user (default: root)")
 	initCmd.Flags().String("database", "", "Use existing server database name (overrides prefix-based naming)")
 	initCmd.Flags().Bool("shared-server", false, "Enable shared Dolt server mode (all projects share one server at ~/.beads/shared-server/)")
+	initCmd.Flags().Bool("external", false, "Server is externally managed (skip server startup); use with --shared-server or --server")
 
 	rootCmd.AddCommand(initCmd)
 }
@@ -1066,7 +1289,7 @@ func checkExistingBeadsDataAt(beadsDir string, prefix string) error {
 		// Embedded mode stores databases under `.beads/embeddeddolt/<db>/`.
 		// Treat any present embedded DB as "already initialized" (guard against
 		// accidental re-init / data loss).
-		if isEmbeddedDolt {
+		if isEmbeddedMode() {
 			embeddedRoot := filepath.Join(beadsDir, "embeddeddolt")
 			entries, err := os.ReadDir(embeddedRoot)
 			if err != nil {
@@ -1117,7 +1340,7 @@ Aborting.`, ui.RenderWarn("⚠"), location, ui.RenderAccent("bd list"), prefix)
 				password := cfg.GetDoltServerPassword()
 				user := cfg.GetDoltServerUser()
 
-				result := checkDatabaseOnServer(host, port, user, password, dbName)
+				result := checkDatabaseOnServer(host, port, user, password, dbName, cfg.GetDoltServerTLS())
 				if result.Reachable && !result.Exists && result.Err == nil {
 					// Server is up but DB doesn't exist. Since we also know
 					// doltDirExists==false, this is a fresh clone — there's no
@@ -1213,11 +1436,14 @@ Aborting.`, ui.RenderWarn("⚠"), dbPath, ui.RenderAccent("bd list"), prefix)
 // issues. Returns 0 if the database is unreachable or empty. Used by --force
 // safeguard to show users what they're about to destroy.
 func countExistingIssues(_ string) (int, error) {
-	beadsDir := ".beads"
+	var beadsDir string
 	if envBeadsDir := os.Getenv("BEADS_DIR"); envBeadsDir != "" {
 		beadsDir = utils.CanonicalizePath(envBeadsDir)
 	} else {
-		beadsDir = beads.FollowRedirect(beadsDir)
+		beadsDir = beads.FindBeadsDir()
+		if beadsDir == "" {
+			return 0, nil
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1278,6 +1504,28 @@ func checkExistingBeadsData(prefix string) error {
 	}
 
 	return checkExistingBeadsDataAt(beadsDir, prefix)
+}
+
+// isNonInteractiveInit returns true if init should run without interactive prompts.
+// Precedence: explicit flag > BD_NON_INTERACTIVE env > CI env > terminal detection.
+// Setting BD_NON_INTERACTIVE=0 or BD_NON_INTERACTIVE=false explicitly forces
+// interactive mode, overriding CI detection and terminal checks.
+func isNonInteractiveInit(flagValue bool) bool {
+	if flagValue {
+		return true
+	}
+	if v := os.Getenv("BD_NON_INTERACTIVE"); v != "" {
+		if v == "1" || v == "true" {
+			return true
+		}
+		// Explicit BD_NON_INTERACTIVE=0/false forces interactive mode,
+		// overriding CI and terminal detection.
+		return false
+	}
+	if v := os.Getenv("CI"); v == "true" || v == "1" {
+		return true
+	}
+	return !term.IsTerminal(int(os.Stdin.Fd()))
 }
 
 // shouldPromptForRole returns true if we should prompt the user for their role.
@@ -1367,14 +1615,18 @@ func promptContributorMode() (isContributor bool, err error) {
 func verifyMetadata(ctx context.Context, store storage.DoltStorage, key, value string) bool {
 	if err := store.SetMetadata(ctx, key, value); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to write %s metadata: %v\n", key, err)
-		fmt.Fprintf(os.Stderr, "  Run 'bd doctor --fix' to repair.\n")
+		if !isEmbeddedMode() {
+			fmt.Fprintf(os.Stderr, "  Run 'bd doctor --fix' to repair.\n")
+		}
 		return false
 	}
 	// Verify read-back
 	readBack, err := store.GetMetadata(ctx, key)
 	if err != nil || readBack != value {
 		fmt.Fprintf(os.Stderr, "Warning: %s metadata write did not persist (wrote %q, read %q)\n", key, value, readBack)
-		fmt.Fprintf(os.Stderr, "  Run 'bd doctor --fix' to repair.\n")
+		if !isEmbeddedMode() {
+			fmt.Fprintf(os.Stderr, "  Run 'bd doctor --fix' to repair.\n")
+		}
 		return false
 	}
 	return true

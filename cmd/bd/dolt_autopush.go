@@ -25,7 +25,7 @@ type pushState struct {
 func pushStatePath() (string, error) {
 	beadsDir := beads.FindBeadsDir()
 	if beadsDir == "" {
-		return "", fmt.Errorf("not in a beads repository")
+		return "", fmt.Errorf("%s", activeWorkspaceNotFoundError())
 	}
 	return filepath.Join(beadsDir, "push-state.json"), nil
 }
@@ -73,7 +73,7 @@ func isDoltAutoPushEnabled(ctx context.Context) bool {
 	if st == nil {
 		return false
 	}
-	if lm, ok := st.(storage.LifecycleManager); ok && lm.IsClosed() {
+	if lm, ok := storage.UnwrapStore(st).(storage.LifecycleManager); ok && lm.IsClosed() {
 		return false
 	}
 	has, err := st.HasRemote(ctx, "origin")
@@ -99,7 +99,7 @@ func maybeAutoPush(ctx context.Context) {
 	if st == nil {
 		return
 	}
-	if lm, ok := st.(storage.LifecycleManager); ok && lm.IsClosed() {
+	if lm, ok := storage.UnwrapStore(st).(storage.LifecycleManager); ok && lm.IsClosed() {
 		return
 	}
 
@@ -140,7 +140,13 @@ func maybeAutoPush(ctx context.Context) {
 	// Push
 	debug.Logf("dolt auto-push: pushing to origin...\n")
 	if err := st.Push(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: dolt auto-push failed: %v\n", err)
+		if !isQuiet() && !jsonOutput {
+			fmt.Fprintf(os.Stderr, "Warning: dolt auto-push failed: %v\n", err)
+			if isDivergedHistoryErr(err) {
+				printDivergedHistoryGuidance("push")
+			}
+		}
+		debug.Logf("dolt auto-push: push error: %v\n", err)
 		return
 	}
 

@@ -93,7 +93,7 @@ func (s *DoltStore) initCredentialKey(ctx context.Context) error {
 	// Write key file with owner-only permissions (0600).
 	// Ensure the directory exists first — when connecting to an external
 	// server without having run `bd init`, .beads/ may not exist yet (GH#2641).
-	if err := os.MkdirAll(s.beadsDir, 0750); err != nil {
+	if err := os.MkdirAll(s.beadsDir, 0700); err != nil {
 		return fmt.Errorf("failed to create beads directory %s: %w", s.beadsDir, err)
 	}
 	if err := os.WriteFile(keyPath, key, 0600); err != nil {
@@ -536,4 +536,50 @@ func (s *DoltStore) shouldUseCLIForCredentials(_ context.Context) bool {
 	// Shared server / external server modes may have CLIDir pointing
 	// to wrong directory — FindCLIRemote returns "" in those cases.
 	return doltutil.FindCLIRemote(cliDir, s.remote) != ""
+}
+
+// cloudAuthEnvPrefixes lists environment variable prefixes used by cloud
+// storage providers for authentication. When any of these are set and the
+// store is in server mode, push/pull must route through a CLI subprocess
+// so the dolt process inherits the current env vars. The SQL path
+// (CALL DOLT_PUSH/PULL) executes inside the dolt-sql-server, which only
+// has env vars from when it was started — not from the current shell.
+var cloudAuthEnvPrefixes = []string{
+	"AZURE_STORAGE_", // Azure Blob Storage (AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY, AZURE_STORAGE_SAS_TOKEN)
+	"AWS_",           // AWS S3 (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, AWS_REGION)
+	"GOOGLE_",        // GCS (GOOGLE_APPLICATION_CREDENTIALS)
+	"GCS_",           // GCS alternate (GCS_CREDENTIALS_FILE)
+	"OCI_",           // Oracle Cloud Infrastructure
+	"DOLT_REMOTE_",   // Dolt-specific remote credentials
+}
+
+// shouldUseCLIForCloudAuth returns true when CLI subprocess routing should
+// be used for push/pull because cloud storage credentials are present in the
+// environment and the store is using an external dolt-sql-server.
+//
+// When bd connects to an external dolt-sql-server (server mode), CALL
+// DOLT_PUSH/PULL executes inside the server process. That process only has
+// the env vars it inherited at startup. If cloud credentials were set (or
+// changed) after the server started, the SQL path silently fails to
+// authenticate. Routing through a CLI subprocess (dolt push/pull) ensures
+// the child process inherits the current environment (GH#6).
+func (s *DoltStore) shouldUseCLIForCloudAuth() bool {
+	if !s.serverMode {
+		return false // embedded mode: env vars are in-process
+	}
+	cliDir := s.CLIDir()
+	if cliDir == "" {
+		return false
+	}
+	if doltutil.FindCLIRemote(cliDir, s.remote) == "" {
+		return false
+	}
+	for _, e := range os.Environ() {
+		for _, prefix := range cloudAuthEnvPrefixes {
+			if strings.HasPrefix(e, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }

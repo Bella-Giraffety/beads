@@ -23,6 +23,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/testutil"
 )
 
@@ -332,7 +333,7 @@ func newTestStoreSharedBranch(t *testing.T, dbPath string, prefix string) *dolt.
 
 // dropTestDatabase drops a test database from the shared server (best-effort cleanup).
 func dropTestDatabase(dbName string, port int) {
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/?parseTime=true&timeout=5s", port)
+	dsn := doltutil.ServerDSN{Host: "127.0.0.1", Port: port, User: "root"}.String()
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return
@@ -373,6 +374,7 @@ func openExistingTestDB(t *testing.T, dbPath string) (*dolt.DoltStore, error) {
 func runCommandInDir(dir string, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
+	cmd.Env = testEnvNoPrompt()
 	return cmd.Run()
 }
 
@@ -380,11 +382,21 @@ func runCommandInDir(dir string, name string, args ...string) error {
 func runCommandInDirWithOutput(dir string, name string, args ...string) (string, error) {
 	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
+	cmd.Env = testEnvNoPrompt()
 	output, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+// testEnvNoPrompt returns the current environment with git auth prompts
+// suppressed. Prevents ksshaskpass/SSH_ASKPASS popups during tests that
+// configure fake git remotes (e.g. github.com/test/repo.git).
+func testEnvNoPrompt() []string {
+	env := os.Environ()
+	env = append(env, "GIT_TERMINAL_PROMPT=0", "SSH_ASKPASS=", "GIT_ASKPASS=")
+	return env
 }
 
 // captureStderr captures stderr output from fn and returns it as a string.

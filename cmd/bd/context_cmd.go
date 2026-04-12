@@ -6,7 +6,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
 )
@@ -25,7 +24,8 @@ type ContextInfo struct {
 	Database      string `json:"database"`
 	DataDir       string `json:"data_dir,omitempty"`
 	ProjectID     string `json:"project_id,omitempty"`
-	SyncGitRemote string `json:"sync_git_remote,omitempty"`
+	SyncRemote    string `json:"sync_remote,omitempty"`
+	SyncGitRemote string `json:"sync_git_remote,omitempty"` // Deprecated: use sync_remote
 	Role          string `json:"role,omitempty"`
 	BdVersion     string `json:"bd_version"`
 }
@@ -51,6 +51,10 @@ Examples:
 		}
 
 		// Resolve repo context (works without DB open)
+		if selected := selectedNoDBBeadsDir(); selected != "" {
+			prepareSelectedNoDBContext(selected)
+		}
+
 		rc, err := beads.GetRepoContext()
 		if err != nil {
 			if jsonOutput {
@@ -98,9 +102,10 @@ Examples:
 			info.DataDir = dataDir
 		}
 
-		// Read sync.git-remote from config.yaml
-		if remote := config.GetString("sync.git-remote"); remote != "" {
-			info.SyncGitRemote = remote
+		// Read sync remote from the selected repo's config.yaml.
+		if remote := resolveSyncRemoteFromDir(rc.BeadsDir); remote != "" {
+			info.SyncRemote = remote
+			info.SyncGitRemote = remote // Deprecated: kept for backwards compat
 		}
 
 		if jsonOutput {
@@ -149,10 +154,10 @@ func printContextText(info ContextInfo) {
 	}
 
 	// Sync
-	if info.SyncGitRemote != "" {
+	if info.SyncRemote != "" {
 		fmt.Println()
 		fmt.Println("Sync:")
-		fmt.Printf("  git remote:   %s\n", info.SyncGitRemote)
+		fmt.Printf("  remote:       %s\n", info.SyncRemote)
 	}
 }
 

@@ -80,8 +80,8 @@ func TestTracker_InitFromEnv(t *testing.T) {
 	if tr.org != "myorg" {
 		t.Errorf("org = %q, want %q", tr.org, "myorg")
 	}
-	if tr.project != "myproject" {
-		t.Errorf("project = %q, want %q", tr.project, "myproject")
+	if tr.PrimaryProject() != "myproject" {
+		t.Errorf("project = %q, want %q", tr.PrimaryProject(), "myproject")
 	}
 	if tr.mapper == nil {
 		t.Fatal("Init() did not create field mapper")
@@ -102,8 +102,8 @@ func TestTracker_InitFromConfig(t *testing.T) {
 	if tr.org != "configorg" {
 		t.Errorf("org = %q, want %q", tr.org, "configorg")
 	}
-	if tr.project != "configproject" {
-		t.Errorf("project = %q, want %q", tr.project, "configproject")
+	if tr.PrimaryProject() != "configproject" {
+		t.Errorf("project = %q, want %q", tr.PrimaryProject(), "configproject")
 	}
 }
 
@@ -127,6 +127,11 @@ func TestTracker_InitWithCustomURL(t *testing.T) {
 }
 
 func TestTracker_InitMissingPAT(t *testing.T) {
+	// Clear env vars that getConfig falls back to, so mock store controls all config.
+	t.Setenv("AZURE_DEVOPS_PAT", "")
+	t.Setenv("AZURE_DEVOPS_ORG", "")
+	t.Setenv("AZURE_DEVOPS_PROJECT", "")
+	t.Setenv("AZURE_DEVOPS_URL", "")
 	tr := &Tracker{}
 	err := tr.Init(context.Background(), newMockStore(nil))
 	if err == nil {
@@ -138,6 +143,8 @@ func TestTracker_InitMissingPAT(t *testing.T) {
 }
 
 func TestTracker_InitMissingOrg(t *testing.T) {
+	t.Setenv("AZURE_DEVOPS_ORG", "")
+	t.Setenv("AZURE_DEVOPS_URL", "")
 	tr := &Tracker{}
 	store := newMockStore(map[string]string{
 		"ado.pat":     "some-pat",
@@ -153,6 +160,7 @@ func TestTracker_InitMissingOrg(t *testing.T) {
 }
 
 func TestTracker_InitMissingProject(t *testing.T) {
+	t.Setenv("AZURE_DEVOPS_PROJECT", "")
 	tr := &Tracker{}
 	store := newMockStore(map[string]string{
 		"ado.pat": "some-pat",
@@ -281,6 +289,31 @@ func TestTracker_IsExternalRef(t *testing.T) {
 			ref:  "https://other-tfs.example.com/proj/_workitems/edit/10",
 			want: false,
 		},
+		{
+			name: "ado shorthand format",
+			ref:  "ado:681509",
+			want: true,
+		},
+		{
+			name: "ado shorthand single digit",
+			ref:  "ado:1",
+			want: true,
+		},
+		{
+			name: "ado shorthand non-numeric",
+			ref:  "ado:abc",
+			want: false,
+		},
+		{
+			name: "ado prefix but not shorthand",
+			ref:  "ado:123/extra",
+			want: false,
+		},
+		{
+			name: "ado shorthand zero rejected",
+			ref:  "ado:0",
+			want: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -323,6 +356,26 @@ func TestTracker_ExtractIdentifier(t *testing.T) {
 			ref:  "",
 			want: "",
 		},
+		{
+			name: "ado shorthand format",
+			ref:  "ado:681509",
+			want: "681509",
+		},
+		{
+			name: "ado shorthand single digit",
+			ref:  "ado:1",
+			want: "1",
+		},
+		{
+			name: "ado shorthand non-numeric",
+			ref:  "ado:abc",
+			want: "",
+		},
+		{
+			name: "ado shorthand zero rejected",
+			ref:  "ado:0",
+			want: "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -342,7 +395,7 @@ func TestTracker_BuildExternalRef(t *testing.T) {
 	}{
 		{
 			name:    "uses issue URL if set",
-			tracker: &Tracker{org: "myorg", project: "myproj"},
+			tracker: &Tracker{org: "myorg", projects: []string{"myproj"}},
 			issue: &tracker.TrackerIssue{
 				Identifier: "42",
 				URL:        "https://dev.azure.com/myorg/myproj/_workitems/edit/42",
@@ -351,13 +404,13 @@ func TestTracker_BuildExternalRef(t *testing.T) {
 		},
 		{
 			name:    "constructs cloud URL from org and project",
-			tracker: &Tracker{org: "myorg", project: "myproj"},
+			tracker: &Tracker{org: "myorg", projects: []string{"myproj"}},
 			issue:   &tracker.TrackerIssue{Identifier: "99"},
 			want:    "https://dev.azure.com/myorg/myproj/_workitems/edit/99",
 		},
 		{
 			name:    "constructs on-prem URL from baseURL",
-			tracker: &Tracker{baseURL: "https://tfs.corp.com/DefaultCollection", project: "proj"},
+			tracker: &Tracker{baseURL: "https://tfs.corp.com/DefaultCollection", projects: []string{"proj"}},
 			issue:   &tracker.TrackerIssue{Identifier: "55"},
 			want:    "https://tfs.corp.com/DefaultCollection/proj/_workitems/edit/55",
 		},
@@ -369,13 +422,13 @@ func TestTracker_BuildExternalRef(t *testing.T) {
 		},
 		{
 			name:    "URL-encodes project with spaces",
-			tracker: &Tracker{org: "myorg", project: "My Project"},
+			tracker: &Tracker{org: "myorg", projects: []string{"My Project"}},
 			issue:   &tracker.TrackerIssue{Identifier: "88"},
 			want:    "https://dev.azure.com/myorg/My%20Project/_workitems/edit/88",
 		},
 		{
 			name:    "URL-encodes on-prem project with spaces",
-			tracker: &Tracker{baseURL: "https://tfs.corp.com/col", project: "My Project"},
+			tracker: &Tracker{baseURL: "https://tfs.corp.com/col", projects: []string{"My Project"}},
 			issue:   &tracker.TrackerIssue{Identifier: "66"},
 			want:    "https://tfs.corp.com/col/My%20Project/_workitems/edit/66",
 		},
@@ -698,11 +751,11 @@ func newTestTracker(t *testing.T, handler http.Handler) (*Tracker, *httptest.Ser
 	}
 
 	return &Tracker{
-		client:  client,
-		mapper:  NewFieldMapper(nil, nil),
-		baseURL: server.URL,
-		org:     "testorg",
-		project: "testproject",
+		client:   client,
+		mapper:   NewFieldMapper(nil, nil),
+		baseURL:  server.URL,
+		org:      "testorg",
+		projects: []string{"testproject"},
 	}, server
 }
 

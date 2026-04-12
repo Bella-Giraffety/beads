@@ -10,12 +10,13 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/steveyegge/beads/internal/storage/doltutil"
+	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
 // TestConcurrentInitSchema verifies that concurrent initSchemaOnDB calls on a
-// fresh database do not corrupt the Dolt journal. Without the GET_LOCK advisory
-// lock, 20+ concurrent processes running DDL simultaneously on a fresh DB
-// reliably produce CRC/journal corruption (see GH#2672).
+// fresh database do not corrupt the schema. All DDL uses IF NOT EXISTS / ON
+// DUPLICATE KEY so concurrent execution is idempotent.
 func TestConcurrentInitSchema(t *testing.T) {
 	skipIfNoDolt(t)
 	acquireTestSlot()
@@ -30,7 +31,7 @@ func TestConcurrentInitSchema(t *testing.T) {
 
 	// Create a fresh database that has never been initialized.
 	dbName := uniqueTestDBName(t)
-	initDSN := fmt.Sprintf("root@tcp(127.0.0.1:%d)/", testServerPort)
+	initDSN := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root"}.String()
 	initDB, err := sql.Open("mysql", initDSN)
 	if err != nil {
 		t.Fatalf("open init connection: %v", err)
@@ -40,15 +41,11 @@ func TestConcurrentInitSchema(t *testing.T) {
 	if _, err := initDB.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+dbName+"`"); err != nil {
 		t.Fatalf("create database: %v", err)
 	}
-	t.Cleanup(func() {
-		// Skip DROP — rapid create/drop cycles can crash the Dolt container.
-		// The orphan is cleaned up when the container terminates.
-	})
 
 	// Open N independent sql.DB pools pointing at the fresh database.
 	// Each simulates a separate bd process connecting simultaneously.
 	const numConcurrent = 20
-	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/%s?parseTime=true", testServerPort, dbName)
+	dsn := doltutil.ServerDSN{Host: "127.0.0.1", Port: testServerPort, User: "root", Database: dbName}.String()
 
 	tmpDir, err := os.MkdirTemp("", "dolt-concurrent-init-*")
 	if err != nil {
@@ -100,12 +97,12 @@ func TestConcurrentInitSchema(t *testing.T) {
 	}
 	defer verifyDB.Close()
 
-	var version int
-	if err := verifyDB.QueryRowContext(ctx, "SELECT `value` FROM config WHERE `key` = 'schema_version'").Scan(&version); err != nil {
-		t.Fatalf("schema_version not found after concurrent init: %v", err)
+	var maxVersion int
+	if err := verifyDB.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&maxVersion); err != nil {
+		t.Fatalf("schema_migrations query failed after concurrent init: %v", err)
 	}
-	if version != currentSchemaVersion {
-		t.Errorf("schema_version = %d, want %d", version, currentSchemaVersion)
+	if maxVersion != schema.LatestVersion() {
+		t.Errorf("max migration version = %d, want %d", maxVersion, schema.LatestVersion())
 	}
 
 	for _, table := range []string{"issues", "dependencies", "config", "comments"} {

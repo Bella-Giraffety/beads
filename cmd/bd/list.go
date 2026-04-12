@@ -437,21 +437,42 @@ var listCmd = &cobra.Command{
 			s := types.StatusOpen
 			filter.Status = &s
 		} else if status != "" && status != "all" {
-			s := types.Status(status)
-			// Validate --status value (bd-ttno)
+			// Support comma-separated status values (GH#2846)
+			statusParts := strings.Split(status, ",")
 			var customStatuses []string
 			if store != nil {
-				cs, _ := store.GetCustomStatuses(rootCtx)
-				customStatuses = cs
-			}
-			if !s.IsValidWithCustom(customStatuses) {
-				validList := "open, in_progress, blocked, deferred, closed, pinned, hooked"
-				if len(customStatuses) > 0 {
-					validList += ", " + strings.Join(customStatuses, ", ")
+				cs, err := store.GetCustomStatuses(rootCtx)
+				if err != nil {
+					if !jsonOutput {
+						fmt.Fprintf(os.Stderr, "%s Could not load custom statuses from database: %v (falling back to config)\n", ui.RenderWarn("!"), err)
+					}
+				} else {
+					customStatuses = cs
 				}
-				FatalError("invalid status %q (valid: %s)", status, validList)
 			}
-			filter.Status = &s
+			if len(statusParts) == 1 {
+				s := types.Status(strings.TrimSpace(statusParts[0]))
+				if !s.IsValidWithCustom(customStatuses) {
+					validList := "open, in_progress, blocked, deferred, closed, pinned, hooked"
+					if len(customStatuses) > 0 {
+						validList += ", " + strings.Join(customStatuses, ", ")
+					}
+					FatalError("invalid status %q (valid: %s)", status, validList)
+				}
+				filter.Status = &s
+			} else {
+				for _, part := range statusParts {
+					s := types.Status(strings.TrimSpace(part))
+					if !s.IsValidWithCustom(customStatuses) {
+						validList := "open, in_progress, blocked, deferred, closed, pinned, hooked"
+						if len(customStatuses) > 0 {
+							validList += ", " + strings.Join(customStatuses, ", ")
+						}
+						FatalError("invalid status %q in multi-status filter (valid: %s)", strings.TrimSpace(part), validList)
+					}
+					filter.Statuses = append(filter.Statuses, s)
+				}
+			}
 		}
 
 		// Default to non-closed/non-pinned issues unless --all, --pinned, or explicit --status (GH#788, bd-uhcg)
@@ -760,27 +781,15 @@ var listCmd = &cobra.Command{
 
 		ctx := rootCtx
 
-		// Handle --rig flag: query a different rig's database
-		rigOverride, _ := cmd.Flags().GetString("rig")
 		activeStore := store
-		if rigOverride != "" {
-			rigStore, err := openStoreForRig(ctx, rigOverride)
-			if err != nil {
-				FatalError("%v", err)
-			}
-			defer func() { _ = rigStore.Close() }() // Best effort cleanup
-			activeStore = rigStore
-		} else {
-			// Keep list/read behavior aligned with bd create routing decisions.
-			// Contributor auto-routing should read from the same target repo.
-			routedStore, routed, err := openRoutedReadStore(ctx, activeStore)
-			if err != nil {
-				FatalError("%v", err)
-			}
-			if routed {
-				defer func() { _ = routedStore.Close() }()
-				activeStore = routedStore
-			}
+		// Contributor auto-routing: read from the same target repo as bd create.
+		routedStore, routed, err := openRoutedReadStore(ctx, activeStore)
+		if err != nil {
+			FatalError("%v", err)
+		}
+		if routed {
+			defer func() { _ = routedStore.Close() }()
+			activeStore = routedStore
 		}
 
 		// Direct mode
@@ -949,7 +958,7 @@ var listCmd = &cobra.Command{
 }
 
 func init() {
-	listCmd.Flags().StringP("status", "s", "", "Filter by stored status (open, in_progress, blocked, deferred, closed). Note: dependency-blocked issues use 'bd blocked'")
+	listCmd.Flags().StringP("status", "s", "", "Filter by stored status (open, in_progress, blocked, deferred, closed). Comma-separated for multiple: --status open,in_progress")
 	listCmd.Flags().String("state", "", "Alias for --status")
 	_ = listCmd.Flags().MarkHidden("state")
 	registerPriorityFlag(listCmd, "")
@@ -1042,9 +1051,6 @@ func init() {
 
 	// Ready filter: show only issues ready to be worked on (bd-ihu31)
 	listCmd.Flags().Bool("ready", false, "Show only ready issues (status=open, excludes hooked/in_progress/blocked/deferred)")
-
-	// Cross-rig routing: query a different rig's database (bd-rgdjr)
-	listCmd.Flags().String("rig", "", "Query a different rig's database (e.g., --rig my-project, --rig gt-, --rig gt)")
 
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(listCmd)
