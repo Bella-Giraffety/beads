@@ -997,6 +997,9 @@ func TestFinalizeSyncedBootstrapWritesConfigFiles(t *testing.T) {
 	if loaded.GetDoltDatabase() != dbName {
 		t.Errorf("dolt_database = %q, want %q", loaded.GetDoltDatabase(), dbName)
 	}
+	if loaded.Database != "dolt" {
+		t.Errorf("database = %q, want %q", loaded.Database, "dolt")
+	}
 	if loaded.GetDoltMode() != configfile.DoltModeEmbedded {
 		t.Errorf("dolt_mode = %q, want %q", loaded.GetDoltMode(), configfile.DoltModeEmbedded)
 	}
@@ -1021,6 +1024,69 @@ func TestFinalizeSyncedBootstrapWritesConfigFiles(t *testing.T) {
 	}
 	if !strings.Contains(yaml, syncRemote) {
 		t.Errorf("config.yaml does not contain sync remote URL %q:\n%s", syncRemote, yaml)
+	}
+}
+
+// TestFinalizeSyncedBootstrapPreservesClonedMetadata verifies that bootstrap
+// recovery keeps the important metadata fields that arrived with the clone
+// while still rebinding the workspace to the canonical Dolt directory.
+func TestFinalizeSyncedBootstrapPreservesClonedMetadata(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	cfg := &configfile.Config{
+		Database:       configfile.DefaultConfig().Database,
+		DoltServerHost: "10.0.0.9",
+		DoltServerPort: 3312,
+		DoltServerUser: "clone-user",
+		DoltServerTLS:  true,
+		ProjectID:      "proj-cloned-123",
+		Backend:        configfile.BackendDolt,
+	}
+
+	if err := finalizeSyncedBootstrap(beadsDir, "file:///tmp/fake-origin.git", cfg, "clone_db"); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load after finalize failed: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("configfile.Load returned nil")
+	}
+
+	if loaded.Database != "dolt" {
+		t.Fatalf("database = %q, want %q", loaded.Database, "dolt")
+	}
+	if loaded.GetDoltDatabase() != "clone_db" {
+		t.Fatalf("dolt_database = %q, want %q", loaded.GetDoltDatabase(), "clone_db")
+	}
+	if loaded.DoltServerHost != "10.0.0.9" {
+		t.Fatalf("dolt_server_host = %q, want %q", loaded.DoltServerHost, "10.0.0.9")
+	}
+	if loaded.DoltServerPort != 3312 {
+		t.Fatalf("dolt_server_port = %d, want %d", loaded.DoltServerPort, 3312)
+	}
+	if loaded.DoltServerUser != "clone-user" {
+		t.Fatalf("dolt_server_user = %q, want %q", loaded.DoltServerUser, "clone-user")
+	}
+	if !loaded.DoltServerTLS {
+		t.Fatal("expected dolt_server_tls to be preserved")
+	}
+	if loaded.ProjectID != "proj-cloned-123" {
+		t.Fatalf("project_id = %q, want %q", loaded.ProjectID, "proj-cloned-123")
 	}
 }
 
