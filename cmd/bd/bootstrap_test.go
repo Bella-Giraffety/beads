@@ -1077,3 +1077,37 @@ func TestFinalizeSyncedBootstrapIsIdempotent(t *testing.T) {
 		t.Errorf("dolt_database drifted: got %q, want %q", loaded.GetDoltDatabase(), "beads_hq")
 	}
 }
+
+func TestApplyBootstrapMetadataRepair_UsesResolvedConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	origResolve := resolveBootstrapAuthoritativeMetadata
+	resolveBootstrapAuthoritativeMetadata = func(path string, apply bool) (*configfile.Config, string, error) {
+		if path != tmpDir {
+			t.Fatalf("path = %q, want %q", path, tmpDir)
+		}
+		if !apply {
+			t.Fatal("expected apply=true")
+		}
+		return &configfile.Config{DoltMode: configfile.DoltModeServer, DoltDatabase: "canonical_db"}, "repaired dolt_database", nil
+	}
+	defer func() { resolveBootstrapAuthoritativeMetadata = origResolve }()
+
+	resolved, msg, err := applyBootstrapMetadataRepair(beadsDir, configfile.DefaultConfig(), true)
+	if err != nil {
+		t.Fatalf("applyBootstrapMetadataRepair failed: %v", err)
+	}
+	if resolved == nil {
+		t.Fatal("resolved config is nil")
+	}
+	if resolved.GetDoltDatabase() != "canonical_db" {
+		t.Fatalf("GetDoltDatabase() = %q, want %q", resolved.GetDoltDatabase(), "canonical_db")
+	}
+	if msg != "repaired dolt_database" {
+		t.Fatalf("msg = %q, want %q", msg, "repaired dolt_database")
+	}
+}

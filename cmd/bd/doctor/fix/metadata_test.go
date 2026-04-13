@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/configfile"
@@ -176,5 +177,101 @@ func setupGitRepoInDir(t *testing.T, dir string) {
 				t.Fatalf("git init failed: %v", err)
 			}
 		}
+	}
+}
+
+func TestReconcileAuthoritativeServerMetadata_UsesProjectIDToRepairDatabaseName(t *testing.T) {
+	cfg := &configfile.Config{
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "wrong_db",
+		ProjectID:    "proj-123",
+	}
+
+	changed, msg, err := reconcileAuthoritativeServerMetadata(cfg, []serverDatabaseMetadata{
+		{Name: "wrong_db", HasSchema: true, ProjectID: "other-proj"},
+		{Name: "canonical_db", HasSchema: true, ProjectID: "proj-123"},
+	})
+	if err != nil {
+		t.Fatalf("reconcileAuthoritativeServerMetadata error: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected repair to change metadata")
+	}
+	if cfg.DoltDatabase != "canonical_db" {
+		t.Fatalf("DoltDatabase = %q, want %q", cfg.DoltDatabase, "canonical_db")
+	}
+	if !strings.Contains(msg, "canonical_db") || !strings.Contains(msg, "proj-123") {
+		t.Fatalf("unexpected repair message: %q", msg)
+	}
+}
+
+func TestReconcileAuthoritativeServerMetadata_AdoptsConfiguredDatabaseProjectID(t *testing.T) {
+	cfg := &configfile.Config{
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "shared_db",
+		ProjectID:    "stale-local-id",
+	}
+
+	changed, msg, err := reconcileAuthoritativeServerMetadata(cfg, []serverDatabaseMetadata{
+		{Name: "shared_db", HasSchema: true, ProjectID: "server-authoritative-id"},
+	})
+	if err != nil {
+		t.Fatalf("reconcileAuthoritativeServerMetadata error: %v", err)
+	}
+	if !changed {
+		t.Fatal("expected repair to change metadata")
+	}
+	if cfg.ProjectID != "server-authoritative-id" {
+		t.Fatalf("ProjectID = %q, want %q", cfg.ProjectID, "server-authoritative-id")
+	}
+	if !strings.Contains(msg, "shared_db") || !strings.Contains(msg, "server-authoritative-id") {
+		t.Fatalf("unexpected repair message: %q", msg)
+	}
+}
+
+func TestReconcileAuthoritativeServerMetadata_ErrorsOnAmbiguousProjectIDMatch(t *testing.T) {
+	cfg := &configfile.Config{
+		DoltMode:     configfile.DoltModeServer,
+		DoltDatabase: "wrong_db",
+		ProjectID:    "proj-123",
+	}
+
+	changed, msg, err := reconcileAuthoritativeServerMetadata(cfg, []serverDatabaseMetadata{
+		{Name: "canonical_a", HasSchema: true, ProjectID: "proj-123"},
+		{Name: "canonical_b", HasSchema: true, ProjectID: "proj-123"},
+	})
+	if err == nil {
+		t.Fatal("expected ambiguous project_id match error")
+	}
+	if changed {
+		t.Fatal("changed = true, want false on error")
+	}
+	if msg != "" {
+		t.Fatalf("msg = %q, want empty", msg)
+	}
+}
+
+func TestResolveAuthoritativeServerMetadata_RunsInSharedServerModeWithoutServerDoltMode(t *testing.T) {
+	dir := setupTestWorkspace(t)
+	beadsDir := filepath.Join(dir, ".beads")
+	cfg := configfile.DefaultConfig()
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("failed to save config: %v", err)
+	}
+
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	origList := listServerMetadataDatabases
+	called := false
+	listServerMetadataDatabases = func(beadsDir string, cfg *configfile.Config) ([]serverDatabaseMetadata, error) {
+		called = true
+		return nil, nil
+	}
+	defer func() { listServerMetadataDatabases = origList }()
+
+	if _, _, err := ResolveAuthoritativeServerMetadata(dir, false); err != nil {
+		t.Fatalf("ResolveAuthoritativeServerMetadata failed: %v", err)
+	}
+	if !called {
+		t.Fatal("expected shared-server metadata probe to run")
 	}
 }
