@@ -1451,7 +1451,7 @@ func initSchemaOnDBWithAuthor(ctx context.Context, db *sql.DB, author string) er
 			"issues", "dependencies", "labels", "comments", "events",
 			"config", "metadata", "child_counters",
 			"issue_snapshots", "compaction_snapshots",
-			"repo_mtimes", "routes", "issue_counter",
+			"routes", "issue_counter",
 			"interactions", "federation_peers",
 			"custom_statuses", "custom_types",
 			"dolt_ignore", "schema_migrations",
