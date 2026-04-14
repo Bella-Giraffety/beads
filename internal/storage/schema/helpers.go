@@ -21,11 +21,15 @@ var ignoredTables = []string{
 // dolt_ignore entries are committed and persist across branches; only the
 // tables themselves (which live in the working set) need recreation.
 func EnsureIgnoredTables(ctx context.Context, db DBConn) error {
-	exists, err := TableExists(ctx, db, "wisps")
+	wispsOK, err := TableExists(ctx, db, "wisps")
 	if err != nil {
 		return fmt.Errorf("check wisps table: %w", err)
 	}
-	if exists {
+	localOK, err := TableExists(ctx, db, "local_metadata")
+	if err != nil {
+		return fmt.Errorf("check local_metadata table: %w", err)
+	}
+	if wispsOK && localOK {
 		return nil
 	}
 	return CreateIgnoredTables(ctx, db)
