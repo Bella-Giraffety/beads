@@ -567,11 +567,7 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 		fmt.Fprintf(os.Stderr, "Warning: post-clone store init failed (wisp tables may be missing): %v\n", err)
 		return nil
 	}
-	defer func() { _ = warmupStore.Close() }()
-
-	if err := syncProjectIDToBeadsDir(ctx, plan.BeadsDir, warmupStore); err != nil {
-		return err
-	}
+	_ = warmupStore.Close()
 
 	return nil
 }
