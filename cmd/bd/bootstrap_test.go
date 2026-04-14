@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -980,7 +981,7 @@ func TestFinalizeSyncedBootstrapWritesConfigFiles(t *testing.T) {
 	const syncRemote = "file:///tmp/fake-origin.git"
 
 	cfg := configfile.DefaultConfig()
-	if err := finalizeSyncedBootstrap(beadsDir, syncRemote, cfg, dbName); err != nil {
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, syncRemote, cfg, dbName); err != nil {
 		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
 	}
 
@@ -1109,7 +1110,7 @@ func TestFinalizeSyncedBootstrapIsIdempotent(t *testing.T) {
 	t.Setenv("BEADS_DIR", beadsDir)
 
 	cfg := configfile.DefaultConfig()
-	if err := finalizeSyncedBootstrap(beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
 		t.Fatalf("first finalize failed: %v", err)
 	}
 
@@ -1118,7 +1119,7 @@ func TestFinalizeSyncedBootstrapIsIdempotent(t *testing.T) {
 		t.Fatalf("read config.yaml after first finalize: %v", err)
 	}
 
-	if err := finalizeSyncedBootstrap(beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
 		t.Fatalf("second finalize failed: %v", err)
 	}
 
@@ -1141,5 +1142,40 @@ func TestFinalizeSyncedBootstrapIsIdempotent(t *testing.T) {
 	}
 	if loaded.GetDoltDatabase() != "beads_hq" {
 		t.Errorf("dolt_database drifted: got %q, want %q", loaded.GetDoltDatabase(), "beads_hq")
+	}
+}
+
+func TestFinalizeSyncedBootstrapClearsInheritedIdentityAndPort(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	cfg := configfile.DefaultConfig()
+	cfg.ProjectID = "stale-project-id"
+	cfg.DoltServerPort = 3307
+
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil || loaded == nil {
+		t.Fatalf("metadata.json missing after finalize: %v", err)
+	}
+	if loaded.ProjectID != "" {
+		t.Errorf("ProjectID = %q, want empty while waiting for authoritative DB identity", loaded.ProjectID)
+	}
+	if loaded.DoltServerPort != 0 {
+		t.Errorf("DoltServerPort = %d, want 0 after clearing inherited explicit port", loaded.DoltServerPort)
 	}
 }

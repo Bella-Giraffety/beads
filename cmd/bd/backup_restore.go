@@ -117,22 +117,20 @@ func registerBackupRemote(ctx context.Context, bs storage.BackupStore, dir strin
 	}
 }
 
-// syncProjectIDFromDB reads _project_id from the restored database and
-// updates metadata.json to match, preventing identity mismatch errors.
-func syncProjectIDFromDB(ctx context.Context, s storage.DoltStorage) error {
+// syncProjectIDToBeadsDir reads _project_id from the database and updates the
+// specified metadata.json to match, preventing identity mismatch errors.
+func syncProjectIDToBeadsDir(ctx context.Context, beadsDir string, s storage.DoltStorage) error {
 	dbID, err := s.GetMetadata(ctx, "_project_id")
 	if err != nil || dbID == "" {
 		return err
 	}
 
-	beadsDir := beads.FindBeadsDir()
-	if beadsDir == "" {
-		return fmt.Errorf("%s; %s", activeWorkspaceNotFoundError(), diagHint())
-	}
-
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil {
 		return err
+	}
+	if cfg == nil {
+		cfg = configfile.DefaultConfig()
 	}
 
 	if cfg.ProjectID == dbID {
@@ -141,6 +139,17 @@ func syncProjectIDFromDB(ctx context.Context, s storage.DoltStorage) error {
 
 	cfg.ProjectID = dbID
 	return cfg.Save(beadsDir)
+}
+
+// syncProjectIDFromDB reads _project_id from the restored database and
+// updates metadata.json to match, preventing identity mismatch errors.
+func syncProjectIDFromDB(ctx context.Context, s storage.DoltStorage) error {
+	beadsDir := beads.FindBeadsDir()
+	if beadsDir == "" {
+		return fmt.Errorf("%s; %s", activeWorkspaceNotFoundError(), diagHint())
+	}
+
+	return syncProjectIDToBeadsDir(ctx, beadsDir, s)
 }
 
 func validateBackupRestoreDir(dir string) error {

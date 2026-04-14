@@ -677,26 +677,22 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				cfg = configfile.DefaultConfig()
 			}
 
-			// Generate project identity UUID if not already set (GH#2372).
-			// This UUID is stored in both metadata.json and the database,
-			// and verified on every connection to detect cross-project leakage.
-			//
-			// When --database is specified and the database already exists on the
-			// server, adopt the existing project_id instead of generating a new
-			// one. This prevents identity mismatch when a second user joins a
-			// shared remote Dolt server. (GH#2922)
-			if cfg.ProjectID == "" {
-				if database != "" && store != nil {
-					if existingID, err := store.GetMetadata(ctx, "_project_id"); err == nil && existingID != "" {
-						cfg.ProjectID = existingID
-						if !quiet {
-							fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
-						}
-					}
+			// Project identity is database-authoritative when one already exists.
+			// Never preserve an inherited metadata.json project_id during init:
+			// cloned/shared-server workspaces may contain a committed stale value.
+			// If the target database already has _project_id, adopt it. Otherwise,
+			// generate a fresh identity for this newly initialized database.
+			dbProjectID := ""
+			if store != nil {
+				dbProjectID, _ = store.GetMetadata(ctx, "_project_id")
+			}
+			if dbProjectID != "" {
+				cfg.ProjectID = dbProjectID
+				if !quiet {
+					fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
 				}
-				if cfg.ProjectID == "" {
-					cfg.ProjectID = configfile.GenerateProjectID()
-				}
+			} else {
+				cfg.ProjectID = configfile.GenerateProjectID()
 			}
 
 			// Always store backend explicitly in metadata.json
@@ -732,6 +728,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				if serverHost != "" {
 					cfg.DoltServerHost = serverHost
 				}
+				// Never preserve an inherited git-tracked dolt_server_port. The
+				// runtime port file and env/config resolution are authoritative unless
+				// init was explicitly given --server-port.
+				cfg.DoltServerPort = 0
 				if serverPort != 0 {
 					cfg.DoltServerPort = serverPort
 				}

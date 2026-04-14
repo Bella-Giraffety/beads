@@ -501,7 +501,7 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 	// bootstrap action (init, restore, jsonl-import) writes these files via
 	// newDoltStore + createConfigYaml; the sync path historically did not.
 	// (GH#3201)
-	return finalizeSyncedBootstrap(plan.BeadsDir, plan.SyncRemote, cfg, dbName)
+	return finalizeSyncedBootstrap(ctx, plan.BeadsDir, plan.SyncRemote, cfg, dbName)
 }
 
 // finalizeSyncedBootstrap writes metadata.json and config.yaml after a
@@ -509,7 +509,7 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 // It is idempotent: re-running over an already-finalized workspace leaves
 // existing files intact (createConfigYaml skips if config.yaml exists; the
 // metadata.json write is a full rewrite that preserves caller fields).
-func finalizeSyncedBootstrap(beadsDir, syncRemote string, cfg *configfile.Config, dbName string) error {
+func finalizeSyncedBootstrap(ctx context.Context, beadsDir, syncRemote string, cfg *configfile.Config, dbName string) error {
 	// Preserve whatever upstream fields were already set in cfg (which may
 	// be DefaultConfig when metadata.json was absent, or a parent workspace
 	// config propagated by findParentConfig), then fill in the bits
@@ -526,6 +526,14 @@ func finalizeSyncedBootstrap(beadsDir, syncRemote string, cfg *configfile.Config
 	if cfg.Database == "" || cfg.Database == beads.CanonicalDatabaseName {
 		cfg.Database = "dolt"
 	}
+	// Do not carry git-tracked identity seeds forward from a cloned workspace.
+	// The cloned database's _project_id is authoritative and will be synced
+	// back after the workspace can reopen the clone.
+	cfg.ProjectID = ""
+	// Do not preserve a committed explicit port. The local runtime port file /
+	// env / config resolution is authoritative unless the user explicitly chose
+	// a port in this workspace.
+	cfg.DoltServerPort = 0
 
 	if err := cfg.Save(beadsDir); err != nil {
 		return fmt.Errorf("write metadata.json: %w", err)
@@ -541,6 +549,16 @@ func finalizeSyncedBootstrap(beadsDir, syncRemote string, cfg *configfile.Config
 		if err := config.SetYamlConfig("sync.remote", syncRemote); err != nil {
 			return fmt.Errorf("persist sync.remote to config.yaml: %w", err)
 		}
+	}
+
+	store, err := dolt.NewFromConfigWithOptions(ctx, beadsDir, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to reopen bootstrapped database to adopt project identity: %v\n", err)
+		return nil
+	}
+	defer func() { _ = store.Close() }()
+	if err := syncProjectIDToBeadsDir(ctx, beadsDir, store); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to adopt project identity from bootstrapped database: %v\n", err)
 	}
 
 	return nil
