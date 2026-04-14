@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net"
+	"net/mail"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -832,16 +833,11 @@ func applyConfigDefaults(cfg *Config) {
 	}
 	if cfg.CommitterName == "" {
 		cfg.CommitterName = os.Getenv("GIT_AUTHOR_NAME")
-		if cfg.CommitterName == "" {
-			cfg.CommitterName = "beads"
-		}
 	}
 	if cfg.CommitterEmail == "" {
 		cfg.CommitterEmail = os.Getenv("GIT_AUTHOR_EMAIL")
-		if cfg.CommitterEmail == "" {
-			cfg.CommitterEmail = "beads@local"
-		}
 	}
+	cfg.CommitterName, cfg.CommitterEmail = normalizeCommitterIdentity(cfg.CommitterName, cfg.CommitterEmail)
 	if cfg.Remote == "" {
 		cfg.Remote = "origin"
 	}
@@ -913,6 +909,34 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.RemotePassword == "" {
 		cfg.RemotePassword = os.Getenv("DOLT_REMOTE_PASSWORD")
 	}
+}
+
+func normalizeCommitterIdentity(name, email string) (string, string) {
+	name = strings.TrimSpace(name)
+	email = strings.TrimSpace(email)
+
+	if email == "" && name != "" {
+		if addr, err := mail.ParseAddress(name); err == nil && addr.Address != "" {
+			email = strings.TrimSpace(addr.Address)
+			if parsedName := strings.TrimSpace(addr.Name); parsedName != "" {
+				name = parsedName
+			}
+		}
+	}
+
+	if name == "" {
+		name = "beads"
+	}
+	if email == "" {
+		email = "beads@local"
+	}
+
+	return name, email
+}
+
+func formatCommitAuthor(name, email string) string {
+	name, email = normalizeCommitterIdentity(name, email)
+	return fmt.Sprintf("%s <%s>", name, email)
 }
 
 // New creates a new Dolt storage backend.
@@ -1411,6 +1435,10 @@ func databaseExistsOnServer(ctx context.Context, db *sql.DB, name string) (bool,
 // backward-compat transforms. Uses the shared schema.MigrateUp runner which
 // tracks applied versions in the schema_migrations table.
 func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
+	return initSchemaOnDBWithAuthor(ctx, db, formatCommitAuthor("", ""))
+}
+
+func initSchemaOnDBWithAuthor(ctx context.Context, db *sql.DB, author string) error {
 	applied, err := schema.MigrateUp(ctx, db)
 	if err != nil {
 		return fmt.Errorf("schema migration: %w", err)
@@ -1431,7 +1459,7 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 		for _, table := range schemaTables {
 			_, _ = db.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
 		}
-		if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-m', 'schema: apply migrations')"); err != nil {
+		if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-m', 'schema: apply migrations', '--author', ?)", author); err != nil {
 			if !strings.Contains(strings.ToLower(err.Error()), "nothing to commit") {
 				return fmt.Errorf("failed to commit schema migrations: %w", err)
 			}
@@ -1449,7 +1477,7 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 }
 
 func (s *DoltStore) initSchema(ctx context.Context) error {
-	return initSchemaOnDB(ctx, s.db)
+	return initSchemaOnDBWithAuthor(ctx, s.db, s.commitAuthorString())
 }
 
 // IsClosed returns true if the store has been closed.
@@ -1555,7 +1583,7 @@ func (s *DoltStore) UnderlyingDB() *sql.DB {
 // =============================================================================
 
 func (s *DoltStore) commitAuthorString() string {
-	return fmt.Sprintf("%s <%s>", s.committerName, s.committerEmail)
+	return formatCommitAuthor(s.committerName, s.committerEmail)
 }
 
 // Commit creates a Dolt commit with the given message.

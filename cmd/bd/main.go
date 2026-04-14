@@ -724,8 +724,10 @@ var rootCmd = &cobra.Command{
 		// on a different filesystem (e.g., ext4 for performance on WSL).
 		doltPath := doltserver.ResolveDoltDir(beadsDir)
 		doltCfg := &dolt.Config{
-			ReadOnly: useReadOnly,
-			BeadsDir: beadsDir,
+			ReadOnly:       useReadOnly,
+			BeadsDir:       beadsDir,
+			CommitterName:  getActorWithGit(),
+			CommitterEmail: getOwner(),
 		}
 
 		// Load config to get database name and server connection settings

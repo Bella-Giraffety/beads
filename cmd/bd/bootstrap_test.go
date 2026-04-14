@@ -14,6 +14,30 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 )
 
+type stubBootstrapMetadataStore struct {
+	metadata map[string]string
+	writes   map[string]string
+}
+
+func (s *stubBootstrapMetadataStore) GetMetadata(_ context.Context, key string) (string, error) {
+	if s.metadata == nil {
+		return "", fmt.Errorf("missing")
+	}
+	return s.metadata[key], nil
+}
+
+func (s *stubBootstrapMetadataStore) SetMetadata(_ context.Context, key, value string) error {
+	if s.metadata == nil {
+		s.metadata = make(map[string]string)
+	}
+	if s.writes == nil {
+		s.writes = make(map[string]string)
+	}
+	s.metadata[key] = value
+	s.writes[key] = value
+	return nil
+}
+
 func TestDetectBootstrapAction_NoneWhenDatabaseExists(t *testing.T) {
 	t.Setenv("BEADS_DOLT_DATA_DIR", "")
 	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
@@ -51,6 +75,73 @@ func TestDetectBootstrapAction_NoneWhenDatabaseExists(t *testing.T) {
 	}
 	if !plan.HasExisting {
 		t.Error("HasExisting = false, want true")
+	}
+}
+
+func TestBootstrapStoreConfig_ServerModeUsesResolvedSettings(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.port"), []byte("3311"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BEADS_ACTOR", "bootstrap-bot")
+	t.Setenv("GIT_AUTHOR_EMAIL", "bootstrap@example.com")
+
+	cfg := configfile.DefaultConfig()
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltDatabase = "beads_meta"
+
+	doltCfg := bootstrapStoreConfig(beadsDir, cfg, cfg.GetDoltDatabase())
+	if !doltCfg.ServerMode {
+		t.Fatal("ServerMode = false, want true")
+	}
+	if doltCfg.ServerPort != 3311 {
+		t.Fatalf("ServerPort = %d, want 3311", doltCfg.ServerPort)
+	}
+	if doltCfg.CommitterName != "bootstrap-bot" {
+		t.Fatalf("CommitterName = %q, want %q", doltCfg.CommitterName, "bootstrap-bot")
+	}
+	if doltCfg.CommitterEmail != "bootstrap@example.com" {
+		t.Fatalf("CommitterEmail = %q, want %q", doltCfg.CommitterEmail, "bootstrap@example.com")
+	}
+}
+
+func TestBootstrapProjectIdentityAdoptsExistingDatabaseIdentity(t *testing.T) {
+	store := &stubBootstrapMetadataStore{metadata: map[string]string{"_project_id": "db-project"}}
+	cfg := configfile.DefaultConfig()
+	cfg.ProjectID = "local-project"
+
+	if err := bootstrapProjectIdentity(context.Background(), store, cfg); err != nil {
+		t.Fatalf("bootstrapProjectIdentity failed: %v", err)
+	}
+	if cfg.ProjectID != "db-project" {
+		t.Fatalf("ProjectID = %q, want %q", cfg.ProjectID, "db-project")
+	}
+	if len(store.writes) != 0 {
+		t.Fatalf("unexpected metadata writes: %#v", store.writes)
+	}
+}
+
+func TestBootstrapProjectIdentityWritesGeneratedIdentityWhenMissing(t *testing.T) {
+	store := &stubBootstrapMetadataStore{metadata: map[string]string{}}
+	cfg := configfile.DefaultConfig()
+
+	if err := bootstrapProjectIdentity(context.Background(), store, cfg); err != nil {
+		t.Fatalf("bootstrapProjectIdentity failed: %v", err)
+	}
+	if cfg.ProjectID == "" {
+		t.Fatal("ProjectID was not generated")
+	}
+	if got := store.writes["_project_id"]; got != cfg.ProjectID {
+		t.Fatalf("_project_id write = %q, want %q", got, cfg.ProjectID)
 	}
 }
 

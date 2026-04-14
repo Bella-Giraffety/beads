@@ -133,3 +133,47 @@ func TestSchemaRunsInitWhenMissing(t *testing.T) {
 	_, _ = store.db.ExecContext(dropCtx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName))
 	store.Close()
 }
+
+func TestSchemaInitCommitsUseConfiguredAuthor(t *testing.T) {
+	skipIfNoDolt(t)
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	tmpDir, err := os.MkdirTemp("", "dolt-test-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	dbName := uniqueTestDBName(t)
+	cfg := &Config{
+		Path:            tmpDir,
+		CommitterName:   "Schema Bot",
+		CommitterEmail:  "schema@example.com",
+		Database:        dbName,
+		CreateIfMissing: true,
+	}
+
+	store, err := New(ctx, cfg)
+	if err != nil {
+		t.Fatalf("failed to create store: %v", err)
+	}
+	defer store.Close()
+
+	var committer, email string
+	err = store.db.QueryRowContext(ctx, "SELECT committer, email FROM dolt_log ORDER BY date DESC LIMIT 1").Scan(&committer, &email)
+	if err != nil {
+		t.Fatalf("query dolt_log failed: %v", err)
+	}
+	if committer != "Schema Bot" {
+		t.Fatalf("committer = %q, want %q", committer, "Schema Bot")
+	}
+	if email != "schema@example.com" {
+		t.Fatalf("email = %q, want %q", email, "schema@example.com")
+	}
+
+	dropCtx, dropCancel := context.WithTimeout(context.Background(), 5*testTimeout)
+	defer dropCancel()
+	_, _ = store.db.ExecContext(dropCtx, fmt.Sprintf("DROP DATABASE IF EXISTS `%s`", dbName))
+}
