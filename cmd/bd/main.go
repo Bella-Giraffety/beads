@@ -526,9 +526,10 @@ var rootCmd = &cobra.Command{
 				WasSet bool
 			}{actor, true}
 		}
-		if !cmd.Root().PersistentFlags().Changed("dolt-auto-commit") && strings.TrimSpace(doltAutoCommit) == "" {
+		doltAutoCommitFlagSet := cmd.Root().PersistentFlags().Changed("dolt-auto-commit")
+		if !doltAutoCommitFlagSet && strings.TrimSpace(doltAutoCommit) == "" {
 			doltAutoCommit = config.GetString("dolt.auto-commit")
-		} else if cmd.Root().PersistentFlags().Changed("dolt-auto-commit") {
+		} else if doltAutoCommitFlagSet {
 			flagOverrides["dolt-auto-commit"] = struct {
 				Value  interface{}
 				WasSet bool
@@ -714,7 +715,6 @@ var rootCmd = &cobra.Command{
 		// and closes BEFORE the main store is opened. This ensures bd doctor and
 		// read-only commands see the correct version after a CLI upgrade.
 		beadsDir := resolveCommandBeadsDir(dbPath)
-
 		autoMigrateOnVersionBump(beadsDir)
 
 		// Initialize direct storage access
@@ -775,7 +775,7 @@ var rootCmd = &cobra.Command{
 		// Server mode defaults auto-commit to OFF because the server handles
 		// commits via its own transaction lifecycle; firing DOLT_COMMIT after
 		// every write under concurrent load causes 'database is read only' errors.
-		if strings.TrimSpace(doltAutoCommit) == "" {
+		if !doltAutoCommitFlagSet {
 			doltAutoCommit = string(doltAutoCommitOff)
 		}
 

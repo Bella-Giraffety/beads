@@ -155,6 +155,9 @@ func recordTipShown(store storage.DoltStorage, tipID string) {
 	if store == nil || tipID == "" {
 		return
 	}
+	if serverMode {
+		return
+	}
 
 	// If dolt auto-commit is enabled, defer the metadata write so it can be
 	// committed as a separate Dolt commit in PostRun.

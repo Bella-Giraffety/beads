@@ -1147,7 +1147,7 @@ func TestFinalizeSyncedBootstrapPreservesClonedMetadata(t *testing.T) {
 		Backend:        configfile.BackendDolt,
 	}
 
-	if err := finalizeSyncedBootstrap(beadsDir, "file:///tmp/fake-origin.git", cfg, "clone_db"); err != nil {
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/fake-origin.git", cfg, "clone_db"); err != nil {
 		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
 	}
 
