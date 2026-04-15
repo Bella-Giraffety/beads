@@ -13,27 +13,54 @@ func TestIgnoredTableDDL(t *testing.T) {
 
 	combined := strings.Join(ddl, "\n")
 
-	// Verify all expected tables are referenced.
 	for _, table := range []string{
-		"local_metadata", "repo_mtimes", "wisps",
-		"wisp_labels", "wisp_dependencies", "wisp_events", "wisp_comments",
+		"local_metadata",
+		"repo_mtimes",
+		"wisps",
+		"wisp_labels",
+		"wisp_dependencies",
+		"wisp_events",
+		"wisp_comments",
 	} {
 		if !strings.Contains(combined, table) {
 			t.Errorf("IgnoredTableDDL missing reference to table %q", table)
 		}
 	}
 
-	// Verify columns added by later migrations are present (the bug that
-	// motivated this refactor: started_at was missing from the Go constant).
 	for _, col := range []string{"started_at", "no_history"} {
 		if !strings.Contains(combined, col) {
-			t.Errorf("IgnoredTableDDL missing column %q — migration not included?", col)
+			t.Errorf("IgnoredTableDDL missing column %q", col)
 		}
 	}
 
-	// Verify the wisp_events created_at index is present.
+	if !strings.Contains(combined, "idx_repo_mtimes_checked") {
+		t.Error("IgnoredTableDDL missing idx_repo_mtimes_checked index")
+	}
 	if !strings.Contains(combined, "idx_wisp_events_created_at") {
 		t.Error("IgnoredTableDDL missing idx_wisp_events_created_at index")
+	}
+}
+
+func TestRequiredIgnoredTables(t *testing.T) {
+	for _, table := range []string{
+		"local_metadata",
+		"repo_mtimes",
+		"wisps",
+		"wisp_labels",
+		"wisp_dependencies",
+		"wisp_events",
+		"wisp_comments",
+	} {
+		found := false
+		for _, candidate := range requiredIgnoredTables {
+			if candidate == table {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("requiredIgnoredTables missing %q", table)
+		}
 	}
 }
 
