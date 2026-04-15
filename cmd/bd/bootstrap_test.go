@@ -1168,8 +1168,8 @@ func TestFinalizeSyncedBootstrapPreservesClonedMetadata(t *testing.T) {
 	if loaded.DoltServerHost != "10.0.0.9" {
 		t.Fatalf("dolt_server_host = %q, want %q", loaded.DoltServerHost, "10.0.0.9")
 	}
-	if loaded.DoltServerPort != 3312 {
-		t.Fatalf("dolt_server_port = %d, want %d", loaded.DoltServerPort, 3312)
+	if loaded.DoltServerPort != 0 {
+		t.Fatalf("dolt_server_port = %d, want %d", loaded.DoltServerPort, 0)
 	}
 	if loaded.DoltServerUser != "clone-user" {
 		t.Fatalf("dolt_server_user = %q, want %q", loaded.DoltServerUser, "clone-user")
@@ -1177,8 +1177,8 @@ func TestFinalizeSyncedBootstrapPreservesClonedMetadata(t *testing.T) {
 	if !loaded.DoltServerTLS {
 		t.Fatal("expected dolt_server_tls to be preserved")
 	}
-	if loaded.ProjectID != "proj-cloned-123" {
-		t.Fatalf("project_id = %q, want %q", loaded.ProjectID, "proj-cloned-123")
+	if loaded.ProjectID != "" {
+		t.Fatalf("project_id = %q, want empty until cloned DB can be reopened", loaded.ProjectID)
 	}
 }
 
