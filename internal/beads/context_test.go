@@ -160,6 +160,40 @@ func TestGetRepoContextForWorkspace_MissingBeadsDir(t *testing.T) {
 	}
 }
 
+func TestGetRepoContextForWorkspace_FindsNestedRigBeadsDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := initGitRepo(tmpDir); err != nil {
+		t.Fatalf("failed to init git repo: %v", err)
+	}
+
+	rigDir := filepath.Join(tmpDir, "rig")
+	beadsDir := filepath.Join(rigDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatalf("failed to create nested .beads dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "beads.db"), []byte{}, 0o644); err != nil {
+		t.Fatalf("failed to create beads.db: %v", err)
+	}
+
+	t.Cleanup(func() {
+		ResetCaches()
+		git.ResetCaches()
+	})
+
+	rc, err := GetRepoContextForWorkspace(rigDir)
+	if err != nil {
+		t.Fatalf("GetRepoContextForWorkspace failed: %v", err)
+	}
+
+	expectedBeadsDir := resolveSymlinks(beadsDir)
+	if rc.BeadsDir != expectedBeadsDir {
+		t.Errorf("BeadsDir mismatch: expected %s, got %s", expectedBeadsDir, rc.BeadsDir)
+	}
+	if rc.RepoRoot != resolveSymlinks(tmpDir) {
+		t.Errorf("RepoRoot mismatch: expected %s, got %s", resolveSymlinks(tmpDir), rc.RepoRoot)
+	}
+}
+
 // TestRepoContext_Validate tests the Validate method for detecting stale contexts
 func TestRepoContext_Validate(t *testing.T) {
 	tmpDir := t.TempDir()

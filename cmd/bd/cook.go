@@ -153,6 +153,9 @@ func parseCookFlags(cmd *cobra.Command, args []string) (*cookFlags, error) {
 // It first tries to load by name from the formula registry (.beads/formulas/),
 // and falls back to parsing as a file path if that fails.
 func loadAndResolveFormula(formulaPath string, searchPaths []string) (*formula.Formula, error) {
+	if len(searchPaths) == 0 {
+		searchPaths = getFormulaSearchPaths()
+	}
 	parser := formula.NewParser(searchPaths...)
 
 	// Try to load by name first (from .beads/formulas/ registry)
@@ -657,6 +660,9 @@ func resolveAndCookFormula(formulaName string, searchPaths []string) (*TemplateS
 // Pass nil for conditionVars to include all steps (condition filtering skipped).
 func resolveAndCookFormulaWithVars(formulaName string, searchPaths []string, conditionVars map[string]string) (*TemplateSubgraph, error) {
 	// Create parser with search paths
+	if len(searchPaths) == 0 {
+		searchPaths = getFormulaSearchPaths()
+	}
 	parser := formula.NewParser(searchPaths...)
 
 	// Load formula by name

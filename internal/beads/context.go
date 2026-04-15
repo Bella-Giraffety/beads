@@ -401,28 +401,31 @@ func buildRepoContextForWorkspace(workspacePath string) (*RepoContext, error) {
 		}
 	}
 
-	// 2. Find .beads directory in the appropriate location
-	beadsDir := filepath.Join(repoRoot, ".beads")
-
-	// Check if .beads exists
-	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
-		return nil, fmt.Errorf("no .beads directory found at %s", beadsDir)
+	// 2. Resolve the workspace's beads directory using the same worktree-aware
+	// search logic as commands, while ignoring BEADS_DIR because the workspace
+	// path was provided explicitly.
+	originalBeadsDirEnv, hadBeadsDirEnv := os.LookupEnv("BEADS_DIR")
+	if hadBeadsDirEnv {
+		_ = os.Unsetenv("BEADS_DIR")
+		defer func() { _ = os.Setenv("BEADS_DIR", originalBeadsDirEnv) }()
 	}
 
-	// 3. Follow redirect if present
-	beadsDir = FollowRedirect(beadsDir)
+	beadsDir := FindBeadsDir()
+	if beadsDir == "" {
+		return nil, fmt.Errorf("no .beads directory found for workspace %s", workspacePath)
+	}
 
-	// 4. Security: Validate path boundary (SEC-003)
+	// 3. Security: Validate path boundary (SEC-003)
 	if !isPathInSafeBoundary(beadsDir) {
 		return nil, fmt.Errorf("beads directory in unsafe location: %s", beadsDir)
 	}
 
-	// 5. Validate directory contains actual project files
+	// 4. Validate directory contains actual project files
 	if !hasBeadsProjectFiles(beadsDir) {
 		return nil, fmt.Errorf("beads directory missing required files: %s", beadsDir)
 	}
 
-	// 6. Get CWD's repo root (same as workspace in this case)
+	// 5. Get CWD's repo root (same as workspace in this case)
 	cwdRepoRoot := git.GetRepoRoot()
 
 	return &RepoContext{

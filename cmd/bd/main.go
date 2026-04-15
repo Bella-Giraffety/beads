@@ -24,6 +24,7 @@ import (
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/molecules"
 	"github.com/steveyegge/beads/internal/storage"
@@ -232,6 +233,36 @@ func selectedNoDBBeadsDir() string {
 		}
 	}
 	return beads.FindBeadsDir()
+}
+
+func currentCommandBeadsDir() string {
+	if db := getDBPath(); db != "" {
+		if beadsDir := resolveCommandBeadsDir(db); beadsDir != "" {
+			return beadsDir
+		}
+	}
+	if beadsDir := selectedNoDBBeadsDir(); beadsDir != "" {
+		return beadsDir
+	}
+	return beads.FindBeadsDir()
+}
+
+func currentCommandWorkspaceRoot() string {
+	if db := getDBPath(); db != "" {
+		if beadsDir := resolveCommandBeadsDir(db); beadsDir != "" {
+			return filepath.Dir(beadsDir)
+		}
+	}
+	if repoRoot := git.GetRepoRoot(); repoRoot != "" {
+		return repoRoot
+	}
+	if beadsDir := currentCommandBeadsDir(); beadsDir != "" {
+		return filepath.Dir(beadsDir)
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return "."
 }
 
 func isSelectedNoDBCommand(cmd *cobra.Command) bool {
@@ -836,8 +867,7 @@ var rootCmd = &cobra.Command{
 
 		// Initialize hook runner
 		// dbPath is .beads/something.db, so workspace root is parent of .beads
-		if dbPath != "" {
-			beadsDir := filepath.Dir(dbPath)
+		if beadsDir != "" {
 			hookRunner = hooks.NewRunner(filepath.Join(beadsDir, "hooks"))
 		}
 
@@ -856,8 +886,7 @@ var rootCmd = &cobra.Command{
 		// Load molecule templates from hierarchical catalog locations
 		// Templates are loaded after auto-import to ensure the database is up-to-date.
 		// Skip for import command to avoid conflicts during import operations.
-		if cmd.Name() != "import" && store != nil {
-			beadsDir := filepath.Dir(dbPath)
+		if cmd.Name() != "import" && store != nil && beadsDir != "" {
 			loader := molecules.NewLoader(store)
 			if result, err := loader.LoadAll(rootCtx, beadsDir); err != nil {
 				debug.Logf("warning: failed to load molecules: %v", err)

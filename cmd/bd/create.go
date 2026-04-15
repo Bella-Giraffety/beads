@@ -317,7 +317,8 @@ var createCmd = &cobra.Command{
 			repoPath = repoOverride
 		} else {
 			// Auto-routing based on user role
-			userRole, err := routing.DetectUserRole(".")
+			workspaceRoot := currentCommandWorkspaceRoot()
+			userRole, err := routing.DetectUserRole(workspaceRoot)
 			if err != nil {
 				debug.Logf("Warning: failed to detect user role: %v\n", err)
 			}
@@ -345,7 +346,7 @@ var createCmd = &cobra.Command{
 				ExplicitOverride: repoOverride,
 			}
 
-			repoPath = routing.DetermineTargetRepo(routingConfig, userRole, ".")
+			repoPath = routing.DetermineTargetRepo(routingConfig, userRole, workspaceRoot)
 		}
 
 		// Switch to target repo for multi-repo support (bd-6x6g)
@@ -368,7 +369,8 @@ var createCmd = &cobra.Command{
 					FatalError("failed to open remote store: %v", err)
 				}
 			} else {
-				targetBeadsDir := routing.ExpandPath(repoPath)
+				baseWorkspace := currentCommandWorkspaceRoot()
+				targetBeadsDir := routing.ExpandPathFrom(repoPath, baseWorkspace)
 				debug.Logf("DEBUG: Routing to target repo: %s\n", targetBeadsDir)
 
 				// Ensure target beads directory exists with prefix inheritance

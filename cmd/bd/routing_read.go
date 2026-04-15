@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
 	"github.com/steveyegge/beads/internal/routing"
@@ -39,7 +40,8 @@ func getRoutingConfigValue(ctx context.Context, store storage.DoltStorage, key s
 // determineAutoRoutedRepoPath returns the repository path that should be used for
 // issue reads when contributor auto-routing is enabled.
 func determineAutoRoutedRepoPath(ctx context.Context, store storage.DoltStorage) string {
-	userRole, err := routing.DetectUserRole(".")
+	workspaceRoot := currentCommandWorkspaceRoot()
+	userRole, err := routing.DetectUserRole(workspaceRoot)
 	if err != nil {
 		debug.Logf("Warning: failed to detect user role: %v\n", err)
 	}
@@ -66,7 +68,7 @@ func determineAutoRoutedRepoPath(ctx context.Context, store storage.DoltStorage)
 		ExplicitOverride: "",
 	}
 
-	return routing.DetermineTargetRepo(routingConfig, userRole, ".")
+	return routing.DetermineTargetRepo(routingConfig, userRole, workspaceRoot)
 }
 
 // openRoutedReadStore opens the auto-routed target store for read commands.
@@ -77,8 +79,9 @@ func openRoutedReadStore(ctx context.Context, store storage.DoltStorage) (storag
 		return nil, false, nil
 	}
 
-	targetRepoPath := routing.ExpandPath(repoPath)
-	targetBeadsDir := filepath.Join(targetRepoPath, ".beads")
+	baseWorkspace := currentCommandWorkspaceRoot()
+	targetRepoPath := routing.ExpandPathFrom(repoPath, baseWorkspace)
+	targetBeadsDir := beads.FollowRedirect(filepath.Join(targetRepoPath, ".beads"))
 	targetStore, err := newReadOnlyStoreFromConfig(ctx, targetBeadsDir)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to open routed store at %s: %w", targetRepoPath, err)

@@ -182,8 +182,8 @@ func runFormulaList(cmd *cobra.Command, args []string) {
 func runFormulaShow(cmd *cobra.Command, args []string) {
 	name := args[0]
 
-	// Create parser with default search paths
-	parser := formula.NewParser()
+	// Create parser with command-aware search paths
+	parser := formula.NewParser(getFormulaSearchPaths()...)
 
 	// Try to load the formula
 	f, err := parser.LoadByName(name)
@@ -349,7 +349,7 @@ func runFormulaShow(cmd *cobra.Command, args []string) {
 
 // getFormulaSearchPaths returns the formula search paths in priority order.
 func getFormulaSearchPaths() []string {
-	return formula.DefaultSearchPaths()
+	return formula.DefaultSearchPathsForBeadsDir(currentCommandBeadsDir())
 }
 
 // scanFormulaDir scans a directory for formula files (both TOML and JSON).
@@ -526,7 +526,7 @@ func runFormulaConvert(cmd *cobra.Command, args []string) {
 	}
 
 	// Parse the JSON file
-	parser := formula.NewParser()
+	parser := formula.NewParser(getFormulaSearchPaths()...)
 	f, err := parser.ParseFile(jsonPath)
 	if err != nil {
 		FatalError("parsing %s: %v", jsonPath, err)

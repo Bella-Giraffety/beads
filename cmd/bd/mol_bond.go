@@ -581,7 +581,7 @@ func resolveOrDescribe(ctx context.Context, s storage.DoltStorage, operand strin
 	}
 
 	// Try to load the formula (but don't cook it)
-	parser := formula.NewParser()
+	parser := formula.NewParser(getFormulaSearchPaths()...)
 	f, err := parser.LoadByName(operand)
 	if err != nil {
 		return nil, "", fmt.Errorf("'%s' not found as issue or formula: %w", operand, err)

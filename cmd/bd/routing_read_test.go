@@ -101,6 +101,67 @@ func TestOpenRoutedReadStore_ContributorRouting(t *testing.T) {
 	}
 }
 
+func TestOpenRoutedReadStore_ResolvesRelativeRepoFromWorkspaceRoot(t *testing.T) {
+	initConfigForTest(t)
+
+	tmpDir := t.TempDir()
+	repoDir := filepath.Join(tmpDir, "repo")
+	planningDir := filepath.Join(repoDir, "planning")
+	subdir := filepath.Join(repoDir, "nested", "cwd")
+
+	runCmd(t, tmpDir, "git", "init", repoDir)
+	runCmd(t, repoDir, "git", "config", "beads.role", "contributor")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+
+	sourceStore := newTestStoreIsolatedDB(t, filepath.Join(repoDir, ".beads", "beads.db"), "src")
+	ctx := context.Background()
+
+	if err := sourceStore.SetConfig(ctx, "routing.mode", "auto"); err != nil {
+		t.Fatalf("failed to set routing.mode: %v", err)
+	}
+	if err := sourceStore.SetConfig(ctx, "routing.contributor", "planning"); err != nil {
+		t.Fatalf("failed to set routing.contributor: %v", err)
+	}
+
+	targetStore := newTestStoreIsolatedDB(t, filepath.Join(planningDir, ".beads", "beads.db"), "plan")
+	if err := targetStore.Close(); err != nil {
+		t.Fatalf("failed to close planning store: %v", err)
+	}
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("os.Getwd failed: %v", err)
+	}
+	oldDBPath := dbPath
+	t.Cleanup(func() {
+		dbPath = oldDBPath
+		_ = os.Chdir(oldWD)
+	})
+	dbPath = filepath.Join(repoDir, ".beads", "beads.db")
+	if err := os.Chdir(subdir); err != nil {
+		t.Fatalf("chdir subdir: %v", err)
+	}
+
+	routedStore, routed, err := openRoutedReadStore(ctx, sourceStore)
+	if err != nil {
+		t.Fatalf("openRoutedReadStore() error = %v", err)
+	}
+	if !routed {
+		t.Fatal("openRoutedReadStore() routed = false, want true")
+	}
+	defer func() { _ = routedStore.Close() }()
+
+	prefix, err := routedStore.GetConfig(ctx, "issue_prefix")
+	if err != nil {
+		t.Fatalf("failed reading issue_prefix from routed store: %v", err)
+	}
+	if prefix != "plan" {
+		t.Fatalf("routed store prefix = %q, want %q", prefix, "plan")
+	}
+}
+
 func runCmd(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
 	cmd := exec.Command(name, args...)

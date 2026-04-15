@@ -56,12 +56,14 @@ func NewParser(searchPaths ...string) *Parser {
 }
 
 // DefaultSearchPaths returns the default formula search paths.
-//
-// The project-level path prefers the resolved beads directory so worktrees with
-// shared/main-repo .beads state search the same formula registry as the rest of
-// the command surface. If no beads project is resolved, fall back to cwd/.beads
-// so formula registries can still be used before a project is initialized.
 func DefaultSearchPaths() []string {
+	return DefaultSearchPathsForBeadsDir("")
+}
+
+// DefaultSearchPathsForBeadsDir returns the default formula search paths for a
+// specific resolved beads directory. If beadsDir is empty, it falls back to the
+// current project resolution and finally cwd/.beads for bootstrap use.
+func DefaultSearchPathsForBeadsDir(beadsDir string) []string {
 	var paths []string
 
 	addPath := func(path string) {
@@ -77,7 +79,10 @@ func DefaultSearchPaths() []string {
 	}
 
 	// Project-level formulas via resolved beads directory.
-	if beadsDir := beads.FindBeadsDir(); beadsDir != "" {
+	if beadsDir == "" {
+		beadsDir = beads.FindBeadsDir()
+	}
+	if beadsDir != "" {
 		addPath(filepath.Join(beadsDir, "formulas"))
 	} else if cwd, err := os.Getwd(); err == nil {
 		addPath(filepath.Join(cwd, ".beads", "formulas"))

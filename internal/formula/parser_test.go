@@ -220,6 +220,39 @@ func TestDefaultSearchPaths_FallsBackToCwdFormulaDirWithoutBeadsProject(t *testi
 	}
 }
 
+func TestDefaultSearchPathsForBeadsDir_UsesExplicitResolvedWorkspace(t *testing.T) {
+	resetFormulaSearchTestContext(t)
+
+	root := t.TempDir()
+	projectBeadsDir := filepath.Join(root, ".beads")
+	projectFormulaDir := filepath.Join(projectBeadsDir, "formulas")
+	writeFormulaFixture(t, projectFormulaDir, "workspace-formula", "explicit workspace")
+
+	other := t.TempDir()
+	t.Chdir(other)
+	resetFormulaSearchCaches()
+
+	paths := DefaultSearchPathsForBeadsDir(projectBeadsDir)
+	if len(paths) == 0 {
+		t.Fatal("DefaultSearchPathsForBeadsDir() returned no paths")
+	}
+
+	want := canonicalTestPath(projectFormulaDir)
+	got := canonicalTestPath(paths[0])
+	if got != want {
+		t.Fatalf("DefaultSearchPathsForBeadsDir()[0] = %q, want %q", got, want)
+	}
+
+	parser := NewParser(paths...)
+	f, err := parser.LoadByName("workspace-formula")
+	if err != nil {
+		t.Fatalf("LoadByName(workspace-formula) failed: %v", err)
+	}
+	if !strings.HasPrefix(f.Source, want) {
+		t.Fatalf("formula source = %q, want prefix %q", f.Source, want)
+	}
+}
+
 func TestValidate_ValidFormula(t *testing.T) {
 	formula := &Formula{
 		Formula: "mol-valid",
