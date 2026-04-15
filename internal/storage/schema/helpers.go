@@ -5,26 +5,23 @@ import (
 	"fmt"
 )
 
-// EnsureIgnoredTables checks whether the dolt_ignore'd wisp tables exist in
-// the current working set and creates them if missing. This is the fast path
-// called after branch creation, checkout, and on session init — it executes a
-// single SHOW TABLES query and returns immediately when the tables are present.
+// EnsureIgnoredTables checks whether the dolt_ignore'd tables exist in the
+// current working set and creates them if any are missing. This is the fast
+// path called after branch creation, checkout, and on session init.
 //
 // dolt_ignore entries are committed and persist across branches; only the
 // tables themselves (which live in the working set) need recreation.
 func EnsureIgnoredTables(ctx context.Context, db DBConn) error {
-	wispsOK, err := TableExists(ctx, db, "wisps")
-	if err != nil {
-		return fmt.Errorf("check wisps table: %w", err)
+	for _, table := range requiredIgnoredTables {
+		tableOK, err := TableExists(ctx, db, table)
+		if err != nil {
+			return fmt.Errorf("check %s table: %w", table, err)
+		}
+		if !tableOK {
+			return CreateIgnoredTables(ctx, db)
+		}
 	}
-	localOK, err := TableExists(ctx, db, "local_metadata")
-	if err != nil {
-		return fmt.Errorf("check local_metadata table: %w", err)
-	}
-	if wispsOK && localOK {
-		return nil
-	}
-	return CreateIgnoredTables(ctx, db)
+	return nil
 }
 
 // CreateIgnoredTables unconditionally creates all dolt_ignore'd tables
