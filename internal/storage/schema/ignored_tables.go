@@ -17,9 +17,8 @@ type ignoredMigration struct {
 }
 
 // ignoredMigrations lists the migrations that define or alter dolt-ignored
-// tables, in the order they must be applied. This replaces the former
-// hand-maintained Go constants — the .up.sql files are the single source
-// of truth.
+// tables, in the order they must be applied. The embedded .up.sql files are
+// the single source of truth for the recreated ignored-table schema.
 var ignoredMigrations = []ignoredMigration{
 	{version: 29},                  // CREATE TABLE local_metadata
 	{version: 11},                  // CREATE TABLE repo_mtimes
@@ -31,14 +30,33 @@ var ignoredMigrations = []ignoredMigration{
 	{version: 31},                  // CREATE INDEX idx_wisp_events_created_at
 }
 
+var requiredIgnoredTables = []string{
+	"local_metadata",
+	"repo_mtimes",
+	"wisps",
+	"wisp_labels",
+	"wisp_dependencies",
+	"wisp_events",
+	"wisp_comments",
+}
+
+// These exported statements preserve existing migration call sites while
+// keeping the embedded SQL migrations as the single schema source of truth.
+var (
+	WispsTableSchema       = mustFindMigrationStatement(20, "wisps")
+	WispLabelsSchema       = mustFindMigrationStatement(21, "wisp_labels")
+	WispDependenciesSchema = mustFindMigrationStatement(21, "wisp_dependencies")
+	WispEventsSchema       = mustFindMigrationStatement(21, "wisp_events")
+	WispCommentsSchema     = mustFindMigrationStatement(21, "wisp_comments")
+)
+
 var (
 	ignoredDDLOnce sync.Once
 	ignoredDDLVal  []string
 )
 
-// IgnoredTableDDL returns the ordered list of SQL statements needed to
-// recreate all dolt-ignored tables from scratch. Derived from embedded
-// migration files at first call and cached thereafter.
+// IgnoredTableDDL returns the ordered SQL needed to recreate every ignored
+// table from embedded migrations. The result is cached after first build.
 func IgnoredTableDDL() []string {
 	ignoredDDLOnce.Do(func() {
 		ignoredDDLVal = buildIgnoredTableDDL()
@@ -53,31 +71,41 @@ func buildIgnoredTableDDL() []string {
 		stmts := splitStatements(raw)
 		if im.filter != "" {
 			filterLower := strings.ToLower(im.filter)
-			for _, s := range stmts {
-				if strings.Contains(strings.ToLower(s), filterLower) {
-					result = append(result, s)
+			for _, stmt := range stmts {
+				if strings.Contains(strings.ToLower(stmt), filterLower) {
+					result = append(result, stmt)
 				}
 			}
-		} else {
-			result = append(result, stmts...)
+			continue
 		}
+		result = append(result, stmts...)
 	}
 	return result
 }
 
-// ReadMigrationSQL reads the embedded .up.sql file for the given version number
-// and returns its contents as a string. Panics if the migration is not found.
+func mustFindMigrationStatement(version int, contains string) string {
+	contains = strings.ToLower(contains)
+	for _, stmt := range splitStatements(ReadMigrationSQL(version)) {
+		if strings.Contains(strings.ToLower(stmt), contains) {
+			return stmt
+		}
+	}
+	panic(fmt.Sprintf("schema: migration %04d missing statement containing %q", version, contains))
+}
+
+// ReadMigrationSQL reads the embedded .up.sql file for the given version.
+// It panics if the migration is missing because this is a programmer error.
 func ReadMigrationSQL(version int) string {
 	entries, err := fs.ReadDir(upMigrations, "migrations")
 	if err != nil {
 		panic(fmt.Sprintf("schema: reading migrations dir: %v", err))
 	}
 	prefix := fmt.Sprintf("%04d_", version)
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), prefix) && strings.HasSuffix(e.Name(), ".up.sql") {
-			data, err := upMigrations.ReadFile("migrations/" + e.Name())
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), prefix) && strings.HasSuffix(entry.Name(), ".up.sql") {
+			data, err := upMigrations.ReadFile("migrations/" + entry.Name())
 			if err != nil {
-				panic(fmt.Sprintf("schema: reading migration %s: %v", e.Name(), err))
+				panic(fmt.Sprintf("schema: reading migration %s: %v", entry.Name(), err))
 			}
 			return string(data)
 		}
@@ -85,16 +113,15 @@ func ReadMigrationSQL(version int) string {
 	panic(fmt.Sprintf("schema: migration %04d not found", version))
 }
 
-// splitStatements splits SQL text on semicolons into individual statements,
-// stripping SQL comments and whitespace. Returns only non-empty statements.
+// splitStatements splits SQL text on semicolons into non-empty statements.
 func splitStatements(sql string) []string {
 	raw := strings.Split(sql, ";")
 	var out []string
-	for _, s := range raw {
-		s = stripSQLComments(s)
-		s = strings.TrimSpace(s)
-		if s != "" {
-			out = append(out, s)
+	for _, stmt := range raw {
+		stmt = stripSQLComments(stmt)
+		stmt = strings.TrimSpace(stmt)
+		if stmt != "" {
+			out = append(out, stmt)
 		}
 	}
 	return out
