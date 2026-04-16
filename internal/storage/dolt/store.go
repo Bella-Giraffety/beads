@@ -38,6 +38,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
@@ -819,6 +820,8 @@ func applyConfigDefaults(cfg *Config) {
 		// Check env var first — this is the highest-priority override and
 		// must be consulted even when no config file was loaded.
 		if d := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); d != "" {
+			cfg.Database = d
+		} else if d := doltdboverride.Current(); d != "" {
 			cfg.Database = d
 		} else if os.Getenv("BEADS_TEST_MODE") == "1" && cfg.Path != "" {
 			// Test mode: derive unique database name from path for isolation.
