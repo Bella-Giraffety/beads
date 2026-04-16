@@ -557,11 +557,16 @@ func isValidRemoteURL(rawURL string) bool {
 
 // findBeadsRepoRoot walks up from the given path to find the repo root (containing .beads)
 func findBeadsRepoRoot(startPath string) string {
+	boundary := gitRepoBoundary(startPath)
+	worktreeRoot := gitRepoTopLevel(startPath)
 	path := startPath
 	for {
 		beadsDir := filepath.Join(path, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			return path
+		}
+		if worktreeRoot != "" && path == worktreeRoot {
+			break
 		}
 		parent := filepath.Dir(path)
 		if parent == path {
@@ -571,12 +576,43 @@ func findBeadsRepoRoot(startPath string) string {
 	}
 
 	if isGitRepo() && git.IsWorktree() {
+		if boundary != "" {
+			beadsDir := filepath.Join(boundary, ".beads")
+			if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+				return boundary
+			}
+		}
 		if fallbackDir := beads.GetWorktreeFallbackBeadsDir(); fallbackDir != "" {
 			return filepath.Dir(fallbackDir)
 		}
 	}
 
 	return ""
+}
+
+func gitRepoBoundary(startPath string) string {
+	cmd := exec.Command("git", "-C", startPath, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	commonDir := filepath.Clean(strings.TrimSpace(string(output)))
+	if commonDir == "" {
+		return ""
+	}
+	if filepath.Base(commonDir) == ".git" {
+		return filepath.Dir(commonDir)
+	}
+	return filepath.Dir(commonDir)
+}
+
+func gitRepoTopLevel(startPath string) string {
+	cmd := exec.Command("git", "-C", startPath, "rev-parse", "--path-format=absolute", "--show-toplevel")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return filepath.Clean(strings.TrimSpace(string(output)))
 }
 
 // resolvedConfigRepoRoot returns the repository root for the active beads
