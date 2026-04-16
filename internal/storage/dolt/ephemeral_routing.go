@@ -58,11 +58,17 @@ func (s *DoltStore) isActiveWisp(ctx context.Context, id string) bool {
 // wispExists checks if an ID exists in the wisps table using a lightweight query.
 // Used as a fallback for ephemeral beads with explicit (non-wisp) IDs (GH#2053).
 func (s *DoltStore) wispExists(ctx context.Context, id string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var exists int
-	err := s.db.QueryRowContext(ctx, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1", id).Scan(&exists)
-	return err == nil
+	exists := false
+	_ = s.withIgnoredTableRepair(ctx, func() error {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+
+		var row int
+		err := s.db.QueryRowContext(ctx, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1", id).Scan(&row)
+		exists = err == nil
+		return err
+	})
+	return exists
 }
 
 // allEphemeral returns true if all IDs in the slice are ephemeral.
@@ -145,33 +151,42 @@ func (s *DoltStore) batchWispExists(ctx context.Context, ids []string) map[strin
 		return nil
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
 	result := make(map[string]bool)
-	for start := 0; start < len(ids); start += queryBatchSize {
-		end := start + queryBatchSize
-		if end > len(ids) {
-			end = len(ids)
-		}
-		batch := ids[start:end]
-		placeholders, args := doltBuildSQLInClause(batch)
+	if err := s.withIgnoredTableRepair(ctx, func() error {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-		//nolint:gosec // G201: placeholders contains only ? markers
-		rows, err := s.db.QueryContext(ctx,
-			fmt.Sprintf("SELECT id FROM wisps WHERE id IN (%s)", placeholders),
-			args...)
-		if err != nil {
-			return nil // On error, assume no wisps (safe fallback)
-		}
-
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err == nil {
-				result[id] = true
+		for start := 0; start < len(ids); start += queryBatchSize {
+			end := start + queryBatchSize
+			if end > len(ids) {
+				end = len(ids)
 			}
+			batch := ids[start:end]
+			placeholders, args := doltBuildSQLInClause(batch)
+
+			//nolint:gosec // G201: placeholders contains only ? markers
+			rows, err := s.db.QueryContext(ctx,
+				fmt.Sprintf("SELECT id FROM wisps WHERE id IN (%s)", placeholders),
+				args...)
+			if err != nil {
+				return err
+			}
+
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err == nil {
+					result[id] = true
+				}
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			_ = rows.Close()
 		}
-		_ = rows.Close()
+		return nil
+	}); err != nil {
+		return nil
 	}
 	return result
 }

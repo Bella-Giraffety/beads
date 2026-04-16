@@ -5,6 +5,16 @@ import (
 	"fmt"
 )
 
+var ignoredTables = []string{
+	"wisp_dependencies",
+	"wisp_events",
+	"wisp_comments",
+	"wisp_labels",
+	"wisps",
+	"repo_mtimes",
+	"local_metadata",
+}
+
 // EnsureIgnoredTables checks whether the dolt_ignore'd wisp tables exist in
 // the current working set and creates them if missing. This is the fast path
 // called after branch creation, checkout, and on session init — it executes a
@@ -44,6 +54,23 @@ func CreateIgnoredTables(ctx context.Context, db DBConn) error {
 				return fmt.Errorf("create ignored table: %w", err)
 			}
 		}
+	}
+	return nil
+}
+
+// RepairIgnoredTables drops and recreates all dolt_ignore'd tables.
+//
+// This is the safe repair path for ignored-table working-set corruption: these
+// tables do not participate in Dolt history, so rebuilding them repairs the
+// local/session state without touching committed issue history.
+func RepairIgnoredTables(ctx context.Context, db DBConn) error {
+	for _, table := range ignoredTables {
+		if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil { //nolint:gosec // G201: table names come from internal constants
+			return fmt.Errorf("drop ignored table %s: %w", table, err)
+		}
+	}
+	if err := CreateIgnoredTables(ctx, db); err != nil {
+		return fmt.Errorf("recreate ignored tables: %w", err)
 	}
 	return nil
 }
