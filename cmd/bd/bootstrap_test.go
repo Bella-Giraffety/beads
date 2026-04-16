@@ -1236,6 +1236,79 @@ func TestFinalizeSyncedBootstrapIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestLoadWorkspaceConfig_FallsBackToParentWorkspaceMetadata(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workspaceBeads := filepath.Join(workspaceRoot, ".beads")
+	if err := os.MkdirAll(workspaceBeads, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	parentCfg := &configfile.Config{
+		Database:       "dolt",
+		Backend:        configfile.BackendDolt,
+		DoltMode:       configfile.DoltModeServer,
+		DoltDatabase:   "my_rig",
+		DoltServerHost: "127.0.0.1",
+		ProjectID:      "workspace-project-id",
+	}
+	if err := parentCfg.Save(workspaceBeads); err != nil {
+		t.Fatalf("save parent metadata.json: %v", err)
+	}
+
+	rigBeads := filepath.Join(workspaceRoot, "rig", "nested", ".beads")
+	if err := os.MkdirAll(rigBeads, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadWorkspaceConfig(rigBeads)
+	if err != nil {
+		t.Fatalf("loadWorkspaceConfig: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("loadWorkspaceConfig returned nil")
+	}
+	if loaded.GetDoltDatabase() != "my_rig" {
+		t.Fatalf("GetDoltDatabase() = %q, want %q", loaded.GetDoltDatabase(), "my_rig")
+	}
+	if loaded.ProjectID != "workspace-project-id" {
+		t.Fatalf("ProjectID = %q, want %q", loaded.ProjectID, "workspace-project-id")
+	}
+}
+
+func TestFinalizeSyncedBootstrapSharedServerWritesGlobalDatabase(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/shared.git", configfile.DefaultConfig(), "beads_obsidian"); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("configfile.Load returned nil")
+	}
+	if loaded.GetDoltMode() != configfile.DoltModeServer {
+		t.Fatalf("dolt_mode = %q, want %q", loaded.GetDoltMode(), configfile.DoltModeServer)
+	}
+	if loaded.GetGlobalDoltDatabase() != "beads_global" {
+		t.Fatalf("GlobalDoltDatabase = %q, want %q", loaded.GetGlobalDoltDatabase(), "beads_global")
+	}
+}
+
 func TestFinalizeSyncedBootstrapClearsInheritedIdentityAndPort(t *testing.T) {
 	t.Setenv("BEADS_DOLT_DATA_DIR", "")
 	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
@@ -1268,5 +1341,45 @@ func TestFinalizeSyncedBootstrapClearsInheritedIdentityAndPort(t *testing.T) {
 	}
 	if loaded.DoltServerPort != 0 {
 		t.Errorf("DoltServerPort = %d, want 0 after clearing inherited explicit port", loaded.DoltServerPort)
+	}
+}
+
+func TestSyncProjectIDFromStoreUpdatesMetadata(t *testing.T) {
+	if testDoltServerPort == 0 {
+		t.Skip("Dolt test server not available")
+	}
+
+	ensureTestMode(t)
+
+	repoDir := t.TempDir()
+	dbPath := filepath.Join(repoDir, ".beads", "dolt")
+	store := newTestStoreWithPrefix(t, dbPath, "sync")
+
+	ctx := context.Background()
+	const dbProjectID = "project-id-from-db"
+	if err := store.SetMetadata(ctx, "_project_id", dbProjectID); err != nil {
+		t.Fatalf("SetMetadata(_project_id): %v", err)
+	}
+
+	beadsDir := filepath.Dir(dbPath)
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load before sync: %v", err)
+	}
+	cfg.ProjectID = "stale-project-id"
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("save stale metadata.json: %v", err)
+	}
+
+	if err := syncProjectIDFromStore(ctx, beadsDir, store); err != nil {
+		t.Fatalf("syncProjectIDFromStore: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load after sync: %v", err)
+	}
+	if loaded.ProjectID != dbProjectID {
+		t.Fatalf("ProjectID = %q, want %q", loaded.ProjectID, dbProjectID)
 	}
 }
