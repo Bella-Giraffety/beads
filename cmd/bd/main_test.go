@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
@@ -266,5 +268,70 @@ func TestListUsesRepoBeadsDirWhenDoltDataDirEscapesDotBeads(t *testing.T) {
 	}
 	if !strings.Contains(string(output), "Port-proof issue") {
 		t.Fatalf("expected list output to include created issue\n%s", output)
+	}
+}
+
+func TestInstallRedirectSourceDatabaseOverrideDoesNotLeakAcrossCommands(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DIR", "")
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BD_DB", "")
+
+	tmpDir := t.TempDir()
+	repoA := filepath.Join(tmpDir, "repo-a")
+	repoB := filepath.Join(tmpDir, "repo-b")
+	sharedDir := filepath.Join(tmpDir, "shared")
+	initGitRepo(t, repoA)
+	beadsDirB := writeServerRepo(t, repoB, "repo_b_db", "10.0.0.2", "origin-b", 3312)
+	_ = writeServerRepo(t, sharedDir, "shared_db", "10.0.0.9", "origin-shared", 3399)
+
+	if err := os.RemoveAll(filepath.Join(beadsDirB, "dolt")); err != nil {
+		t.Fatalf("remove source dolt dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDirB, "redirect"), []byte(filepath.Join("..", "shared", ".beads")+"\n"), 0o644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+	if err := (&configfile.Config{
+		Backend:        configfile.BackendDolt,
+		DoltMode:       configfile.DoltModeServer,
+		DoltServerHost: "10.0.0.2",
+		DoltDatabase:   "repo_b_db",
+	}).Save(beadsDirB); err != nil {
+		t.Fatalf("save source metadata: %v", err)
+	}
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	defer func() { _ = os.Chdir(oldWD) }()
+	if err := os.Chdir(repoA); err != nil {
+		t.Fatalf("chdir repoA: %v", err)
+	}
+
+	cmd := &cobra.Command{Use: "context"}
+	t.Setenv("BEADS_DB", filepath.Join(beadsDirB, "dolt"))
+	installRedirectSourceDatabaseOverride(cmd)
+	defer func() {
+		if clearRedirectSourceDatabaseOverride != nil {
+			clearRedirectSourceDatabaseOverride()
+			clearRedirectSourceDatabaseOverride = nil
+		}
+	}()
+
+	if got := (&configfile.Config{DoltDatabase: "shared_db"}).GetDoltDatabase(); got != "repo_b_db" {
+		t.Fatalf("GetDoltDatabase() with scoped override = %q, want repo_b_db", got)
+	}
+	if got := doltdboverride.Current(); got != "repo_b_db" {
+		t.Fatalf("Current() = %q, want repo_b_db", got)
+	}
+
+	clearRedirectSourceDatabaseOverride()
+	clearRedirectSourceDatabaseOverride = nil
+	if got := (&configfile.Config{DoltDatabase: "shared_db"}).GetDoltDatabase(); got != "shared_db" {
+		t.Fatalf("GetDoltDatabase() after cleanup = %q, want shared_db", got)
+	}
+	if got := doltdboverride.Current(); got != "" {
+		t.Fatalf("Current() after cleanup = %q, want empty", got)
 	}
 }
