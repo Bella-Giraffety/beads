@@ -1098,6 +1098,13 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		autoStartedServerDir: autoStartedDir,
 	}
 
+	// Ensure dolt_ignore'd tables exist before queries or migrations touch
+	// wisp/local metadata state. Fresh clones and new branch working sets can be
+	// missing these tables, and the first command is often read-only.
+	if err := versioncontrolops.EnsureIgnoredTables(ctx, db); err != nil {
+		return nil, fmt.Errorf("failed to ensure ignored tables: %w", err)
+	}
+
 	// Schema initialization for server mode (idempotent).
 	// Short retry for Dolt "no root value found in session" race: after
 	// CREATE DATABASE, information_schema queries may fail transiently

@@ -51,6 +51,29 @@ type SourceDatabaseInfo struct {
 	SourceDatabase string
 }
 
+// PreserveRedirectSourceDatabase restores the source workspace's dolt_database
+// into BEADS_DOLT_SERVER_DATABASE when a redirected .beads directory points at a
+// shared target with different metadata. This keeps startup/store-open paths on
+// the source workspace's database instead of silently drifting to the target's.
+func PreserveRedirectSourceDatabase(beadsDir string) {
+	if beadsDir == "" || os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" {
+		return
+	}
+
+	info := ResolveRedirect(beadsDir)
+	if info.WasRedirected && info.SourceDatabase != "" {
+		_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", info.SourceDatabase)
+	}
+}
+
+// LoadRedirectAwareConfig preserves any redirected source database identity
+// before loading metadata.json. Callers that open stores during startup should
+// use this instead of configfile.Load directly.
+func LoadRedirectAwareConfig(beadsDir string) (*configfile.Config, error) {
+	PreserveRedirectSourceDatabase(beadsDir)
+	return configfile.Load(beadsDir)
+}
+
 // ResolveRedirect follows a .beads/redirect file and captures the source directory's
 // dolt_database from metadata.json BEFORE following the redirect. This preserves
 // the source database identity across redirects.
