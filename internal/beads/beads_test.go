@@ -2169,6 +2169,48 @@ func TestResolveRedirect_SourceDatabaseAvailableForRouting(t *testing.T) {
 	}
 }
 
+func TestLoadRedirectAwareConfig_PreservesSourceDatabase(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+
+	sourceDir := filepath.Join(tmpDir, "rig", ".beads")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, sourceDir, &configfile.Config{
+		Database:     "beads.db",
+		DoltMode:     "server",
+		DoltDatabase: "rig_db",
+	})
+
+	targetDir := filepath.Join(tmpDir, "shared", ".beads")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, targetDir, &configfile.Config{
+		Database:     "beads.db",
+		DoltMode:     "server",
+		DoltDatabase: "shared_db",
+	})
+
+	if err := os.WriteFile(filepath.Join(sourceDir, "redirect"), []byte(targetDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadRedirectAwareConfig(sourceDir)
+	if err != nil {
+		t.Fatalf("LoadRedirectAwareConfig() error = %v", err)
+	}
+	if got := cfg.GetDoltDatabase(); got != "rig_db" {
+		t.Fatalf("GetDoltDatabase() = %q, want %q", got, "rig_db")
+	}
+	if got := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); got != "rig_db" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want %q", got, "rig_db")
+	}
+}
+
 func TestFindBeadsDir_BareParentWorktreeFallback(t *testing.T) {
 	originalEnvDir := os.Getenv("BEADS_DIR")
 	originalEnvDB := os.Getenv("BEADS_DB")
