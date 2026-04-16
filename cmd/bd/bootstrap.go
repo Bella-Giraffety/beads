@@ -580,6 +580,10 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 	}
 	defer func() { _ = warmupStore.Close() }()
 
+	if err := syncProjectIDToBeadsDir(ctx, plan.BeadsDir, warmupStore); err != nil {
+		return err
+	}
+
 	return nil
 }
 

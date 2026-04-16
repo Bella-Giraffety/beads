@@ -1301,7 +1301,6 @@ func TestFinalizeSyncedBootstrapClearsInheritedIdentityAndPort(t *testing.T) {
 		t.Errorf("DoltServerPort = %d, want 0 after clearing inherited explicit port", loaded.DoltServerPort)
 	}
 }
-
 func TestLoadWorkspaceConfig_DoesNotFallBackToParentWorkspaceMetadata(t *testing.T) {
 	workspaceRoot := t.TempDir()
 	workspaceBeads := filepath.Join(workspaceRoot, ".beads")
