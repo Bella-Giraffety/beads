@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
@@ -634,6 +635,13 @@ func loadWorkspaceConfig(beadsDir string) (*configfile.Config, error) {
 		return parent, nil
 	}
 	return nil, nil
+}
+
+// syncProjectIDFromStore is kept as a thin compatibility wrapper for tests and
+// older bootstrap code paths that update metadata.json from an already-open
+// store after clone/restore operations.
+func syncProjectIDFromStore(ctx context.Context, beadsDir string, s storage.DoltStorage) error {
+	return syncProjectIDToBeadsDir(ctx, beadsDir, s)
 }
 
 // cloneFromRemote clones a Dolt database from a remote URL.
