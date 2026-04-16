@@ -438,99 +438,13 @@ func (s *DoltStore) getChildrenWithParents(ctx context.Context, parentIDs []stri
 
 // GetMoleculeProgress returns progress stats for a molecule
 func (s *DoltStore) GetMoleculeProgress(ctx context.Context, moleculeID string) (*types.MoleculeProgressStats, error) {
-	stats := &types.MoleculeProgressStats{
-		MoleculeID: moleculeID,
-	}
-
-	// Route to correct table based on whether molecule is a wisp (bd-w2w)
-	issueTable := "issues"
-	depTable := "dependencies"
-	if s.isActiveWisp(ctx, moleculeID) {
-		issueTable = "wisps"
-		depTable = "wisp_dependencies"
-	}
-
-	// Get molecule title
-	var title sql.NullString
-	//nolint:gosec // G201: issueTable is hardcoded to "issues" or "wisps"
-	err := s.db.QueryRowContext(ctx, fmt.Sprintf("SELECT title FROM %s WHERE id = ?", issueTable), moleculeID).Scan(&title)
-	if err == nil && title.Valid {
-		stats.MoleculeTitle = title.String
-	}
-
-	// Use separate single-table queries to avoid Dolt's joinIter panic
-	// (join_iters.go:192) which triggers on JOIN between issues and dependencies.
-
-	// Step 1: Get child issue IDs from dependencies table (single-table scan)
-	//nolint:gosec // G201: depTable is hardcoded to "dependencies" or "wisp_dependencies"
-	depRows, err := s.queryContext(ctx, fmt.Sprintf(`
-		SELECT issue_id FROM %s
-		WHERE depends_on_id = ? AND type = 'parent-child'
-	`, depTable), moleculeID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get molecule children: %w", err)
-	}
-	var childIDs []string
-	for depRows.Next() {
-		var id string
-		if err := depRows.Scan(&id); err != nil {
-			_ = depRows.Close() // Best effort cleanup on error path
-			return nil, wrapScanError("get molecule progress: scan child", err)
-		}
-		childIDs = append(childIDs, id)
-	}
-	_ = depRows.Close() // Redundant close for safety (rows already iterated)
-
-	// Step 2: Batch-fetch status for all children (batched IN clauses to avoid full table scans).
-	// Children of a wisp molecule are also wisps, so use the same table.
-	if len(childIDs) > 0 {
-		type childInfo struct {
-			status string
-		}
-		childMap := make(map[string]childInfo)
-		for start := 0; start < len(childIDs); start += queryBatchSize {
-			end := start + queryBatchSize
-			if end > len(childIDs) {
-				end = len(childIDs)
-			}
-			batch := childIDs[start:end]
-			placeholders, args := doltBuildSQLInClause(batch)
-			// nolint:gosec // G201: issueTable is hardcoded, placeholders contains only ? markers
-			query := fmt.Sprintf("SELECT id, status FROM %s WHERE id IN (%s)", issueTable, placeholders)
-			statusRows, err := s.queryContext(ctx, query, args...)
-			if err != nil {
-				return nil, fmt.Errorf("failed to batch-fetch child statuses: %w", err)
-			}
-			for statusRows.Next() {
-				var id, status string
-				if err := statusRows.Scan(&id, &status); err != nil {
-					_ = statusRows.Close()
-					return nil, wrapScanError("get molecule progress: scan status", err)
-				}
-				childMap[id] = childInfo{status: status}
-			}
-			_ = statusRows.Close()
-		}
-
-		for _, childID := range childIDs {
-			info, ok := childMap[childID]
-			if !ok {
-				continue
-			}
-			stats.Total++
-			switch types.Status(info.status) {
-			case types.StatusClosed:
-				stats.Completed++
-			case types.StatusInProgress:
-				stats.InProgress++
-				if stats.CurrentStepID == "" {
-					stats.CurrentStepID = childID
-				}
-			}
-		}
-	}
-
-	return stats, nil
+	var result *types.MoleculeProgressStats
+	err := s.withReadTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		result, err = issueops.GetMoleculeProgressInTx(ctx, tx, moleculeID)
+		return err
+	})
+	return result, err
 }
 
 // GetMoleculeLastActivity returns the most recent activity timestamp for a molecule.

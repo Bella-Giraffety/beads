@@ -175,6 +175,8 @@ type DoltStore struct {
 	blockedIDsCached             bool // true once blockedIDsCache has been populated
 	blockedIDsCacheIncludesWisps bool // true if cache was computed with wisps
 	cacheMu                      sync.Mutex
+	ignoredTableRepairMu         sync.Mutex
+	ignoredTableRepairHook       func() error // test hook for simulating ignored-table corruption
 
 	// OTel span attribute cache (avoids per-call allocation)
 	spanAttrsOnce  sync.Once
@@ -589,14 +591,16 @@ func (s *DoltStore) withReadTx(ctx context.Context, fn func(tx *sql.Tx) error) e
 	if s.closed.Load() {
 		return ErrStoreClosed
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin read tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	return fn(tx)
+	return s.withIgnoredTableRepair(ctx, func() error {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin read tx: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		return fn(tx)
+	})
 }
 
 // withRetryTx wraps withWriteTx with retry logic for serialization failures
@@ -637,15 +641,17 @@ func (s *DoltStore) withWriteTx(ctx context.Context, fn func(tx *sql.Tx) error) 
 	if s.closed.Load() {
 		return ErrStoreClosed
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin write tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := fn(tx); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.withIgnoredTableRepair(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin write tx: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 // uncommitted implicit transaction that Dolt rolls back on connection close,
@@ -776,15 +782,17 @@ func (s *DoltStore) queryContext(ctx context.Context, query string, args ...any)
 		)...),
 	)
 	var rows *sql.Rows
-	err := s.withRetry(ctx, func() error {
-		// Close any Rows from a previous failed attempt to avoid leaking connections.
-		if rows != nil {
-			_ = rows.Close()
-			rows = nil
-		}
-		var queryErr error
-		rows, queryErr = s.db.QueryContext(ctx, query, args...)
-		return queryErr
+	err := s.withIgnoredTableRepair(ctx, func() error {
+		return s.withRetry(ctx, func() error {
+			// Close any Rows from a previous failed attempt to avoid leaking connections.
+			if rows != nil {
+				_ = rows.Close()
+				rows = nil
+			}
+			var queryErr error
+			rows, queryErr = s.db.QueryContext(ctx, query, args...)
+			return queryErr
+		})
 	})
 	finalErr := wrapLockError(err)
 	endSpan(span, finalErr)
@@ -804,9 +812,11 @@ func (s *DoltStore) queryRowContext(ctx context.Context, scan func(*sql.Row) err
 			attribute.String("db.statement", spanSQL(query)),
 		)...),
 	)
-	finalErr := wrapLockError(s.withRetry(ctx, func() error {
-		row := s.db.QueryRowContext(ctx, query, args...)
-		return scan(row)
+	finalErr := wrapLockError(s.withIgnoredTableRepair(ctx, func() error {
+		return s.withRetry(ctx, func() error {
+			row := s.db.QueryRowContext(ctx, query, args...)
+			return scan(row)
+		})
 	}))
 	endSpan(span, finalErr)
 	return finalErr
