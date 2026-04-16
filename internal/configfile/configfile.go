@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/steveyegge/beads/internal/doltdboverride"
 )
 
 const ConfigFileName = "metadata.json"
@@ -309,6 +311,9 @@ func (c *Config) GetDoltServerUser() string {
 // Checks BEADS_DOLT_SERVER_DATABASE env var first, then config, then default.
 func (c *Config) GetDoltDatabase() string {
 	if d := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); d != "" {
+		return d
+	}
+	if d := doltdboverride.Current(); d != "" {
 		return d
 	}
 	if c.DoltDatabase != "" {

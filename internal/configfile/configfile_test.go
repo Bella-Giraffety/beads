@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/doltdboverride"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -543,6 +545,19 @@ func TestEnvVarOverrides(t *testing.T) {
 			t.Errorf("GetDoltDatabase() = %q, want mydb", got)
 		}
 	})
+
+}
+
+func TestGetDoltDatabase_ScopedOverrideIsAppliedAndRestored(t *testing.T) {
+	cfg := &Config{DoltDatabase: "mydb"}
+	restore := doltdboverride.Push("redirected_db")
+	if got := cfg.GetDoltDatabase(); got != "redirected_db" {
+		t.Errorf("GetDoltDatabase() with scoped override = %q, want redirected_db", got)
+	}
+	restore()
+	if got := cfg.GetDoltDatabase(); got != "mydb" {
+		t.Errorf("GetDoltDatabase() after restore = %q, want mydb", got)
+	}
 }
 
 // --- Upgrade regression tests (GH#2949) ---

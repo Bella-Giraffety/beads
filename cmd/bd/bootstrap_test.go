@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 )
 
 type stubBootstrapMetadataStore struct {
@@ -276,6 +277,36 @@ func TestDetectBootstrapAction_ServerModeMissingConfiguredDBDoesNotReturnNone(t 
 	}
 	if plan.Action != "init" {
 		t.Fatalf("expected init fallback when no remote/backup/jsonl exists, got %q", plan.Action)
+	}
+}
+
+func TestDetectBootstrapAction_UsesScopedSourceDatabaseOverride(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	sharedDir := filepath.Join(tmpDir, "shared-dolt")
+	if err := os.MkdirAll(filepath.Join(sharedDir, "shared_db"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedDir, "dolt-server.port"), []byte("3312"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := configfile.DefaultConfig()
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltDatabase = "shared_db"
+	cfg.DoltDataDir = sharedDir
+
+	restore := doltdboverride.Push("source_db")
+	defer restore()
+
+	plan := detectBootstrapAction(beadsDir, cfg)
+	if plan.Database != "source_db" {
+		t.Fatalf("plan.Database = %q, want %q", plan.Database, "source_db")
 	}
 }
 

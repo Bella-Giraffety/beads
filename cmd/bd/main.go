@@ -23,6 +23,7 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/molecules"
@@ -200,23 +201,49 @@ func loadServerModeFromConfig() {
 	}
 }
 
-func preserveRedirectSourceDatabase(beadsDir string) {
+var clearRedirectSourceDatabaseOverride func()
+
+func redirectSourceDatabaseOverride(beadsDir string) string {
 	if beadsDir == "" || os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" {
-		return
+		return ""
 	}
 
 	rInfo := beads.ResolveRedirect(beadsDir)
-	if rInfo.WasRedirected && rInfo.SourceDatabase != "" {
-		_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", rInfo.SourceDatabase)
+	if !rInfo.WasRedirected || rInfo.SourceDatabase == "" {
+		return ""
+	}
+	return rInfo.SourceDatabase
+}
+
+func installRedirectSourceDatabaseOverride(cmd *cobra.Command) {
+	if clearRedirectSourceDatabaseOverride != nil {
+		clearRedirectSourceDatabaseOverride()
+		clearRedirectSourceDatabaseOverride = nil
+	}
+
+	if database := redirectSourceDatabaseOverride(beads.GetRedirectInfo().LocalDir); database != "" {
+		clearRedirectSourceDatabaseOverride = doltdboverride.Push(database)
 		if os.Getenv("BD_DEBUG_ROUTING") != "" {
-			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", rInfo.SourceDatabase)
+			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", database)
+		}
+		return
+	}
+
+	if cmd == nil || !isSelectedNoDBCommand(cmd) {
+		return
+	}
+
+	if database := redirectSourceDatabaseOverride(selectedNoDBBeadsDirFor(cmd)); database != "" {
+		clearRedirectSourceDatabaseOverride = doltdboverride.Push(database)
+		if os.Getenv("BD_DEBUG_ROUTING") != "" {
+			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", database)
 		}
 	}
 }
 
-func selectedNoDBBeadsDir() string {
+func selectedNoDBBeadsDirFor(cmd *cobra.Command) string {
 	selectedDBPath := ""
-	if rootCmd.PersistentFlags().Changed("db") && dbPath != "" {
+	if cmd != nil && cmd.Root() != nil && cmd.Root().PersistentFlags().Changed("db") && dbPath != "" {
 		selectedDBPath = dbPath
 	} else if envDB := os.Getenv("BEADS_DB"); envDB != "" {
 		selectedDBPath = envDB
@@ -231,6 +258,10 @@ func selectedNoDBBeadsDir() string {
 		}
 	}
 	return beads.FindBeadsDir()
+}
+
+func selectedNoDBBeadsDir() string {
+	return selectedNoDBBeadsDirFor(rootCmd)
 }
 
 func isSelectedNoDBCommand(cmd *cobra.Command) bool {
@@ -293,7 +324,6 @@ func prepareSelectedNoDBContext(beadsDir string) {
 	}
 	_ = os.Setenv("BEADS_DIR", beadsDir)
 	loadBeadsEnvFile(beadsDir)
-	preserveRedirectSourceDatabase(beadsDir)
 	if err := config.Initialize(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to reinitialize config for selected beads dir: %v\n", err)
 	}
@@ -437,6 +467,8 @@ var rootCmd = &cobra.Command{
 		_ = cmd.Help() // Help() always returns nil for cobra commands
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		installRedirectSourceDatabaseOverride(cmd)
+
 		// Initialize CommandContext to hold runtime state (replaces scattered globals)
 		initCommandContext()
 
@@ -649,12 +681,6 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		// Capture redirect info BEFORE FindDatabasePath() follows the redirect.
-		// When .beads/redirect points to a shared directory with a different
-		// dolt_database, the source's database name would be lost. Capture it
-		// early and set BEADS_DOLT_SERVER_DATABASE so all store opens use it.
-		preserveRedirectSourceDatabase(beads.GetRedirectInfo().LocalDir)
-
 		// Initialize database path
 		if dbPath == "" {
 			// Use public API to find database (same logic as extensions)
@@ -860,6 +886,11 @@ var rootCmd = &cobra.Command{
 		// after successful command execution, not in PreRun
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
+		if clearRedirectSourceDatabaseOverride != nil {
+			clearRedirectSourceDatabaseOverride()
+			clearRedirectSourceDatabaseOverride = nil
+		}
+
 		// Dolt auto-commit: after a successful write command (and after final flush),
 		// create a Dolt commit so changes don't remain only in the working set.
 		if commandDidWrite.Load() && !commandDidExplicitDoltCommit {
