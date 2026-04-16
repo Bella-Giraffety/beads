@@ -16,6 +16,7 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
@@ -172,9 +173,9 @@ Examples:
 		// workspace-level metadata.json that contains the correct database
 		// name (e.g. dolt_database). Without this, server-mode rigs get the
 		// default name "beads" instead of their configured name. (GH#3029)
-		cfg, err := configfile.Load(beadsDir)
-		if err != nil || cfg == nil {
-			cfg = findParentConfig(beadsDir)
+		cfg, err := loadWorkspaceConfig(beadsDir)
+		if err != nil {
+			FatalError("failed to load metadata.json: %v", err)
 		}
 		if cfg == nil {
 			cfg = configfile.DefaultConfig()
@@ -567,7 +568,11 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 		fmt.Fprintf(os.Stderr, "Warning: post-clone store init failed (wisp tables may be missing): %v\n", err)
 		return nil
 	}
-	_ = warmupStore.Close()
+	defer func() { _ = warmupStore.Close() }()
+
+	if err := syncProjectIDFromStore(ctx, plan.BeadsDir, warmupStore); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -592,6 +597,9 @@ func finalizeSyncedBootstrap(ctx context.Context, beadsDir, syncRemote string, c
 		cfg.DoltMode = configfile.DoltModeEmbedded
 	} else {
 		cfg.DoltMode = configfile.DoltModeServer
+	}
+	if doltserver.IsSharedServerMode() {
+		cfg.GlobalDoltDatabase = doltserver.GlobalDatabaseName
 	}
 	// Mirror init's convention: metadata.json database points at the Dolt
 	// directory rather than the legacy "beads.db" placeholder.
@@ -634,6 +642,46 @@ func finalizeSyncedBootstrap(ctx context.Context, beadsDir, syncRemote string, c
 	}
 
 	return nil
+}
+
+func syncProjectIDFromStore(ctx context.Context, beadsDir string, s storage.DoltStorage) error {
+	if s == nil {
+		return nil
+	}
+
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		return fmt.Errorf("load metadata.json: %w", err)
+	}
+	if cfg == nil {
+		return nil
+	}
+
+	dbID, err := s.GetMetadata(ctx, "_project_id")
+	if err != nil || dbID == "" || cfg.ProjectID == dbID {
+		return nil
+	}
+
+	cfg.ProjectID = dbID
+	if err := cfg.Save(beadsDir); err != nil {
+		return fmt.Errorf("sync project_id to metadata.json: %w", err)
+	}
+	return nil
+}
+
+// loadWorkspaceConfig reads the local metadata.json when present, and falls back
+// to the parent workspace's committed metadata only when the local file is absent.
+// This keeps rig/bootstrap paths on the authoritative database name without
+// silently ignoring malformed local metadata.
+func loadWorkspaceConfig(beadsDir string) (*configfile.Config, error) {
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg != nil {
+		return cfg, err
+	}
+	if parent := findParentConfig(beadsDir); parent != nil {
+		return parent, nil
+	}
+	return nil, nil
 }
 
 // cloneFromRemote clones a Dolt database from a remote URL.

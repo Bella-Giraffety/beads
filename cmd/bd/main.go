@@ -185,7 +185,7 @@ func loadServerModeFromConfig() {
 	if beadsDir == "" {
 		return
 	}
-	cfg, err := configfile.Load(beadsDir)
+	cfg, err := loadWorkspaceConfig(beadsDir)
 	if err != nil || cfg == nil {
 		return
 	}
@@ -733,9 +733,9 @@ var rootCmd = &cobra.Command{
 		}
 
 		// Load config to get database name and server connection settings
-		cfg, cfgErr := configfile.Load(beadsDir)
+		cfg, cfgErr := loadWorkspaceConfig(beadsDir)
 		if cfgErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to load beads config from %s: %v\n", beadsDir, cfgErr)
+			FatalError("failed to load beads config from %s: %v", beadsDir, cfgErr)
 		}
 		if cfg != nil {
 			doltCfg.ServerMode = cfg.IsDoltServerMode()
