@@ -2,8 +2,10 @@ package dolt
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -36,6 +38,47 @@ func ApplyCLIAutoStart(beadsDir string, cfg *Config) {
 	cfg.AutoStart = resolveAutoStart(true, autoStartCfg, ServerModeOwned)
 }
 
+func preserveRedirectSourceDatabase(beadsDir string) {
+	if beadsDir == "" || os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" {
+		return
+	}
+
+	var raw struct {
+		DoltDatabase string `json:"dolt_database"`
+	}
+	//nolint:gosec // G304: beadsDir is an internal workspace path, not untrusted input.
+	if data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json")); err == nil {
+		_ = json.Unmarshal(data, &raw)
+	}
+	if raw.DoltDatabase == "" {
+		return
+	}
+
+	//nolint:gosec // G304: beadsDir is an internal workspace path, not untrusted input.
+	data, err := os.ReadFile(filepath.Join(beadsDir, "redirect"))
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if !filepath.IsAbs(line) {
+			line = filepath.Join(filepath.Dir(beadsDir), line)
+		}
+		if info, statErr := os.Stat(line); statErr == nil && info.IsDir() {
+			_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", raw.DoltDatabase)
+		}
+		return
+	}
+}
+
+func loadRedirectAwareConfig(beadsDir string) (*configfile.Config, error) {
+	preserveRedirectSourceDatabase(beadsDir)
+	return configfile.Load(beadsDir)
+}
+
 // NewFromConfig creates a DoltStore based on the metadata.json configuration.
 // beadsDir is the path to the .beads directory.
 func NewFromConfig(ctx context.Context, beadsDir string) (*DoltStore, error) {
@@ -48,7 +91,7 @@ func NewFromConfig(ctx context.Context, beadsDir string) (*DoltStore, error) {
 // like `bd doctor` that should behave the same way as normal top-level CLI
 // commands on cold repo-local standalone setups.
 func NewFromConfigWithCLIOptions(ctx context.Context, beadsDir string, cfg *Config) (*DoltStore, error) {
-	fileCfg, err := configfile.Load(beadsDir)
+	fileCfg, err := loadRedirectAwareConfig(beadsDir)
 	if err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
 	}
@@ -68,7 +111,7 @@ func NewFromConfigWithCLIOptions(ctx context.Context, beadsDir string, cfg *Conf
 // NewFromConfigWithOptions creates a DoltStore with options from metadata.json.
 // Options in cfg override those from the config file. Pass nil for default options.
 func NewFromConfigWithOptions(ctx context.Context, beadsDir string, cfg *Config) (*DoltStore, error) {
-	fileCfg, err := configfile.Load(beadsDir)
+	fileCfg, err := loadRedirectAwareConfig(beadsDir)
 	if err != nil {
 		return nil, fmt.Errorf("loading config: %w", err)
 	}
