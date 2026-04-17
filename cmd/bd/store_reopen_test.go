@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -60,6 +61,118 @@ func TestResolveBeadsDirForDBPath_UsesRawBeadsDirForSymlinkedDBPath(t *testing.T
 
 	if got := resolveBeadsDirForDBPath(linkDBPath); !utils.PathsEqual(got, beadsDir) {
 		t.Fatalf("resolveBeadsDirForDBPath(%q) = %q, want %q", linkDBPath, got, beadsDir)
+	}
+}
+
+func TestWithStorage_ReopensRedirectedSourceDatabaseAndPreservesEphemeralState(t *testing.T) {
+	if testDoltServerPort == 0 {
+		t.Skip("Dolt test server not available")
+	}
+
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+
+	ctx := context.Background()
+	repoDir := t.TempDir()
+	sourceBeadsDir := filepath.Join(repoDir, "rig", ".beads")
+	targetBeadsDir := filepath.Join(repoDir, "shared", ".beads")
+	sourceDBPath := filepath.Join(sourceBeadsDir, "dolt")
+	targetDBPath := filepath.Join(targetBeadsDir, "dolt")
+
+	sourceStore := newTestStoreIsolatedDB(t, sourceDBPath, "rig")
+	_ = newTestStoreIsolatedDB(t, targetDBPath, "shared")
+
+	sourceCfg, err := configfile.Load(sourceBeadsDir)
+	if err != nil {
+		t.Fatalf("load source metadata: %v", err)
+	}
+	targetCfg, err := configfile.Load(targetBeadsDir)
+	if err != nil {
+		t.Fatalf("load target metadata: %v", err)
+	}
+	if sourceCfg.GetDoltDatabase() == targetCfg.GetDoltDatabase() {
+		t.Fatal("expected source and target databases to differ")
+	}
+
+	root := &types.Issue{
+		ID:        "startup-root",
+		Title:     "Startup thread root",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeMessage,
+		Sender:    "mayor",
+		Assignee:  "worker",
+		Ephemeral: true,
+	}
+	reply := &types.Issue{
+		ID:        "startup-reply",
+		Title:     "Startup thread reply",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeMessage,
+		Sender:    "worker",
+		Assignee:  "mayor",
+		Ephemeral: true,
+	}
+	wisp := &types.Issue{
+		ID:        "startup-wisp",
+		Title:     "Startup wisp",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	for _, issue := range []*types.Issue{root, reply, wisp} {
+		if err := sourceStore.CreateIssue(ctx, issue, "test"); err != nil {
+			t.Fatalf("CreateIssue(%s): %v", issue.ID, err)
+		}
+	}
+	if err := sourceStore.AddDependency(ctx, &types.Dependency{
+		IssueID: reply.ID, DependsOnID: root.ID, Type: types.DepRepliesTo,
+	}, "test"); err != nil {
+		t.Fatalf("AddDependency(replies-to): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceBeadsDir, "redirect"), []byte(targetBeadsDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+	if err := sourceStore.Close(); err != nil {
+		t.Fatalf("close source store before reopen: %v", err)
+	}
+
+	err = withStorage(ctx, nil, sourceDBPath, func(s storage.DoltStorage) error {
+		gotRoot, err := s.GetIssue(ctx, root.ID)
+		if err != nil {
+			return err
+		}
+		if gotRoot == nil || gotRoot.ID != root.ID || !gotRoot.Ephemeral {
+			return fmt.Errorf("root message missing after reopen: %#v", gotRoot)
+		}
+
+		gotReply, err := s.GetIssue(ctx, reply.ID)
+		if err != nil {
+			return err
+		}
+		if gotReply == nil || gotReply.ID != reply.ID || !gotReply.Ephemeral {
+			return fmt.Errorf("reply message missing after reopen: %#v", gotReply)
+		}
+		if parent := findRepliesTo(ctx, reply.ID, s); parent != root.ID {
+			return fmt.Errorf("reply parent = %q, want %q", parent, root.ID)
+		}
+
+		gotWisp, err := s.GetIssue(ctx, wisp.ID)
+		if err != nil {
+			return err
+		}
+		if gotWisp == nil || gotWisp.ID != wisp.ID || !gotWisp.Ephemeral {
+			return fmt.Errorf("wisp missing after reopen: %#v", gotWisp)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withStorage() reopen failed: %v", err)
+	}
+	if got := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); got != sourceCfg.GetDoltDatabase() {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want %q", got, sourceCfg.GetDoltDatabase())
 	}
 }
 

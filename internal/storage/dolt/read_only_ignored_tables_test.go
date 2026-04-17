@@ -7,6 +7,16 @@ import (
 	"github.com/steveyegge/beads/internal/storage/schema"
 )
 
+var requiredIgnoredTables = []string{
+	"wisp_comments",
+	"wisp_events",
+	"wisp_dependencies",
+	"wisp_labels",
+	"wisps",
+	"repo_mtimes",
+	"local_metadata",
+}
+
 func TestNew_ReadOnlyRepairsMissingIgnoredTables(t *testing.T) {
 	if testServerPort == 0 {
 		t.Skip("Dolt test container not running")
@@ -28,7 +38,7 @@ func TestNew_ReadOnlyRepairsMissingIgnoredTables(t *testing.T) {
 		t.Fatalf("initial New() error = %v", err)
 	}
 
-	for _, table := range []string{"wisp_comments", "wisp_events", "wisp_dependencies", "wisp_labels", "wisps", "repo_mtimes", "local_metadata"} {
+	for _, table := range requiredIgnoredTables {
 		if _, err := initStore.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil {
 			initStore.Close()
 			t.Fatalf("drop %s: %v", table, err)
@@ -70,7 +80,7 @@ func TestNew_ReadOnlyRepairsMissingIgnoredTables(t *testing.T) {
 	}
 	defer readOnlyStore.Close()
 
-	for _, table := range []string{"wisps", "repo_mtimes", "local_metadata"} {
+	for _, table := range requiredIgnoredTables {
 		ok, err := schema.TableExists(ctx, readOnlyStore.db, table)
 		if err != nil {
 			t.Fatalf("TableExists(%s): %v", table, err)
