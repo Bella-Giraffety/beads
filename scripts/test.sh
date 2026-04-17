@@ -151,8 +151,15 @@ echo "" >&2
 status=$?
 
 if [[ -n "$COVERAGE" ]]; then
-    total=$(go tool cover -func="$COVERPROFILE" | awk '/^total:/ {print $NF}')
-    echo "Total coverage: ${total} (profile: ${COVERPROFILE})" >&2
+	if cover_output=$(go tool cover -func="$COVERPROFILE" 2>&1); then
+		total=$(printf '%s\n' "$cover_output" | awk '/^total:/ {print $NF}')
+		if [[ -n "$total" ]]; then
+			echo "Total coverage: ${total} (profile: ${COVERPROFILE})" >&2
+		fi
+	else
+		echo "WARN: failed to summarize coverage from ${COVERPROFILE}" >&2
+		echo "$cover_output" >&2
+	fi
 fi
 
 exit $status
