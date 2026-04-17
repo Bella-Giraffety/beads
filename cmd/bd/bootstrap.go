@@ -648,7 +648,7 @@ func finalizeSyncedBootstrap(ctx context.Context, beadsDir, syncRemote string, c
 // This keeps rig/bootstrap paths on the authoritative database name without
 // silently ignoring malformed local metadata.
 func loadWorkspaceConfig(beadsDir string) (*configfile.Config, error) {
-	cfg, err := configfile.Load(beadsDir)
+	cfg, err := beads.LoadRedirectAwareConfig(beadsDir)
 	if err != nil || cfg != nil {
 		return cfg, err
 	}
