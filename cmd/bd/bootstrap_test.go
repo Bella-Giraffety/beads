@@ -1168,8 +1168,8 @@ func TestFinalizeSyncedBootstrapPreservesClonedMetadata(t *testing.T) {
 	if loaded.DoltServerHost != "10.0.0.9" {
 		t.Fatalf("dolt_server_host = %q, want %q", loaded.DoltServerHost, "10.0.0.9")
 	}
-	if loaded.DoltServerPort != 3312 {
-		t.Fatalf("dolt_server_port = %d, want %d", loaded.DoltServerPort, 3312)
+	if loaded.DoltServerPort != 0 {
+		t.Fatalf("dolt_server_port = %d, want %d", loaded.DoltServerPort, 0)
 	}
 	if loaded.DoltServerUser != "clone-user" {
 		t.Fatalf("dolt_server_user = %q, want %q", loaded.DoltServerUser, "clone-user")
@@ -1177,8 +1177,8 @@ func TestFinalizeSyncedBootstrapPreservesClonedMetadata(t *testing.T) {
 	if !loaded.DoltServerTLS {
 		t.Fatal("expected dolt_server_tls to be preserved")
 	}
-	if loaded.ProjectID != "proj-cloned-123" {
-		t.Fatalf("project_id = %q, want %q", loaded.ProjectID, "proj-cloned-123")
+	if loaded.ProjectID != "" {
+		t.Fatalf("project_id = %q, want empty until the cloned DB is reopened", loaded.ProjectID)
 	}
 }
 
@@ -1344,7 +1344,7 @@ func TestFinalizeSyncedBootstrapSharedServerWritesGlobalDatabase(t *testing.T) {
 	}
 }
 
-func TestSyncProjectIDFromStoreUpdatesMetadata(t *testing.T) {
+func TestSyncProjectIDToBeadsDirUpdatesMetadata(t *testing.T) {
 	if testDoltServerPort == 0 {
 		t.Skip("Dolt test server not available")
 	}
@@ -1371,8 +1371,8 @@ func TestSyncProjectIDFromStoreUpdatesMetadata(t *testing.T) {
 		t.Fatalf("save stale metadata.json: %v", err)
 	}
 
-	if err := syncProjectIDFromStore(ctx, beadsDir, store); err != nil {
-		t.Fatalf("syncProjectIDFromStore: %v", err)
+	if err := syncProjectIDToBeadsDir(ctx, beadsDir, store); err != nil {
+		t.Fatalf("syncProjectIDToBeadsDir: %v", err)
 	}
 
 	loaded, err := configfile.Load(beadsDir)

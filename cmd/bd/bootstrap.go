@@ -16,7 +16,6 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/doltserver"
-	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
@@ -570,7 +569,7 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 	}
 	defer func() { _ = warmupStore.Close() }()
 
-	if err := syncProjectIDFromStore(ctx, plan.BeadsDir, warmupStore); err != nil {
+	if err := syncProjectIDToBeadsDir(ctx, plan.BeadsDir, warmupStore); err != nil {
 		return err
 	}
 
@@ -641,31 +640,6 @@ func finalizeSyncedBootstrap(ctx context.Context, beadsDir, syncRemote string, c
 		fmt.Fprintf(os.Stderr, "Warning: failed to adopt project identity from bootstrapped database: %v\n", err)
 	}
 
-	return nil
-}
-
-func syncProjectIDFromStore(ctx context.Context, beadsDir string, s storage.DoltStorage) error {
-	if s == nil {
-		return nil
-	}
-
-	cfg, err := configfile.Load(beadsDir)
-	if err != nil {
-		return fmt.Errorf("load metadata.json: %w", err)
-	}
-	if cfg == nil {
-		return nil
-	}
-
-	dbID, err := s.GetMetadata(ctx, "_project_id")
-	if err != nil || dbID == "" || cfg.ProjectID == dbID {
-		return nil
-	}
-
-	cfg.ProjectID = dbID
-	if err := cfg.Save(beadsDir); err != nil {
-		return fmt.Errorf("sync project_id to metadata.json: %w", err)
-	}
 	return nil
 }
 
