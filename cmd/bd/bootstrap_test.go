@@ -1302,7 +1302,7 @@ func TestFinalizeSyncedBootstrapClearsInheritedIdentityAndPort(t *testing.T) {
 	}
 }
 
-func TestLoadWorkspaceConfig_FallsBackToParentWorkspaceMetadata(t *testing.T) {
+func TestLoadWorkspaceConfig_DoesNotFallBackToParentWorkspaceMetadata(t *testing.T) {
 	workspaceRoot := t.TempDir()
 	workspaceBeads := filepath.Join(workspaceRoot, ".beads")
 	if err := os.MkdirAll(workspaceBeads, 0o750); err != nil {
@@ -1330,8 +1330,41 @@ func TestLoadWorkspaceConfig_FallsBackToParentWorkspaceMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadWorkspaceConfig: %v", err)
 	}
+	if loaded != nil {
+		t.Fatalf("loadWorkspaceConfig() = %#v, want nil when local metadata.json is absent", loaded)
+	}
+}
+
+func TestLoadBootstrapWorkspaceConfig_FallsBackToParentWorkspaceMetadata(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workspaceBeads := filepath.Join(workspaceRoot, ".beads")
+	if err := os.MkdirAll(workspaceBeads, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	parentCfg := &configfile.Config{
+		Database:       "dolt",
+		Backend:        configfile.BackendDolt,
+		DoltMode:       configfile.DoltModeServer,
+		DoltDatabase:   "my_rig",
+		DoltServerHost: "127.0.0.1",
+		ProjectID:      "workspace-project-id",
+	}
+	if err := parentCfg.Save(workspaceBeads); err != nil {
+		t.Fatalf("save parent metadata.json: %v", err)
+	}
+
+	rigBeads := filepath.Join(workspaceRoot, "rig", "nested", ".beads")
+	if err := os.MkdirAll(rigBeads, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadBootstrapWorkspaceConfig(rigBeads)
+	if err != nil {
+		t.Fatalf("loadBootstrapWorkspaceConfig: %v", err)
+	}
 	if loaded == nil {
-		t.Fatal("loadWorkspaceConfig returned nil")
+		t.Fatal("loadBootstrapWorkspaceConfig returned nil")
 	}
 	if loaded.GetDoltDatabase() != "my_rig" {
 		t.Fatalf("GetDoltDatabase() = %q, want %q", loaded.GetDoltDatabase(), "my_rig")

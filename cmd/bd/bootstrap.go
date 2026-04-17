@@ -172,12 +172,16 @@ Examples:
 		// workspace-level metadata.json that contains the correct database
 		// name (e.g. dolt_database). Without this, server-mode rigs get the
 		// default name "beads" instead of their configured name. (GH#3029)
-		cfg, err := loadWorkspaceConfig(beadsDir)
+		cfg, err := loadBootstrapWorkspaceConfig(beadsDir)
 		if err != nil {
 			FatalError("failed to load metadata.json: %v", err)
 		}
 		if cfg == nil {
 			cfg = configfile.DefaultConfig()
+		}
+		serverMode = cfg.IsDoltServerMode() || doltserver.IsSharedServerMode()
+		if cmdCtx != nil {
+			cmdCtx.ServerMode = serverMode
 		}
 
 		// Determine action based on state
@@ -643,12 +647,19 @@ func finalizeSyncedBootstrap(ctx context.Context, beadsDir, syncRemote string, c
 	return nil
 }
 
-// loadWorkspaceConfig reads the local metadata.json when present, and falls back
-// to the parent workspace's committed metadata only when the local file is absent.
-// This keeps rig/bootstrap paths on the authoritative database name without
-// silently ignoring malformed local metadata.
+// loadWorkspaceConfig reads only the local metadata.json for the current
+// workspace. Ordinary command startup must fail closed when local metadata is
+// missing instead of silently inheriting a parent workspace's database.
 func loadWorkspaceConfig(beadsDir string) (*configfile.Config, error) {
-	cfg, err := configfile.Load(beadsDir)
+	return configfile.Load(beadsDir)
+}
+
+// loadBootstrapWorkspaceConfig reads the local metadata.json when present, and
+// falls back to the parent workspace's committed metadata only when the local
+// file is absent. Bootstrap/recovery paths use this to recover the correct
+// database name from the owning workspace without relaxing normal startup.
+func loadBootstrapWorkspaceConfig(beadsDir string) (*configfile.Config, error) {
+	cfg, err := loadWorkspaceConfig(beadsDir)
 	if err != nil || cfg != nil {
 		return cfg, err
 	}
