@@ -28,7 +28,7 @@ func TestNew_ReadOnlyRepairsMissingIgnoredTables(t *testing.T) {
 		t.Fatalf("initial New() error = %v", err)
 	}
 
-	for _, table := range []string{"wisp_comments", "wisp_events", "wisp_dependencies", "wisp_labels", "wisps", "local_metadata"} {
+	for _, table := range []string{"wisp_comments", "wisp_events", "wisp_dependencies", "wisp_labels", "wisps", "repo_mtimes"} {
 		if _, err := initStore.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil {
 			initStore.Close()
 			t.Fatalf("drop %s: %v", table, err)
@@ -41,12 +41,12 @@ func TestNew_ReadOnlyRepairsMissingIgnoredTables(t *testing.T) {
 		initStore.Close()
 		t.Fatal("expected wisps table to be missing before read-only reopen")
 	}
-	if ok, err := schema.TableExists(ctx, initStore.db, "local_metadata"); err != nil {
+	if ok, err := schema.TableExists(ctx, initStore.db, "repo_mtimes"); err != nil {
 		initStore.Close()
-		t.Fatalf("precondition check local_metadata: %v", err)
+		t.Fatalf("precondition check repo_mtimes: %v", err)
 	} else if ok {
 		initStore.Close()
-		t.Fatal("expected local_metadata table to be missing before read-only reopen")
+		t.Fatal("expected repo_mtimes table to be missing before read-only reopen")
 	}
 	initStore.Close()
 
@@ -63,7 +63,7 @@ func TestNew_ReadOnlyRepairsMissingIgnoredTables(t *testing.T) {
 	}
 	defer readOnlyStore.Close()
 
-	for _, table := range []string{"wisps", "local_metadata"} {
+	for _, table := range []string{"wisps", "repo_mtimes"} {
 		ok, err := schema.TableExists(ctx, readOnlyStore.db, table)
 		if err != nil {
 			t.Fatalf("TableExists(%s): %v", table, err)

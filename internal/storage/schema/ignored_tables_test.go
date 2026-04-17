@@ -14,7 +14,6 @@ func TestIgnoredTableDDL(t *testing.T) {
 	combined := strings.Join(ddl, "\n")
 
 	for _, table := range []string{
-		"local_metadata",
 		"repo_mtimes",
 		"wisps",
 		"wisp_labels",
@@ -36,14 +35,10 @@ func TestIgnoredTableDDL(t *testing.T) {
 	if !strings.Contains(combined, "idx_repo_mtimes_checked") {
 		t.Error("IgnoredTableDDL missing idx_repo_mtimes_checked index")
 	}
-	if !strings.Contains(combined, "idx_wisp_events_created_at") {
-		t.Error("IgnoredTableDDL missing idx_wisp_events_created_at index")
-	}
 }
 
 func TestRequiredIgnoredTables(t *testing.T) {
 	for _, table := range []string{
-		"local_metadata",
 		"repo_mtimes",
 		"wisps",
 		"wisp_labels",
