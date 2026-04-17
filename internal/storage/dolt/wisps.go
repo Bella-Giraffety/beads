@@ -146,110 +146,127 @@ func wispPrefix(configPrefix string, issue *types.Issue) string {
 
 // getWisp retrieves an issue from the wisps table.
 func (s *DoltStore) getWisp(ctx context.Context, id string) (*types.Issue, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	issue, err := scanIssueFromTable(ctx, s.db, "wisps", id)
-	if err != nil {
-		return nil, err
-	}
-	if issue == nil {
-		return nil, nil
-	}
-	labels, err := s.getWispLabels(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get wisp labels: %w", err)
-	}
-	issue.Labels = labels
-	return issue, nil
+	var issue *types.Issue
+	err := s.withIgnoredTableRepair(ctx, func() error {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+
+		fetched, err := scanIssueFromTable(ctx, s.db, "wisps", id)
+		if err != nil {
+			return err
+		}
+		if fetched == nil {
+			issue = nil
+			return nil
+		}
+		labels, err := s.getWispLabels(ctx, id)
+		if err != nil {
+			return fmt.Errorf("failed to get wisp labels: %w", err)
+		}
+		fetched.Labels = labels
+		issue = fetched
+		return nil
+	})
+	return issue, err
 }
 
 // getWispLabels retrieves labels from the wisp_labels table.
 func (s *DoltStore) getWispLabels(ctx context.Context, issueID string) ([]string, error) {
-	rows, err := s.queryContext(ctx, `SELECT label FROM wisp_labels WHERE issue_id = ? ORDER BY label`, issueID)
-	if err != nil {
-		return nil, wrapQueryError("get wisp labels", err)
-	}
-	defer rows.Close()
-
 	var labels []string
-	for rows.Next() {
-		var label string
-		if err := rows.Scan(&label); err != nil {
-			return nil, wrapScanError("scan wisp label", err)
+	err := s.withIgnoredTableRepair(ctx, func() error {
+		rows, err := s.queryContext(ctx, `SELECT label FROM wisp_labels WHERE issue_id = ? ORDER BY label`, issueID)
+		if err != nil {
+			return wrapQueryError("get wisp labels", err)
 		}
-		labels = append(labels, label)
-	}
-	return labels, rows.Err()
+		defer rows.Close()
+
+		labels = labels[:0]
+		for rows.Next() {
+			var label string
+			if err := rows.Scan(&label); err != nil {
+				return wrapScanError("scan wisp label", err)
+			}
+			labels = append(labels, label)
+		}
+		return rows.Err()
+	})
+	return labels, err
 }
 
 // updateWisp updates fields on a wisp in the wisps table.
 // Delegates SQL work to issueops.UpdateIssueInTx; no Dolt versioning needed
 // since wisps live in dolt_ignored tables.
 func (s *DoltStore) updateWisp(ctx context.Context, id string, updates map[string]interface{}, actor string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.withIgnoredTableRepair(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
 
-	if _, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor); err != nil {
-		return err
-	}
+		if _, err := issueops.UpdateIssueInTx(ctx, tx, id, updates, actor); err != nil {
+			return err
+		}
 
-	return wrapTransactionError("commit update wisp", tx.Commit())
+		return wrapTransactionError("commit update wisp", tx.Commit())
+	})
 }
 
 // closeWisp closes a wisp in the wisps table.
 // Delegates SQL work to issueops.CloseIssueInTx; no Dolt versioning needed
 // since wisps live in dolt_ignored tables.
 func (s *DoltStore) closeWisp(ctx context.Context, id string, reason string, actor string, session string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.withIgnoredTableRepair(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
 
-	if _, err := issueops.CloseIssueInTx(ctx, tx, id, reason, actor, session); err != nil {
-		return err
-	}
+		if _, err := issueops.CloseIssueInTx(ctx, tx, id, reason, actor, session); err != nil {
+			return err
+		}
 
-	return wrapTransactionError("commit close wisp", tx.Commit())
+		return wrapTransactionError("commit close wisp", tx.Commit())
+	})
 }
 
 // deleteWisp permanently removes a wisp and its related data.
 func (s *DoltStore) deleteWisp(ctx context.Context, id string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Delete from auxiliary tables
-	for _, table := range []string{"wisp_dependencies", "wisp_events", "wisp_comments", "wisp_labels"} {
-		if table == "wisp_dependencies" {
-			_, err = tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE issue_id = ? OR depends_on_id = ?", table), id, id) //nolint:gosec // G201: table is hardcoded
-		} else {
-			_, err = tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE issue_id = ?", table), id) //nolint:gosec // G201: table is hardcoded
-		}
+	return s.withIgnoredTableRepair(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("failed to delete from %s: %w", table, err)
+			return fmt.Errorf("failed to begin transaction: %w", err)
 		}
-	}
+		defer func() { _ = tx.Rollback() }()
 
-	result, err := tx.ExecContext(ctx, "DELETE FROM wisps WHERE id = ?", id)
-	if err != nil {
-		return fmt.Errorf("failed to delete wisp: %w", err)
-	}
+		// Delete from auxiliary tables
+		for _, table := range []string{"wisp_dependencies", "wisp_events", "wisp_comments", "wisp_labels"} {
+			if table == "wisp_dependencies" {
+				_, err = tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE issue_id = ? OR depends_on_id = ?", table), id, id) //nolint:gosec // G201: table is hardcoded
+			} else {
+				_, err = tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE issue_id = ?", table), id) //nolint:gosec // G201: table is hardcoded
+			}
+			if err != nil {
+				return fmt.Errorf("failed to delete from %s: %w", table, err)
+			}
+		}
 
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-	if rows == 0 {
-		return fmt.Errorf("wisp not found: %s", id)
-	}
+		result, err := tx.ExecContext(ctx, "DELETE FROM wisps WHERE id = ?", id)
+		if err != nil {
+			return fmt.Errorf("failed to delete wisp: %w", err)
+		}
 
-	return wrapTransactionError("commit delete wisp", tx.Commit())
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("failed to get rows affected: %w", err)
+		}
+		if rows == 0 {
+			return fmt.Errorf("wisp not found: %s", id)
+		}
+
+		return wrapTransactionError("commit delete wisp", tx.Commit())
+	})
 }
 
 // deleteWispBatch permanently removes multiple wisps using one transaction per
@@ -290,74 +307,80 @@ func (s *DoltStore) deleteWispBatch(ctx context.Context, ids []string) (int, err
 // Keeping each transaction to ≤200 wisps (6 DELETE statements) ensures it
 // completes well within Dolt's 10 s write timeout.
 func (s *DoltStore) deleteWispBatchTx(ctx context.Context, ids []string) (int, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	inClause, args := doltBuildSQLInClause(ids)
-
-	// Delete from wisp_dependencies using two separate queries rather than a
-	// single OR condition. An OR across issue_id and depends_on_id forces Dolt
-	// to union two index scans in one statement, which is slow enough to trigger
-	// the driver's write timeout on large batches (ff-tqm). Two targeted queries
-	// each use their own index: PRIMARY KEY for issue_id and
-	// idx_wisp_dep_depends for depends_on_id.
-	//nolint:gosec // G201: inClause contains only ? markers
-	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf("DELETE FROM wisp_dependencies WHERE issue_id IN (%s)", inClause),
-		args...); err != nil {
-		return 0, fmt.Errorf("failed to batch delete from wisp_dependencies (issue_id): %w", err)
-	}
-	//nolint:gosec // G201: inClause contains only ? markers
-	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_id IN (%s)", inClause),
-		args...); err != nil {
-		return 0, fmt.Errorf("failed to batch delete from wisp_dependencies (depends_on_id): %w", err)
-	}
-
-	for _, table := range []string{"wisp_events", "wisp_comments", "wisp_labels"} {
-		//nolint:gosec // G201: table is a hardcoded constant, inClause contains only ? markers
-		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM %s WHERE issue_id IN (%s)", table, inClause),
-			args...); err != nil {
-			return 0, fmt.Errorf("failed to batch delete from %s: %w", table, err)
+	var deleted int
+	err := s.withIgnoredTableRepair(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
 		}
-	}
+		defer func() { _ = tx.Rollback() }()
 
-	// Delete the wisps themselves
-	//nolint:gosec // G201: inClause contains only ? markers
-	result, err := tx.ExecContext(ctx,
-		fmt.Sprintf("DELETE FROM wisps WHERE id IN (%s)", inClause),
-		args...)
-	if err != nil {
-		return 0, fmt.Errorf("failed to batch delete wisps: %w", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
+		inClause, args := doltBuildSQLInClause(ids)
 
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("failed to commit batch wisp delete: %w", err)
-	}
+		// Delete from wisp_dependencies using two separate queries rather than a
+		// single OR condition. An OR across issue_id and depends_on_id forces Dolt
+		// to union two index scans in one statement, which is slow enough to trigger
+		// the driver's write timeout on large batches (ff-tqm). Two targeted queries
+		// each use their own index: PRIMARY KEY for issue_id and
+		// idx_wisp_dep_depends for depends_on_id.
+		//nolint:gosec // G201: inClause contains only ? markers
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf("DELETE FROM wisp_dependencies WHERE issue_id IN (%s)", inClause),
+			args...); err != nil {
+			return fmt.Errorf("failed to batch delete from wisp_dependencies (issue_id): %w", err)
+		}
+		//nolint:gosec // G201: inClause contains only ? markers
+		if _, err := tx.ExecContext(ctx,
+			fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_id IN (%s)", inClause),
+			args...); err != nil {
+			return fmt.Errorf("failed to batch delete from wisp_dependencies (depends_on_id): %w", err)
+		}
 
-	return int(rowsAffected), nil
+		for _, table := range []string{"wisp_events", "wisp_comments", "wisp_labels"} {
+			//nolint:gosec // G201: table is a hardcoded constant, inClause contains only ? markers
+			if _, err := tx.ExecContext(ctx,
+				fmt.Sprintf("DELETE FROM %s WHERE issue_id IN (%s)", table, inClause),
+				args...); err != nil {
+				return fmt.Errorf("failed to batch delete from %s: %w", table, err)
+			}
+		}
+
+		// Delete the wisps themselves
+		//nolint:gosec // G201: inClause contains only ? markers
+		result, err := tx.ExecContext(ctx,
+			fmt.Sprintf("DELETE FROM wisps WHERE id IN (%s)", inClause),
+			args...)
+		if err != nil {
+			return fmt.Errorf("failed to batch delete wisps: %w", err)
+		}
+		rowsAffected, _ := result.RowsAffected()
+		deleted = int(rowsAffected)
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit batch wisp delete: %w", err)
+		}
+		return nil
+	})
+	return deleted, err
 }
 
 // claimWisp atomically claims a wisp.
 // Delegates SQL work to issueops.ClaimIssueInTx; no Dolt versioning needed
 // since wisps live in dolt_ignored tables.
 func (s *DoltStore) claimWisp(ctx context.Context, id string, actor string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.withIgnoredTableRepair(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
 
-	if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor); err != nil {
-		return err
-	}
+		if _, err := issueops.ClaimIssueInTx(ctx, tx, id, actor); err != nil {
+			return err
+		}
 
-	return wrapTransactionError("commit claim wisp", tx.Commit())
+		return wrapTransactionError("commit claim wisp", tx.Commit())
+	})
 }
 
 // ListWisps returns ephemeral issues matching the filter.
@@ -369,39 +392,44 @@ func (s *DoltStore) ListWisps(ctx context.Context, filter types.WispFilter) ([]*
 
 // searchWisps searches for issues in the wisps table.
 func (s *DoltStore) searchWisps(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	var issues []*types.Issue
+	err := s.withIgnoredTableRepair(ctx, func() error {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
 
-	whereClauses, args, err := buildIssueFilterClauses(query, filter, wispsFilterTables)
-	if err != nil {
-		return nil, err
-	}
+		whereClauses, args, err := buildIssueFilterClauses(query, filter, wispsFilterTables)
+		if err != nil {
+			return err
+		}
 
-	whereSQL := ""
-	if len(whereClauses) > 0 {
-		whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
-	}
+		whereSQL := ""
+		if len(whereClauses) > 0 {
+			whereSQL = "WHERE " + strings.Join(whereClauses, " AND ")
+		}
 
-	limitSQL := ""
-	if filter.Limit > 0 {
-		limitSQL = fmt.Sprintf(" LIMIT %d", filter.Limit)
-	}
+		limitSQL := ""
+		if filter.Limit > 0 {
+			limitSQL = fmt.Sprintf(" LIMIT %d", filter.Limit)
+		}
 
-	//nolint:gosec // G201: whereSQL contains column comparisons with ?, limitSQL is a safe integer
-	querySQL := fmt.Sprintf(`
-		SELECT id FROM wisps
-		%s
-		ORDER BY priority ASC, created_at DESC
-		%s
-	`, whereSQL, limitSQL)
+		//nolint:gosec // G201: whereSQL contains column comparisons with ?, limitSQL is a safe integer
+		querySQL := fmt.Sprintf(`
+			SELECT id FROM wisps
+			%s
+			ORDER BY priority ASC, created_at DESC
+			%s
+		`, whereSQL, limitSQL)
 
-	rows, err := s.queryContext(ctx, querySQL, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search wisps: %w", err)
-	}
-	defer rows.Close()
+		rows, err := s.queryContext(ctx, querySQL, args...)
+		if err != nil {
+			return fmt.Errorf("failed to search wisps: %w", err)
+		}
+		defer rows.Close()
 
-	return s.scanWispIDs(ctx, rows)
+		issues, err = s.scanWispIDs(ctx, rows)
+		return err
+	})
+	return issues, err
 }
 
 // scanWispIDs collects IDs from rows and fetches full issues from the wisps table.
@@ -433,48 +461,53 @@ func (s *DoltStore) getWispsByIDs(ctx context.Context, ids []string) ([]*types.I
 		return nil, nil
 	}
 
-	// Fetch wisps in batches to keep IN-clause size bounded.
 	var issues []*types.Issue
-	issueMap := make(map[string]*types.Issue, len(ids))
-	for start := 0; start < len(ids); start += queryBatchSize {
-		end := start + queryBatchSize
-		if end > len(ids) {
-			end = len(ids)
-		}
-		batch := ids[start:end]
-
-		placeholders, args := doltBuildSQLInClause(batch)
-
-		//nolint:gosec // G201: placeholders contains only ? markers
-		querySQL := fmt.Sprintf(`
-			SELECT %s
-			FROM wisps
-			WHERE id IN (%s)
-		`, issueSelectColumns, placeholders)
-
-		queryRows, err := s.queryContext(ctx, querySQL, args...)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get wisps by IDs: %w", err)
-		}
-
-		for queryRows.Next() {
-			issue, err := scanIssueFrom(queryRows)
-			if err != nil {
-				_ = queryRows.Close()
-				return nil, wrapScanError("scan wisp", err)
+	err := s.withIgnoredTableRepair(ctx, func() error {
+		// Fetch wisps in batches to keep IN-clause size bounded.
+		issues = nil
+		issueMap := make(map[string]*types.Issue, len(ids))
+		for start := 0; start < len(ids); start += queryBatchSize {
+			end := start + queryBatchSize
+			if end > len(ids) {
+				end = len(ids)
 			}
-			issues = append(issues, issue)
-			issueMap[issue.ID] = issue
-		}
-		if err := queryRows.Err(); err != nil {
-			_ = queryRows.Close()
-			return nil, wrapQueryError("iterate wisps", err)
-		}
-		_ = queryRows.Close()
-	}
+			batch := ids[start:end]
 
-	// Hydrate labels in batches.
-	if len(issues) > 0 {
+			placeholders, args := doltBuildSQLInClause(batch)
+
+			//nolint:gosec // G201: placeholders contains only ? markers
+			querySQL := fmt.Sprintf(`
+				SELECT %s
+				FROM wisps
+				WHERE id IN (%s)
+			`, issueSelectColumns, placeholders)
+
+			queryRows, err := s.queryContext(ctx, querySQL, args...)
+			if err != nil {
+				return fmt.Errorf("failed to get wisps by IDs: %w", err)
+			}
+
+			for queryRows.Next() {
+				issue, err := scanIssueFrom(queryRows)
+				if err != nil {
+					_ = queryRows.Close()
+					return wrapScanError("scan wisp", err)
+				}
+				issues = append(issues, issue)
+				issueMap[issue.ID] = issue
+			}
+			if err := queryRows.Err(); err != nil {
+				_ = queryRows.Close()
+				return wrapQueryError("iterate wisps", err)
+			}
+			_ = queryRows.Close()
+		}
+
+		// Hydrate labels in batches.
+		if len(issues) == 0 {
+			return nil
+		}
+
 		allIDs := make([]string, len(issues))
 		for i, issue := range issues {
 			allIDs[i] = issue.ID
@@ -497,14 +530,14 @@ func (s *DoltStore) getWispsByIDs(ctx context.Context, ids []string) ([]*types.I
 
 			labelRows, err := s.queryContext(ctx, labelSQL, args...)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get wisp labels: %w", err)
+				return fmt.Errorf("failed to get wisp labels: %w", err)
 			}
 
 			for labelRows.Next() {
 				var issueID, label string
 				if err := labelRows.Scan(&issueID, &label); err != nil {
 					_ = labelRows.Close()
-					return nil, wrapScanError("scan wisp label", err)
+					return wrapScanError("scan wisp label", err)
 				}
 				if issue, ok := issueMap[issueID]; ok {
 					issue.Labels = append(issue.Labels, label)
@@ -512,13 +545,13 @@ func (s *DoltStore) getWispsByIDs(ctx context.Context, ids []string) ([]*types.I
 			}
 			if err := labelRows.Err(); err != nil {
 				_ = labelRows.Close()
-				return nil, wrapQueryError("iterate wisp labels", err)
+				return wrapQueryError("iterate wisp labels", err)
 			}
 			_ = labelRows.Close()
 		}
-	}
-
-	return issues, nil
+		return nil
+	})
+	return issues, err
 }
 
 // addWispDependency adds a dependency to the wisp_dependencies table.
@@ -528,68 +561,70 @@ func (s *DoltStore) addWispDependency(ctx context.Context, dep *types.Dependency
 		metadata = "{}"
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	return s.withIgnoredTableRepair(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
 
-	// Cycle detection for blocking dependency types: check if adding this edge
-	// would create a cycle. UNIONs both tables to detect cross-table cycles
-	// (e.g., wisp A -> permanent B -> wisp A). (bd-xe27)
-	if dep.Type == types.DepBlocks {
-		var reachable int
-		if err := tx.QueryRowContext(ctx, `
-			WITH RECURSIVE reachable AS (
-				SELECT ? AS node, 0 AS depth
-				UNION ALL
-				SELECT d.depends_on_id, r.depth + 1
-				FROM reachable r
-				JOIN (
-					SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'
+		// Cycle detection for blocking dependency types: check if adding this edge
+		// would create a cycle. UNIONs both tables to detect cross-table cycles
+		// (e.g., wisp A -> permanent B -> wisp A). (bd-xe27)
+		if dep.Type == types.DepBlocks {
+			var reachable int
+			if err := tx.QueryRowContext(ctx, `
+				WITH RECURSIVE reachable AS (
+					SELECT ? AS node, 0 AS depth
 					UNION ALL
-					SELECT issue_id, depends_on_id FROM wisp_dependencies WHERE type = 'blocks'
-				) d ON d.issue_id = r.node
-				WHERE r.depth < 100
-			)
-			SELECT COUNT(*) FROM reachable WHERE node = ?
-		`, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
-			return fmt.Errorf("failed to check for dependency cycle: %w", err)
-		}
-		if reachable > 0 {
-			return fmt.Errorf("adding dependency would create a cycle")
-		}
-	}
-
-	// Check for existing dependency to prevent silent type overwrites.
-	var existingType string
-	err = tx.QueryRowContext(ctx, `
-		SELECT type FROM wisp_dependencies WHERE issue_id = ? AND depends_on_id = ?
-	`, dep.IssueID, dep.DependsOnID).Scan(&existingType)
-	if err == nil {
-		if existingType == string(dep.Type) {
-			// Same type — idempotent; update metadata in case it changed
-			if _, err := tx.ExecContext(ctx, `
-				UPDATE wisp_dependencies SET metadata = ? WHERE issue_id = ? AND depends_on_id = ?
-			`, metadata, dep.IssueID, dep.DependsOnID); err != nil {
-				return fmt.Errorf("failed to update wisp dependency metadata: %w", err)
+					SELECT d.depends_on_id, r.depth + 1
+					FROM reachable r
+					JOIN (
+						SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'blocks'
+						UNION ALL
+						SELECT issue_id, depends_on_id FROM wisp_dependencies WHERE type = 'blocks'
+					) d ON d.issue_id = r.node
+					WHERE r.depth < 100
+				)
+				SELECT COUNT(*) FROM reachable WHERE node = ?
+			`, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
+				return fmt.Errorf("failed to check for dependency cycle: %w", err)
 			}
-			return wrapTransactionError("commit add wisp dependency", tx.Commit())
+			if reachable > 0 {
+				return fmt.Errorf("adding dependency would create a cycle")
+			}
 		}
-		return fmt.Errorf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
-			dep.IssueID, dep.DependsOnID, existingType, dep.Type)
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("failed to check existing wisp dependency: %w", err)
-	}
 
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
-		VALUES (?, ?, ?, NOW(), ?, ?, ?)
-	`, dep.IssueID, dep.DependsOnID, dep.Type, actor, metadata, dep.ThreadID); err != nil {
-		return fmt.Errorf("failed to add wisp dependency: %w", err)
-	}
+		// Check for existing dependency to prevent silent type overwrites.
+		var existingType string
+		err = tx.QueryRowContext(ctx, `
+			SELECT type FROM wisp_dependencies WHERE issue_id = ? AND depends_on_id = ?
+		`, dep.IssueID, dep.DependsOnID).Scan(&existingType)
+		if err == nil {
+			if existingType == string(dep.Type) {
+				// Same type — idempotent; update metadata in case it changed
+				if _, err := tx.ExecContext(ctx, `
+					UPDATE wisp_dependencies SET metadata = ? WHERE issue_id = ? AND depends_on_id = ?
+				`, metadata, dep.IssueID, dep.DependsOnID); err != nil {
+					return fmt.Errorf("failed to update wisp dependency metadata: %w", err)
+				}
+				return wrapTransactionError("commit add wisp dependency", tx.Commit())
+			}
+			return fmt.Errorf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
+				dep.IssueID, dep.DependsOnID, existingType, dep.Type)
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("failed to check existing wisp dependency: %w", err)
+		}
 
-	return wrapTransactionError("commit add wisp dependency", tx.Commit())
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+			VALUES (?, ?, ?, NOW(), ?, ?, ?)
+		`, dep.IssueID, dep.DependsOnID, dep.Type, actor, metadata, dep.ThreadID); err != nil {
+			return fmt.Errorf("failed to add wisp dependency: %w", err)
+		}
+
+		return wrapTransactionError("commit add wisp dependency", tx.Commit())
+	})
 }
 
 // getWispDependencies retrieves issues that a wisp depends on.

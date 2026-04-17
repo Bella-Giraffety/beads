@@ -27,12 +27,23 @@ var configCmd = &cobra.Command{
 Configuration is stored per-project in the beads database and is version-control-friendly.
 
 Common namespaces:
+  - export.*          Auto-export settings (stored in config.yaml)
   - jira.*            Jira integration settings
   - linear.*          Linear integration settings
   - github.*          GitHub integration settings
   - custom.*          Custom integration settings
   - status.*          Issue status configuration
   - doctor.suppress.* Suppress specific bd doctor warnings (GH#1095)
+
+Auto-Export (config.yaml):
+  Writes .beads/issues.jsonl after every write command (throttled).
+  Enabled by default. Useful for viewers (bv) and git-based sync.
+
+  Keys:
+    export.auto       Enable/disable auto-export (default: true)
+    export.path       Output filename relative to .beads/ (default: issues.jsonl)
+    export.interval   Minimum time between exports (default: 60s)
+    export.git-add    Auto-stage the export file (default: true)
 
 Custom Status States:
   You can define custom status states for multi-step pipelines using the
@@ -53,11 +64,13 @@ Suppressing Doctor Warnings:
   To unsuppress: bd config unset doctor.suppress.<slug>
 
 Examples:
+  bd config set export.auto false                      # Disable auto-export
+  bd config set export.path "beads.jsonl"              # Custom export filename
   bd config set jira.url "https://company.atlassian.net"
   bd config set jira.project "PROJ"
   bd config set status.custom "awaiting_review,awaiting_testing"
   bd config set doctor.suppress.pending-migrations true
-  bd config get jira.url
+  bd config get export.auto
   bd config list
   bd config unset jira.url`,
 }
@@ -515,10 +528,20 @@ func validateSyncConfig(repoPath string) []string {
 		issues = append(issues, "federation.remote: required for Dolt sync")
 	}
 
-	// Validate remote URL format
+	// Strict security validation of remote URL
 	if federationRemote != "" {
-		if !isValidRemoteURL(federationRemote) {
-			issues = append(issues, fmt.Sprintf("federation.remote: %q is not a valid remote URL (expected dolthub://, gs://, s3://, az://, file://, or standard git URL)", federationRemote))
+		if err := remotecache.ValidateRemoteURL(federationRemote); err != nil {
+			issues = append(issues, fmt.Sprintf("federation.remote: %s", err))
+		}
+	}
+
+	// Validate against allowed-remote-patterns if configured
+	if federationRemote != "" {
+		patterns := v.GetStringSlice("federation.allowed-remote-patterns")
+		if len(patterns) > 0 {
+			if err := remotecache.ValidateRemoteURLWithPatterns(federationRemote, patterns); err != nil {
+				issues = append(issues, fmt.Sprintf("federation.remote: %s", err))
+			}
 		}
 	}
 
@@ -526,9 +549,10 @@ func validateSyncConfig(repoPath string) []string {
 }
 
 // isValidRemoteURL validates remote URL formats for sync configuration.
-// Delegates to remotecache.IsRemoteURL for consistent URL classification.
-func isValidRemoteURL(url string) bool {
-	return remotecache.IsRemoteURL(url)
+// Uses strict security validation that checks structural correctness,
+// rejects control characters, and validates per-scheme requirements.
+func isValidRemoteURL(rawURL string) bool {
+	return remotecache.ValidateRemoteURL(rawURL) == nil
 }
 
 // findBeadsRepoRoot walks up from the given path to find the repo root (containing .beads)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -102,6 +103,41 @@ func TestResolveAutoStart(t *testing.T) {
 					tc.currentValue, tc.doltAutoStartCfg, got, tc.wantAutoStart)
 			}
 		})
+	}
+}
+
+func TestCLIDirUsesSharedDoltRootInSharedServerMode(t *testing.T) {
+	sharedRoot := t.TempDir()
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+	t.Setenv("BEADS_SHARED_SERVER_DIR", sharedRoot)
+
+	store := &DoltStore{
+		serverMode: true,
+		beadsDir:   filepath.Join(t.TempDir(), ".beads"),
+		dbPath:     filepath.Join(t.TempDir(), ".beads", "dolt"),
+		database:   "shared_db",
+	}
+
+	want := filepath.Join(sharedRoot, "dolt", "shared_db")
+	if got := store.CLIDir(); got != want {
+		t.Fatalf("CLIDir() = %q, want %q", got, want)
+	}
+}
+
+func TestCLIDirUsesDbPathOutsideSharedServerMode(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "0")
+
+	dbPath := filepath.Join(t.TempDir(), ".beads", "dolt")
+	store := &DoltStore{
+		serverMode: true,
+		beadsDir:   filepath.Join(t.TempDir(), ".beads"),
+		dbPath:     dbPath,
+		database:   "local_db",
+	}
+
+	want := filepath.Join(dbPath, "local_db")
+	if got := store.CLIDir(); got != want {
+		t.Fatalf("CLIDir() = %q, want %q", got, want)
 	}
 }
 
@@ -226,4 +262,38 @@ func TestApplyResolvedConfig(t *testing.T) {
 			t.Fatalf("ServerUser override lost: %q", cfg.ServerUser)
 		}
 	})
+}
+
+func TestLoadRedirectAwareConfig_PreservesSourceDatabase(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "rig", ".beads")
+	targetDir := filepath.Join(tmpDir, "shared", ".beads")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	sourceCfg := &configfile.Config{DoltMode: configfile.DoltModeServer, DoltDatabase: "rig_db"}
+	if err := sourceCfg.Save(sourceDir); err != nil {
+		t.Fatalf("save source metadata: %v", err)
+	}
+	targetCfg := &configfile.Config{DoltMode: configfile.DoltModeServer, DoltDatabase: "shared_db"}
+	if err := targetCfg.Save(targetDir); err != nil {
+		t.Fatalf("save target metadata: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "redirect"), []byte(targetDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+
+	cfg, err := loadRedirectAwareConfig(sourceDir)
+	if err != nil {
+		t.Fatalf("loadRedirectAwareConfig() error = %v", err)
+	}
+	if got := cfg.GetDoltDatabase(); got != "rig_db" {
+		t.Fatalf("GetDoltDatabase() = %q, want %q", got, "rig_db")
+	}
 }

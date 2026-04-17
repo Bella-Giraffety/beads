@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 	"github.com/steveyegge/beads/internal/routing"
 	"github.com/steveyegge/beads/internal/storage"
 )
@@ -69,6 +72,20 @@ func determineAutoRoutedRepoPath(ctx context.Context, store storage.DoltStorage)
 	return routing.DetermineTargetRepo(routingConfig, userRole, ".")
 }
 
+func routedReadWorkspaceRoot() string {
+	if redirectInfo := beads.GetRedirectInfo(); redirectInfo.LocalDir != "" {
+		return filepath.Dir(redirectInfo.LocalDir)
+	}
+	if beadsDir := beads.FindBeadsDir(); beadsDir != "" {
+		return filepath.Dir(beadsDir)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return cwd
+}
+
 // openRoutedReadStore opens the auto-routed target store for read commands.
 // Returns routed=false when reads should stay in the current store.
 func openRoutedReadStore(ctx context.Context, store storage.DoltStorage) (storage.DoltStorage, bool, error) {
@@ -77,8 +94,10 @@ func openRoutedReadStore(ctx context.Context, store storage.DoltStorage) (storag
 		return nil, false, nil
 	}
 
-	targetRepoPath := routing.ExpandPath(repoPath)
+	targetRepoPath := routing.ExpandPathFrom(repoPath, routedReadWorkspaceRoot())
 	targetBeadsDir := filepath.Join(targetRepoPath, ".beads")
+	restoreOverride := doltdboverride.Replace(redirectSourceDatabaseOverride(targetBeadsDir))
+	defer restoreOverride()
 	targetStore, err := newReadOnlyStoreFromConfig(ctx, targetBeadsDir)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to open routed store at %s: %w", targetRepoPath, err)

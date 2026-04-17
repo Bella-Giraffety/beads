@@ -26,6 +26,21 @@ func (s *DoltStore) CreateIssue(ctx context.Context, issue *types.Issue, actor s
 	if useWispsTable && !issue.NoHistory {
 		issue.Ephemeral = true // infra types get marked ephemeral (legacy behavior)
 	}
+	if useWispsTable {
+		return s.withIgnoredTableRepair(ctx, func() error {
+			return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+				// SkipPrefixValidation matches legacy behavior: single-issue path does
+				// not validate prefixes for explicit IDs.
+				bc, err := issueops.NewBatchContext(ctx, tx, storage.BatchCreateOptions{
+					SkipPrefixValidation: true,
+				})
+				if err != nil {
+					return err
+				}
+				return issueops.CreateIssueInTx(ctx, tx, bc, issue, actor)
+			})
+		})
+	}
 
 	if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
 		// SkipPrefixValidation matches legacy behavior: single-issue path does
@@ -73,12 +88,14 @@ func (s *DoltStore) CreateIssuesWithFullOptions(ctx context.Context, issues []*t
 			if !issue.NoHistory {
 				issue.Ephemeral = true
 			}
-			if err := s.withRetryTx(ctx, func(tx *sql.Tx) error {
-				bc, err := issueops.NewBatchContext(ctx, tx, opts)
-				if err != nil {
-					return err
-				}
-				return issueops.CreateIssueInTx(ctx, tx, bc, issue, actor)
+			if err := s.withIgnoredTableRepair(ctx, func() error {
+				return s.withRetryTx(ctx, func(tx *sql.Tx) error {
+					bc, err := issueops.NewBatchContext(ctx, tx, opts)
+					if err != nil {
+						return err
+					}
+					return issueops.CreateIssueInTx(ctx, tx, bc, issue, actor)
+				})
 			}); err != nil {
 				return err
 			}

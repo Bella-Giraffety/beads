@@ -1557,12 +1557,12 @@ func TestInitDoltMetadata(t *testing.T) {
 	defer doltStore.Close()
 
 	// FR-001: bd_version must be written
-	bdVersion, err := doltStore.GetMetadata(ctx, "bd_version")
+	bdVersion, err := doltStore.GetLocalMetadata(ctx, "bd_version")
 	if err != nil {
-		t.Fatalf("GetMetadata(bd_version) failed: %v", err)
+		t.Fatalf("GetLocalMetadata(bd_version) failed: %v", err)
 	}
 	if bdVersion == "" {
-		t.Error("bd_version metadata was not written")
+		t.Error("bd_version local metadata was not written")
 	}
 
 	// FR-002: repo_id must be written (git repo with remote configured)
@@ -1708,7 +1708,7 @@ func buildBDForInitTests(t *testing.T) string {
 			return
 		}
 		initTestBD = filepath.Join(tmpDir, bdBinary)
-		cmd := exec.Command("go", "build", "-o", initTestBD, ".")
+		cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", initTestBD, ".")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			initTestBDErr = fmt.Errorf("go build failed: %v\n%s", err, out)
 		}
@@ -2260,5 +2260,115 @@ func TestInitDatabaseAdoptsExistingProjectID(t *testing.T) {
 
 	if cfg.ProjectID != knownProjectID {
 		t.Errorf("ProjectID = %q, want %q (should adopt existing project_id from server)", cfg.ProjectID, knownProjectID)
+	}
+}
+
+// TestInitDatabaseOverridesInheritedProjectIDAndPort verifies that init does
+// not preserve stale committed metadata seeds when attaching to an existing
+// server database. The database identity is authoritative, and the runtime
+// port should not be copied into metadata.json unless explicitly requested.
+func TestInitDatabaseOverridesInheritedProjectIDAndPort(t *testing.T) {
+	skipIfNoDolt(t)
+
+	origDBPath := dbPath
+	origStore := store
+	defer func() {
+		if store != nil && store != origStore {
+			store.Close()
+		}
+		store = origStore
+		dbPath = origDBPath
+	}()
+	dbPath = ""
+	store = nil
+
+	ctx := context.Background()
+	database := uniqueTestDBName(t)
+
+	firstBeadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(firstBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	doltNewMutex.Lock()
+	firstStore, err := dolt.New(ctx, &dolt.Config{
+		Path:            filepath.Join(firstBeadsDir, "dolt"),
+		BeadsDir:        firstBeadsDir,
+		ServerHost:      "127.0.0.1",
+		ServerPort:      testDoltServerPort,
+		Database:        database,
+		CreateIfMissing: true,
+	})
+	doltNewMutex.Unlock()
+	if err != nil {
+		t.Fatalf("create first store: %v", err)
+	}
+
+	knownProjectID := "test-authoritative-project-id-ghl85"
+	if err := firstStore.SetMetadata(ctx, "_project_id", knownProjectID); err != nil {
+		t.Fatalf("set _project_id: %v", err)
+	}
+	if err := firstStore.SetConfig(ctx, "issue_prefix", "test"); err != nil {
+		t.Fatalf("set issue_prefix: %v", err)
+	}
+	firstStore.Close()
+
+	t.Cleanup(func() {
+		dropTestDatabase(database, testDoltServerPort)
+	})
+
+	secondDir := t.TempDir()
+	t.Chdir(secondDir)
+
+	if err := exec.Command("git", "-C", secondDir, "init").Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	_ = exec.Command("git", "-C", secondDir, "config", "user.email", "test@test.com").Run()
+	_ = exec.Command("git", "-C", secondDir, "config", "user.name", "Test").Run()
+
+	secondBeadsDir := filepath.Join(secondDir, ".beads")
+	if err := os.MkdirAll(secondBeadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir second beads dir: %v", err)
+	}
+	seedCfg := &configfile.Config{
+		Database:       "dolt",
+		Backend:        configfile.BackendDolt,
+		DoltMode:       configfile.DoltModeServer,
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: 3307,
+		DoltDatabase:   database,
+		ProjectID:      "stale-project-id",
+	}
+	if err := seedCfg.Save(secondBeadsDir); err != nil {
+		t.Fatalf("seed metadata.json: %v", err)
+	}
+
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "1")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "127.0.0.1")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", fmt.Sprintf("%d", testDoltServerPort))
+
+	rootCmd.SetArgs([]string{
+		"init",
+		"--server",
+		"--database", database,
+		"--prefix", "second",
+		"--quiet",
+		"--skip-hooks",
+		"--skip-agents",
+	})
+
+	if err := rootCmd.Execute(); err != nil {
+		t.Fatalf("second init failed: %v", err)
+	}
+
+	loaded, err := configfile.Load(secondBeadsDir)
+	if err != nil {
+		t.Fatalf("load metadata.json: %v", err)
+	}
+	if loaded.ProjectID != knownProjectID {
+		t.Errorf("ProjectID = %q, want %q (should adopt authoritative DB identity over inherited metadata)", loaded.ProjectID, knownProjectID)
+	}
+	if loaded.DoltServerPort != 0 {
+		t.Errorf("DoltServerPort = %d, want 0 (should clear inherited explicit port unless re-specified)", loaded.DoltServerPort)
 	}
 }

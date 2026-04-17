@@ -23,6 +23,7 @@ import (
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/hooks"
 	"github.com/steveyegge/beads/internal/molecules"
@@ -58,6 +59,7 @@ var (
 )
 var (
 	sandboxMode     bool
+	globalFlag      bool               // Use the global shared-server database (beads_global)
 	serverMode      bool               // True when using external dolt sql-server (dolt_mode=server)
 	readonlyMode    bool               // Read-only mode: block write operations (for worker sandboxes)
 	storeIsReadOnly bool               // Track if store was opened read-only (for staleness checks)
@@ -184,7 +186,8 @@ func loadServerModeFromConfig() {
 	if beadsDir == "" {
 		return
 	}
-	cfg, err := configfile.Load(beadsDir)
+	preserveRedirectSourceDatabase(beadsDir)
+	cfg, err := loadWorkspaceConfig(beadsDir)
 	if err != nil || cfg == nil {
 		return
 	}
@@ -200,23 +203,59 @@ func loadServerModeFromConfig() {
 	}
 }
 
-func preserveRedirectSourceDatabase(beadsDir string) {
+var clearRedirectSourceDatabaseOverride func()
+
+func redirectSourceDatabaseOverride(beadsDir string) string {
 	if beadsDir == "" || os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" {
-		return
+		return ""
 	}
 
 	rInfo := beads.ResolveRedirect(beadsDir)
-	if rInfo.WasRedirected && rInfo.SourceDatabase != "" {
-		_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", rInfo.SourceDatabase)
+	if !rInfo.WasRedirected || rInfo.SourceDatabase == "" {
+		return ""
+	}
+	return rInfo.SourceDatabase
+}
+
+func installRedirectSourceDatabaseOverride(cmd *cobra.Command) {
+	if clearRedirectSourceDatabaseOverride != nil {
+		clearRedirectSourceDatabaseOverride()
+		clearRedirectSourceDatabaseOverride = nil
+	}
+
+	if database := redirectSourceDatabaseOverride(beads.GetRedirectInfo().LocalDir); database != "" {
+		clearRedirectSourceDatabaseOverride = doltdboverride.Push(database)
 		if os.Getenv("BD_DEBUG_ROUTING") != "" {
-			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", rInfo.SourceDatabase)
+			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", database)
+		}
+		return
+	}
+
+	if cmd == nil || !isSelectedNoDBCommand(cmd) {
+		return
+	}
+
+	if database := redirectSourceDatabaseOverride(selectedNoDBBeadsDirFor(cmd)); database != "" {
+		clearRedirectSourceDatabaseOverride = doltdboverride.Push(database)
+		if os.Getenv("BD_DEBUG_ROUTING") != "" {
+			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", database)
 		}
 	}
 }
 
-func selectedNoDBBeadsDir() string {
+func preserveRedirectSourceDatabase(beadsDir string) {
+	before := os.Getenv("BEADS_DOLT_SERVER_DATABASE")
+	beads.PreserveRedirectSourceDatabase(beadsDir)
+	if os.Getenv("BD_DEBUG_ROUTING") != "" && before == "" {
+		if after := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); after != "" {
+			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", after)
+		}
+	}
+}
+
+func selectedNoDBBeadsDirFor(cmd *cobra.Command) string {
 	selectedDBPath := ""
-	if rootCmd.PersistentFlags().Changed("db") && dbPath != "" {
+	if cmd != nil && cmd.Root() != nil && cmd.Root().PersistentFlags().Changed("db") && dbPath != "" {
 		selectedDBPath = dbPath
 	} else if envDB := os.Getenv("BEADS_DB"); envDB != "" {
 		selectedDBPath = envDB
@@ -231,6 +270,10 @@ func selectedNoDBBeadsDir() string {
 		}
 	}
 	return beads.FindBeadsDir()
+}
+
+func selectedNoDBBeadsDir() string {
+	return selectedNoDBBeadsDirFor(rootCmd)
 }
 
 func isSelectedNoDBCommand(cmd *cobra.Command) bool {
@@ -293,7 +336,6 @@ func prepareSelectedNoDBContext(beadsDir string) {
 	}
 	_ = os.Setenv("BEADS_DIR", beadsDir)
 	loadBeadsEnvFile(beadsDir)
-	preserveRedirectSourceDatabase(beadsDir)
 	if err := config.Initialize(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to reinitialize config for selected beads dir: %v\n", err)
 	}
@@ -398,6 +440,7 @@ func init() {
 	_ = rootCmd.PersistentFlags().MarkHidden("format") // Hidden alias for CLI ergonomics
 	rootCmd.PersistentFlags().BoolVar(&sandboxMode, "sandbox", false, "Sandbox mode: disables auto-sync")
 	rootCmd.PersistentFlags().BoolVar(&readonlyMode, "readonly", false, "Read-only mode: block write operations (for worker sandboxes)")
+	rootCmd.PersistentFlags().BoolVar(&globalFlag, "global", false, "Use the global shared-server database (beads_global)")
 	rootCmd.PersistentFlags().StringVar(&doltAutoCommit, "dolt-auto-commit", "", "Dolt auto-commit policy (off|on|batch). 'on': commit after each write. 'batch': defer commits to bd dolt commit; uncommitted changes persist in the working set until then. SIGTERM/SIGHUP flush pending batch commits. Default: off. Override via config key dolt.auto-commit")
 	rootCmd.PersistentFlags().BoolVar(&profileEnabled, "profile", false, "Generate CPU profile for performance analysis")
 	rootCmd.PersistentFlags().BoolVarP(&verboseFlag, "verbose", "v", false, "Enable verbose/debug output")
@@ -437,6 +480,8 @@ var rootCmd = &cobra.Command{
 		_ = cmd.Help() // Help() always returns nil for cobra commands
 	},
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		installRedirectSourceDatabaseOverride(cmd)
+
 		// Initialize CommandContext to hold runtime state (replaces scattered globals)
 		initCommandContext()
 
@@ -526,9 +571,10 @@ var rootCmd = &cobra.Command{
 				WasSet bool
 			}{actor, true}
 		}
-		if !cmd.Root().PersistentFlags().Changed("dolt-auto-commit") && strings.TrimSpace(doltAutoCommit) == "" {
+		doltAutoCommitFlagSet := cmd.Root().PersistentFlags().Changed("dolt-auto-commit")
+		if !doltAutoCommitFlagSet && strings.TrimSpace(doltAutoCommit) == "" {
 			doltAutoCommit = config.GetString("dolt.auto-commit")
-		} else if cmd.Root().PersistentFlags().Changed("dolt-auto-commit") {
+		} else if doltAutoCommitFlagSet {
 			flagOverrides["dolt-auto-commit"] = struct {
 				Value  interface{}
 				WasSet bool
@@ -648,12 +694,6 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		// Capture redirect info BEFORE FindDatabasePath() follows the redirect.
-		// When .beads/redirect points to a shared directory with a different
-		// dolt_database, the source's database name would be lost. Capture it
-		// early and set BEADS_DOLT_SERVER_DATABASE so all store opens use it.
-		preserveRedirectSourceDatabase(beads.GetRedirectInfo().LocalDir)
-
 		// Initialize database path
 		if dbPath == "" {
 			// Use public API to find database (same logic as extensions)
@@ -714,7 +754,6 @@ var rootCmd = &cobra.Command{
 		// and closes BEFORE the main store is opened. This ensures bd doctor and
 		// read-only commands see the correct version after a CLI upgrade.
 		beadsDir := resolveCommandBeadsDir(dbPath)
-
 		autoMigrateOnVersionBump(beadsDir)
 
 		// Initialize direct storage access
@@ -724,14 +763,17 @@ var rootCmd = &cobra.Command{
 		// on a different filesystem (e.g., ext4 for performance on WSL).
 		doltPath := doltserver.ResolveDoltDir(beadsDir)
 		doltCfg := &dolt.Config{
-			ReadOnly: useReadOnly,
-			BeadsDir: beadsDir,
+			ReadOnly:       useReadOnly,
+			BeadsDir:       beadsDir,
+			CommitterName:  getActorWithGit(),
+			CommitterEmail: getOwner(),
 		}
 
 		// Load config to get database name and server connection settings
-		cfg, cfgErr := configfile.Load(beadsDir)
+		preserveRedirectSourceDatabase(beadsDir)
+		cfg, cfgErr := loadWorkspaceConfig(beadsDir)
 		if cfgErr != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to load beads config from %s: %v\n", beadsDir, cfgErr)
+			FatalError("failed to load beads config from %s: %v", beadsDir, cfgErr)
 		}
 		if cfg != nil {
 			doltCfg.ServerMode = cfg.IsDoltServerMode()
@@ -766,6 +808,15 @@ var rootCmd = &cobra.Command{
 		}
 		doltCfg.SyncRemote = resolveSyncRemote()
 
+		// --global flag: switch to the global shared-server database.
+		// Must be in shared-server mode; errors otherwise.
+		if globalFlag {
+			if !doltserver.IsSharedServerMode() {
+				FatalError("--global requires shared-server mode (set BEADS_DOLT_SHARED_SERVER=1 or dolt.shared-server: true in config.yaml)")
+			}
+			doltCfg.Database = doltserver.GlobalDatabaseName
+		}
+
 		// Keep standalone CLI auto-start behavior centralized so doctor and
 		// other helper paths stay in lockstep with the main command path.
 		dolt.ApplyCLIAutoStart(beadsDir, doltCfg)
@@ -773,7 +824,7 @@ var rootCmd = &cobra.Command{
 		// Server mode defaults auto-commit to OFF because the server handles
 		// commits via its own transaction lifecycle; firing DOLT_COMMIT after
 		// every write under concurrent load causes 'database is read only' errors.
-		if strings.TrimSpace(doltAutoCommit) == "" {
+		if !doltAutoCommitFlagSet {
 			doltAutoCommit = string(doltAutoCommitOff)
 		}
 
@@ -809,13 +860,15 @@ var rootCmd = &cobra.Command{
 		// Skip auto-import when the user is explicitly running "bd import" —
 		// the import command handles JSONL files itself and auto-importing
 		// first would interfere (double-import / upsert confusion).
-		if store != nil && !useReadOnly && cmd.Name() != "import" {
+		if store != nil && !useReadOnly && !globalFlag && cmd.Name() != "import" {
 			maybeAutoImportJSONL(rootCtx, store, beadsDir)
 		}
 
 		// Validate workspace identity for write commands (GH#2438, GH#2372)
-		// Skip for read-only commands since they can't corrupt data
-		if !useReadOnly && os.Getenv("BEADS_SKIP_IDENTITY_CHECK") != "1" {
+		// Skip for read-only commands since they can't corrupt data.
+		// Skip for --global: the global database uses a sentinel project ID
+		// that won't match any project's metadata.json.
+		if !useReadOnly && !globalFlag && os.Getenv("BEADS_SKIP_IDENTITY_CHECK") != "1" {
 			validateWorkspaceIdentity(rootCtx, beadsDir)
 		}
 
@@ -858,6 +911,11 @@ var rootCmd = &cobra.Command{
 		// after successful command execution, not in PreRun
 	},
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
+		if clearRedirectSourceDatabaseOverride != nil {
+			clearRedirectSourceDatabaseOverride()
+			clearRedirectSourceDatabaseOverride = nil
+		}
+
 		// Dolt auto-commit: after a successful write command (and after final flush),
 		// create a Dolt commit so changes don't remain only in the working set.
 		if commandDidWrite.Load() && !commandDidExplicitDoltCommit {
@@ -877,7 +935,7 @@ var rootCmd = &cobra.Command{
 				for tipID := range commandTipIDsShown {
 					key := fmt.Sprintf("tip_%s_last_shown", tipID)
 					value := time.Now().Format(time.RFC3339)
-					if err := store.SetMetadata(rootCtx, key, value); err != nil {
+					if err := store.SetLocalMetadata(rootCtx, key, value); err != nil {
 						FatalError("dolt tip auto-commit failed: %v", err)
 					}
 				}

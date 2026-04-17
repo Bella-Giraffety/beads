@@ -39,11 +39,6 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Install ICU4C
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libicu-dev
-
       - name: Configure Git
         run: |
           git config --global user.name "CI Bot"
@@ -56,7 +51,7 @@ jobs:
           key: smoke-binaries-${{ matrix.prev_version }}-${{ runner.os }}
 
       - name: Build candidate binary
-        run: go build -o /tmp/bd-candidate ./cmd/bd
+        run: go build -tags gms_pure_go -o /tmp/bd-candidate ./cmd/bd
 
       - name: Run upgrade smoke tests
         env:

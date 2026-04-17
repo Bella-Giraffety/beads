@@ -175,6 +175,98 @@ func TestSharedServerConcurrent(t *testing.T) {
 	t.Logf("total: %s", time.Since(testStart))
 }
 
+// TestSharedServerMultiProjectIsolation verifies that two repositories sharing
+// one Dolt SQL server keep their issue spaces isolated by database.
+func TestSharedServerMultiProjectIsolation(t *testing.T) {
+	if os.Getenv("BEADS_TEST_SHARED_SERVER") == "" {
+		t.Skip("skipping: set BEADS_TEST_SHARED_SERVER=1 to run")
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("not supported on Windows")
+	}
+
+	bdBinary := buildSharedServerTestBinary(t)
+	cp, err := testutil.NewContainerProvider()
+	if err != nil {
+		t.Skipf("cannot start Dolt container: %v", err)
+	}
+	defer func() { _ = cp.Stop() }()
+
+	sharedDir := t.TempDir()
+	if err := cp.WritePortFile(sharedDir); err != nil {
+		t.Fatalf("write port file: %v", err)
+	}
+
+	baseEnv := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + t.TempDir(),
+		"GOPATH=" + os.Getenv("GOPATH"),
+		"GOROOT=" + os.Getenv("GOROOT"),
+		"BEADS_SHARED_SERVER_DIR=" + sharedDir,
+		"BEADS_DOLT_SHARED_SERVER=1",
+		"BEADS_DOLT_SERVER_PORT=" + strconv.Itoa(cp.Port()),
+		"BEADS_DOLT_AUTO_START=0",
+		"BEADS_TEST_MODE=1",
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=",
+		"SSH_ASKPASS=",
+		"GT_ROOT=",
+	}
+
+	ctx := context.Background()
+	repoADir := filepath.Join(t.TempDir(), "repo-a")
+	repoBDir := filepath.Join(t.TempDir(), "repo-b")
+	for _, tc := range []struct {
+		dir    string
+		prefix string
+	}{
+		{dir: repoADir, prefix: "alpha"},
+		{dir: repoBDir, prefix: "beta"},
+	} {
+		if err := os.MkdirAll(tc.dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", tc.dir, err)
+		}
+		if err := gitInit(ctx, tc.dir); err != nil {
+			t.Fatalf("git init %s: %v", tc.dir, err)
+		}
+		if out, err := ssExec(ctx, bdBinary, tc.dir, baseEnv,
+			"init", "--shared-server", "--external", "--prefix", tc.prefix, "--quiet", "--non-interactive"); err != nil {
+			t.Fatalf("init %s: %s: %v", tc.prefix, out, err)
+		}
+	}
+
+	clientA := &bdClient{tag: "alpha", binary: bdBinary, dir: repoADir, env: baseEnv, ctx: ctx, t: t}
+	clientB := &bdClient{tag: "beta", binary: bdBinary, dir: repoBDir, env: baseEnv, ctx: ctx, t: t}
+
+	idA, err := clientA.create("only alpha issue", "--type", "task")
+	if err != nil {
+		t.Fatalf("create alpha issue: %v", err)
+	}
+	idB, err := clientB.create("only beta issue", "--type", "task")
+	if err != nil {
+		t.Fatalf("create beta issue: %v", err)
+	}
+
+	issuesA, err := clientA.list("--all", "--limit", "20")
+	if err != nil {
+		t.Fatalf("list alpha issues: %v", err)
+	}
+	issuesB, err := clientB.list("--all", "--limit", "20")
+	if err != nil {
+		t.Fatalf("list beta issues: %v", err)
+	}
+
+	assertListContainsOnlyTitle(t, issuesA, "only alpha issue", "only beta issue")
+	assertListContainsOnlyTitle(t, issuesB, "only beta issue", "only alpha issue")
+
+	if _, err := clientA.show(idB); err == nil {
+		t.Fatalf("alpha repo unexpectedly resolved beta issue %s", idB)
+	}
+	if _, err := clientB.show(idA); err == nil {
+		t.Fatalf("beta repo unexpectedly resolved alpha issue %s", idA)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // bdClient — wraps a bd subprocess invocation for one client
 // ---------------------------------------------------------------------------
@@ -515,6 +607,27 @@ func checkLabels(issue map[string]any, required ...string) error {
 	return nil
 }
 
+func assertListContainsOnlyTitle(t *testing.T, issues []any, wantPresent, wantAbsent string) {
+	t.Helper()
+	var foundPresent bool
+	for _, raw := range issues {
+		issue, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		title, _ := issue["title"].(string)
+		if title == wantPresent {
+			foundPresent = true
+		}
+		if title == wantAbsent {
+			t.Fatalf("unexpected title %q in list result", wantAbsent)
+		}
+	}
+	if !foundPresent {
+		t.Fatalf("expected title %q in list result", wantPresent)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Subprocess + JSON helpers
 // ---------------------------------------------------------------------------
@@ -619,7 +732,7 @@ func buildSharedServerTestBinary(t *testing.T) string {
 			return
 		}
 		bdBin := filepath.Join(buildDir, "bd")
-		cmd := exec.Command("go", "build", "-o", bdBin, ".")
+		cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", bdBin, ".")
 		cmd.Dir = pkgDir
 		cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
 		out, err := cmd.CombinedOutput()

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,7 +12,32 @@ import (
 	"testing"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 )
+
+type stubBootstrapMetadataStore struct {
+	metadata map[string]string
+	writes   map[string]string
+}
+
+func (s *stubBootstrapMetadataStore) GetMetadata(_ context.Context, key string) (string, error) {
+	if s.metadata == nil {
+		return "", fmt.Errorf("missing")
+	}
+	return s.metadata[key], nil
+}
+
+func (s *stubBootstrapMetadataStore) SetMetadata(_ context.Context, key, value string) error {
+	if s.metadata == nil {
+		s.metadata = make(map[string]string)
+	}
+	if s.writes == nil {
+		s.writes = make(map[string]string)
+	}
+	s.metadata[key] = value
+	s.writes[key] = value
+	return nil
+}
 
 func TestDetectBootstrapAction_NoneWhenDatabaseExists(t *testing.T) {
 	t.Setenv("BEADS_DOLT_DATA_DIR", "")
@@ -50,6 +76,73 @@ func TestDetectBootstrapAction_NoneWhenDatabaseExists(t *testing.T) {
 	}
 	if !plan.HasExisting {
 		t.Error("HasExisting = false, want true")
+	}
+}
+
+func TestBootstrapStoreConfig_ServerModeUsesResolvedSettings(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "dolt-server.port"), []byte("3311"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BEADS_ACTOR", "bootstrap-bot")
+	t.Setenv("GIT_AUTHOR_EMAIL", "bootstrap@example.com")
+
+	cfg := configfile.DefaultConfig()
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltDatabase = "beads_meta"
+
+	doltCfg := bootstrapStoreConfig(beadsDir, cfg, cfg.GetDoltDatabase())
+	if !doltCfg.ServerMode {
+		t.Fatal("ServerMode = false, want true")
+	}
+	if doltCfg.ServerPort != 3311 {
+		t.Fatalf("ServerPort = %d, want 3311", doltCfg.ServerPort)
+	}
+	if doltCfg.CommitterName != "bootstrap-bot" {
+		t.Fatalf("CommitterName = %q, want %q", doltCfg.CommitterName, "bootstrap-bot")
+	}
+	if doltCfg.CommitterEmail != "bootstrap@example.com" {
+		t.Fatalf("CommitterEmail = %q, want %q", doltCfg.CommitterEmail, "bootstrap@example.com")
+	}
+}
+
+func TestBootstrapProjectIdentityAdoptsExistingDatabaseIdentity(t *testing.T) {
+	store := &stubBootstrapMetadataStore{metadata: map[string]string{"_project_id": "db-project"}}
+	cfg := configfile.DefaultConfig()
+	cfg.ProjectID = "local-project"
+
+	if err := bootstrapProjectIdentity(context.Background(), store, cfg); err != nil {
+		t.Fatalf("bootstrapProjectIdentity failed: %v", err)
+	}
+	if cfg.ProjectID != "db-project" {
+		t.Fatalf("ProjectID = %q, want %q", cfg.ProjectID, "db-project")
+	}
+	if len(store.writes) != 0 {
+		t.Fatalf("unexpected metadata writes: %#v", store.writes)
+	}
+}
+
+func TestBootstrapProjectIdentityWritesGeneratedIdentityWhenMissing(t *testing.T) {
+	store := &stubBootstrapMetadataStore{metadata: map[string]string{}}
+	cfg := configfile.DefaultConfig()
+
+	if err := bootstrapProjectIdentity(context.Background(), store, cfg); err != nil {
+		t.Fatalf("bootstrapProjectIdentity failed: %v", err)
+	}
+	if cfg.ProjectID == "" {
+		t.Fatal("ProjectID was not generated")
+	}
+	if got := store.writes["_project_id"]; got != cfg.ProjectID {
+		t.Fatalf("_project_id write = %q, want %q", got, cfg.ProjectID)
 	}
 }
 
@@ -184,6 +277,36 @@ func TestDetectBootstrapAction_ServerModeMissingConfiguredDBDoesNotReturnNone(t 
 	}
 	if plan.Action != "init" {
 		t.Fatalf("expected init fallback when no remote/backup/jsonl exists, got %q", plan.Action)
+	}
+}
+
+func TestDetectBootstrapAction_UsesScopedSourceDatabaseOverride(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	sharedDir := filepath.Join(tmpDir, "shared-dolt")
+	if err := os.MkdirAll(filepath.Join(sharedDir, "shared_db"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sharedDir, "dolt-server.port"), []byte("3312"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := configfile.DefaultConfig()
+	cfg.DoltMode = configfile.DoltModeServer
+	cfg.DoltDatabase = "shared_db"
+	cfg.DoltDataDir = sharedDir
+
+	restore := doltdboverride.Push("source_db")
+	defer restore()
+
+	plan := detectBootstrapAction(beadsDir, cfg)
+	if plan.Database != "source_db" {
+		t.Fatalf("plan.Database = %q, want %q", plan.Database, "source_db")
 	}
 }
 
@@ -943,5 +1066,351 @@ func TestDetectBootstrapAction_SharedServerEnvUsesSharedPath(t *testing.T) {
 	}
 	if !plan.HasExisting {
 		t.Error("HasExisting = false, want true")
+	}
+}
+
+// TestFinalizeSyncedBootstrapWritesConfigFiles verifies that after a sync
+// clone, finalizeSyncedBootstrap writes the metadata.json and config.yaml
+// files bd needs to reopen the cloned database. This is the regression
+// guard for GH#3201: executeSyncAction previously left the workspace
+// without these files, causing "no beads configuration found" and
+// "Error 1105: no database selected" on every subsequent bd command.
+func TestFinalizeSyncedBootstrapWritesConfigFiles(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a post-clone workspace: cloneFromRemote created the
+	// embeddeddolt directory but no metadata.json / config.yaml exists.
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Point findProjectConfigYaml at the test workspace instead of walking
+	// up from CWD, so the sync.remote write lands in the right file even
+	// when the test runs from an unrelated directory.
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	const dbName = "beads_hq"
+	const syncRemote = "file:///tmp/fake-origin.git"
+
+	cfg := configfile.DefaultConfig()
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, syncRemote, cfg, dbName); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	// metadata.json must exist and record the database name bd needs to
+	// reopen the cloned data. Without this, GetDoltDatabase() falls back to
+	// DefaultDoltDatabase ("beads") and the cloned DB is unreachable.
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load after finalize failed: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("configfile.Load returned nil; metadata.json was not written")
+	}
+	if loaded.GetDoltDatabase() != dbName {
+		t.Errorf("dolt_database = %q, want %q", loaded.GetDoltDatabase(), dbName)
+	}
+	if loaded.Database != "dolt" {
+		t.Errorf("database = %q, want %q", loaded.Database, "dolt")
+	}
+	if loaded.GetDoltMode() != configfile.DoltModeEmbedded {
+		t.Errorf("dolt_mode = %q, want %q", loaded.GetDoltMode(), configfile.DoltModeEmbedded)
+	}
+	if loaded.GetBackend() != configfile.BackendDolt {
+		t.Errorf("backend = %q, want %q", loaded.GetBackend(), configfile.BackendDolt)
+	}
+
+	// config.yaml must exist so GetYamlConfig / SetYamlConfig and other
+	// yaml-backed settings (sync.remote, dolt.shared-server, etc.) work.
+	configYamlPath := filepath.Join(beadsDir, "config.yaml")
+	yamlBytes, err := os.ReadFile(configYamlPath)
+	if err != nil {
+		t.Fatalf("config.yaml missing after finalize: %v", err)
+	}
+	yaml := string(yamlBytes)
+
+	// sync.remote must be persisted so subsequent fresh clones (and
+	// bootstrap retries) can rediscover the remote without re-probing
+	// origin refs.
+	if !strings.Contains(yaml, "sync.remote: ") && !strings.Contains(yaml, "sync-remote: ") {
+		t.Errorf("config.yaml does not contain sync.remote entry:\n%s", yaml)
+	}
+	if !strings.Contains(yaml, syncRemote) {
+		t.Errorf("config.yaml does not contain sync remote URL %q:\n%s", syncRemote, yaml)
+	}
+}
+
+// TestFinalizeSyncedBootstrapPreservesClonedMetadata verifies that bootstrap
+// recovery keeps the important metadata fields that arrived with the clone
+// while still rebinding the workspace to the canonical Dolt directory.
+func TestFinalizeSyncedBootstrapPreservesClonedMetadata(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	cfg := &configfile.Config{
+		Database:       configfile.DefaultConfig().Database,
+		DoltServerHost: "10.0.0.9",
+		DoltServerPort: 3312,
+		DoltServerUser: "clone-user",
+		DoltServerTLS:  true,
+		ProjectID:      "proj-cloned-123",
+		Backend:        configfile.BackendDolt,
+	}
+
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/fake-origin.git", cfg, "clone_db"); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load after finalize failed: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("configfile.Load returned nil")
+	}
+
+	if loaded.Database != "dolt" {
+		t.Fatalf("database = %q, want %q", loaded.Database, "dolt")
+	}
+	if loaded.GetDoltDatabase() != "clone_db" {
+		t.Fatalf("dolt_database = %q, want %q", loaded.GetDoltDatabase(), "clone_db")
+	}
+	if loaded.DoltServerHost != "10.0.0.9" {
+		t.Fatalf("dolt_server_host = %q, want %q", loaded.DoltServerHost, "10.0.0.9")
+	}
+	if loaded.DoltServerPort != 0 {
+		t.Fatalf("dolt_server_port = %d, want %d", loaded.DoltServerPort, 0)
+	}
+	if loaded.DoltServerUser != "clone-user" {
+		t.Fatalf("dolt_server_user = %q, want %q", loaded.DoltServerUser, "clone-user")
+	}
+	if !loaded.DoltServerTLS {
+		t.Fatal("expected dolt_server_tls to be preserved")
+	}
+	if loaded.ProjectID != "" {
+		t.Fatalf("project_id = %q, want empty until the cloned DB is reopened", loaded.ProjectID)
+	}
+}
+
+// TestFinalizeSyncedBootstrapIsIdempotent verifies that re-running the
+// finalize step over an already-finalized workspace is a no-op — the
+// clone retry path relies on this.
+func TestFinalizeSyncedBootstrapIsIdempotent(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	cfg := configfile.DefaultConfig()
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
+		t.Fatalf("first finalize failed: %v", err)
+	}
+
+	firstYaml, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config.yaml after first finalize: %v", err)
+	}
+
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
+		t.Fatalf("second finalize failed: %v", err)
+	}
+
+	secondYaml, err := os.ReadFile(filepath.Join(beadsDir, "config.yaml"))
+	if err != nil {
+		t.Fatalf("read config.yaml after second finalize: %v", err)
+	}
+
+	// createConfigYaml skips existing files, so the template portion must
+	// be unchanged. SetYamlConfig rewrites in place but should produce the
+	// same output for the same value.
+	if string(firstYaml) != string(secondYaml) {
+		t.Errorf("config.yaml changed on second finalize.\nfirst:\n%s\nsecond:\n%s", firstYaml, secondYaml)
+	}
+
+	// metadata.json must still load cleanly.
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil || loaded == nil {
+		t.Fatalf("metadata.json missing after second finalize: %v", err)
+	}
+	if loaded.GetDoltDatabase() != "beads_hq" {
+		t.Errorf("dolt_database drifted: got %q, want %q", loaded.GetDoltDatabase(), "beads_hq")
+	}
+}
+
+func TestFinalizeSyncedBootstrapClearsInheritedIdentityAndPort(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "embeddeddolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	cfg := configfile.DefaultConfig()
+	cfg.ProjectID = "stale-project-id"
+	cfg.DoltServerPort = 3307
+
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/a.git", cfg, "beads_hq"); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil || loaded == nil {
+		t.Fatalf("metadata.json missing after finalize: %v", err)
+	}
+	if loaded.ProjectID != "" {
+		t.Errorf("ProjectID = %q, want empty while waiting for authoritative DB identity", loaded.ProjectID)
+	}
+	if loaded.DoltServerPort != 0 {
+		t.Errorf("DoltServerPort = %d, want 0 after clearing inherited explicit port", loaded.DoltServerPort)
+	}
+}
+
+func TestLoadWorkspaceConfig_FallsBackToParentWorkspaceMetadata(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workspaceBeads := filepath.Join(workspaceRoot, ".beads")
+	if err := os.MkdirAll(workspaceBeads, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	parentCfg := &configfile.Config{
+		Database:       "dolt",
+		Backend:        configfile.BackendDolt,
+		DoltMode:       configfile.DoltModeServer,
+		DoltDatabase:   "my_rig",
+		DoltServerHost: "127.0.0.1",
+		ProjectID:      "workspace-project-id",
+	}
+	if err := parentCfg.Save(workspaceBeads); err != nil {
+		t.Fatalf("save parent metadata.json: %v", err)
+	}
+
+	rigBeads := filepath.Join(workspaceRoot, "rig", "nested", ".beads")
+	if err := os.MkdirAll(rigBeads, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadWorkspaceConfig(rigBeads)
+	if err != nil {
+		t.Fatalf("loadWorkspaceConfig: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("loadWorkspaceConfig returned nil")
+	}
+	if loaded.GetDoltDatabase() != "my_rig" {
+		t.Fatalf("GetDoltDatabase() = %q, want %q", loaded.GetDoltDatabase(), "my_rig")
+	}
+	if loaded.ProjectID != "workspace-project-id" {
+		t.Fatalf("ProjectID = %q, want %q", loaded.ProjectID, "workspace-project-id")
+	}
+}
+
+func TestFinalizeSyncedBootstrapSharedServerWritesGlobalDatabase(t *testing.T) {
+	t.Setenv("BEADS_DOLT_DATA_DIR", "")
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_MODE", "")
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	if err := finalizeSyncedBootstrap(context.Background(), beadsDir, "file:///tmp/shared.git", configfile.DefaultConfig(), "beads_obsidian"); err != nil {
+		t.Fatalf("finalizeSyncedBootstrap failed: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("configfile.Load returned nil")
+	}
+	if loaded.GetDoltMode() != configfile.DoltModeServer {
+		t.Fatalf("dolt_mode = %q, want %q", loaded.GetDoltMode(), configfile.DoltModeServer)
+	}
+	if loaded.GetGlobalDoltDatabase() != "beads_global" {
+		t.Fatalf("GlobalDoltDatabase = %q, want %q", loaded.GetGlobalDoltDatabase(), "beads_global")
+	}
+}
+
+func TestSyncProjectIDToBeadsDirUpdatesMetadata(t *testing.T) {
+	if testDoltServerPort == 0 {
+		t.Skip("Dolt test server not available")
+	}
+
+	ensureTestMode(t)
+
+	repoDir := t.TempDir()
+	dbPath := filepath.Join(repoDir, ".beads", "dolt")
+	store := newTestStoreWithPrefix(t, dbPath, "sync")
+
+	ctx := context.Background()
+	const dbProjectID = "project-id-from-db"
+	if err := store.SetMetadata(ctx, "_project_id", dbProjectID); err != nil {
+		t.Fatalf("SetMetadata(_project_id): %v", err)
+	}
+
+	beadsDir := filepath.Dir(dbPath)
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load before sync: %v", err)
+	}
+	cfg.ProjectID = "stale-project-id"
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("save stale metadata.json: %v", err)
+	}
+
+	if err := syncProjectIDToBeadsDir(ctx, beadsDir, store); err != nil {
+		t.Fatalf("syncProjectIDToBeadsDir: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load after sync: %v", err)
+	}
+	if loaded.ProjectID != dbProjectID {
+		t.Fatalf("ProjectID = %q, want %q", loaded.ProjectID, dbProjectID)
 	}
 }

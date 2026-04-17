@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net"
+	"net/mail"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,6 +39,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 	"github.com/steveyegge/beads/internal/doltserver"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/doltutil"
@@ -175,6 +177,7 @@ type DoltStore struct {
 	blockedIDsCached             bool // true once blockedIDsCache has been populated
 	blockedIDsCacheIncludesWisps bool // true if cache was computed with wisps
 	cacheMu                      sync.Mutex
+	ignoredTableRepairMu         sync.Mutex
 
 	// OTel span attribute cache (avoids per-call allocation)
 	spanAttrsOnce  sync.Once
@@ -819,6 +822,8 @@ func applyConfigDefaults(cfg *Config) {
 		// must be consulted even when no config file was loaded.
 		if d := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); d != "" {
 			cfg.Database = d
+		} else if d := doltdboverride.Current(); d != "" {
+			cfg.Database = d
 		} else if os.Getenv("BEADS_TEST_MODE") == "1" && cfg.Path != "" {
 			// Test mode: derive unique database name from path for isolation.
 			// Each test creates a unique temp directory, so hashing the path
@@ -833,16 +838,11 @@ func applyConfigDefaults(cfg *Config) {
 	}
 	if cfg.CommitterName == "" {
 		cfg.CommitterName = os.Getenv("GIT_AUTHOR_NAME")
-		if cfg.CommitterName == "" {
-			cfg.CommitterName = "beads"
-		}
 	}
 	if cfg.CommitterEmail == "" {
 		cfg.CommitterEmail = os.Getenv("GIT_AUTHOR_EMAIL")
-		if cfg.CommitterEmail == "" {
-			cfg.CommitterEmail = "beads@local"
-		}
 	}
+	cfg.CommitterName, cfg.CommitterEmail = normalizeCommitterIdentity(cfg.CommitterName, cfg.CommitterEmail)
 	if cfg.Remote == "" {
 		cfg.Remote = "origin"
 	}
@@ -914,6 +914,34 @@ func applyConfigDefaults(cfg *Config) {
 	if cfg.RemotePassword == "" {
 		cfg.RemotePassword = os.Getenv("DOLT_REMOTE_PASSWORD")
 	}
+}
+
+func normalizeCommitterIdentity(name, email string) (string, string) {
+	name = strings.TrimSpace(name)
+	email = strings.TrimSpace(email)
+
+	if email == "" && name != "" {
+		if addr, err := mail.ParseAddress(name); err == nil && addr.Address != "" {
+			email = strings.TrimSpace(addr.Address)
+			if parsedName := strings.TrimSpace(addr.Name); parsedName != "" {
+				name = parsedName
+			}
+		}
+	}
+
+	if name == "" {
+		name = "beads"
+	}
+	if email == "" {
+		email = "beads@local"
+	}
+
+	return name, email
+}
+
+func formatCommitAuthor(name, email string) string {
+	name, email = normalizeCommitterIdentity(name, email)
+	return fmt.Sprintf("%s <%s>", name, email)
 }
 
 // New creates a new Dolt storage backend.
@@ -1071,11 +1099,26 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		autoStartedServerDir: autoStartedDir,
 	}
 
+	// Ensure dolt_ignore'd tables exist before queries or migrations touch
+	// wisp/local metadata state. Fresh clones and new branch working sets can be
+	// missing these tables, and the first command is often read-only.
+	if err := versioncontrolops.EnsureIgnoredTables(ctx, db); err != nil {
+		return nil, fmt.Errorf("failed to ensure ignored tables: %w", err)
+	}
+
 	// Schema initialization for server mode (idempotent).
 	// Short retry for Dolt "no root value found in session" race: after
 	// CREATE DATABASE, information_schema queries may fail transiently
 	// even though Ping succeeded. This resolves within ~1s.
 	if !cfg.ReadOnly {
+		// Ensure dolt_ignore'd tables exist BEFORE running migrations.
+		// Migrations may reference these tables (e.g. 0027 alters wisps,
+		// 0030 inserts into local_metadata). After a clone or server restart
+		// these tables don't exist yet since they're not in committed data.
+		if err := versioncontrolops.EnsureIgnoredTables(ctx, db); err != nil {
+			return nil, fmt.Errorf("failed to ensure ignored tables: %w", err)
+		}
+
 		schemaBO := backoff.NewExponentialBackOff()
 		schemaBO.InitialInterval = 100 * time.Millisecond
 		schemaBO.MaxElapsedTime = 5 * time.Second
@@ -1090,13 +1133,6 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 			return nil
 		}, backoff.WithContext(schemaBO, ctx)); err != nil {
 			return nil, fmt.Errorf("failed to initialize schema: %w", err)
-		}
-
-		// Ensure dolt_ignore'd tables (wisps, wisp_*) exist in the working set.
-		// These tables are not persisted in commits, so they need recreation
-		// after a server restart. Short-circuits if they already exist (1 query).
-		if err := versioncontrolops.EnsureIgnoredTables(ctx, db); err != nil {
-			return nil, fmt.Errorf("failed to ensure ignored tables: %w", err)
 		}
 	}
 
@@ -1430,6 +1466,10 @@ func databaseExistsOnServer(ctx context.Context, db *sql.DB, name string) (bool,
 // backward-compat transforms. Uses the shared schema.MigrateUp runner which
 // tracks applied versions in the schema_migrations table.
 func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
+	return initSchemaOnDBWithAuthor(ctx, db, formatCommitAuthor("", ""))
+}
+
+func initSchemaOnDBWithAuthor(ctx context.Context, db *sql.DB, author string) error {
 	applied, err := schema.MigrateUp(ctx, db)
 	if err != nil {
 		return fmt.Errorf("schema migration: %w", err)
@@ -1442,7 +1482,7 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 			"issues", "dependencies", "labels", "comments", "events",
 			"config", "metadata", "child_counters",
 			"issue_snapshots", "compaction_snapshots",
-			"repo_mtimes", "routes", "issue_counter",
+			"routes", "issue_counter",
 			"interactions", "federation_peers",
 			"custom_statuses", "custom_types",
 			"dolt_ignore", "schema_migrations",
@@ -1450,7 +1490,7 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 		for _, table := range schemaTables {
 			_, _ = db.ExecContext(ctx, "CALL DOLT_ADD(?)", table)
 		}
-		if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-m', 'schema: apply migrations')"); err != nil {
+		if _, err := db.ExecContext(ctx, "CALL DOLT_COMMIT('-m', 'schema: apply migrations', '--author', ?)", author); err != nil {
 			if !strings.Contains(strings.ToLower(err.Error()), "nothing to commit") {
 				return fmt.Errorf("failed to commit schema migrations: %w", err)
 			}
@@ -1468,7 +1508,7 @@ func initSchemaOnDB(ctx context.Context, db *sql.DB) error {
 }
 
 func (s *DoltStore) initSchema(ctx context.Context) error {
-	return initSchemaOnDB(ctx, s.db)
+	return initSchemaOnDBWithAuthor(ctx, s.db, s.commitAuthorString())
 }
 
 // IsClosed returns true if the store has been closed.
@@ -1520,6 +1560,9 @@ func (s *DoltStore) Path() string {
 // Use this instead of Path() when running dolt CLI commands that target the
 // actual database (e.g., remote add/remove, push, pull).
 func (s *DoltStore) CLIDir() string {
+	if s.serverMode && doltserver.IsSharedServerMode() && s.beadsDir != "" {
+		return filepath.Join(doltserver.ResolveDoltDir(s.beadsDir), s.database)
+	}
 	if s.dbPath == "" {
 		return ""
 	}
@@ -1571,7 +1614,7 @@ func (s *DoltStore) UnderlyingDB() *sql.DB {
 // =============================================================================
 
 func (s *DoltStore) commitAuthorString() string {
-	return fmt.Sprintf("%s <%s>", s.committerName, s.committerEmail)
+	return formatCommitAuthor(s.committerName, s.committerEmail)
 }
 
 // Commit creates a Dolt commit with the given message.

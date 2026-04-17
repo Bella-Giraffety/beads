@@ -1388,6 +1388,108 @@ func TestFindDatabasePath_WorktreeRedirectOverride(t *testing.T) {
 	}
 }
 
+// TestFindBeadsDir_WorktreeRedirectOverrideFromPolecatSubdir verifies that the
+// redirect is still visible when the caller is inside a nested polecat path
+// under the worktree root, matching the rig/polecat/worktree layout used by
+// Gas Town worktrees.
+func TestFindBeadsDir_WorktreeRedirectOverrideFromPolecatSubdir(t *testing.T) {
+	originalEnv := os.Getenv("BEADS_DIR")
+	defer func() {
+		if originalEnv != "" {
+			os.Setenv("BEADS_DIR", originalEnv)
+		} else {
+			os.Unsetenv("BEADS_DIR")
+		}
+	}()
+	os.Unsetenv("BEADS_DIR")
+
+	tmpDir, err := os.MkdirTemp("", "beads-worktree-redirect-polecat-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	mainRepoDir := filepath.Join(tmpDir, "main-repo")
+	if err := os.MkdirAll(mainRepoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("git", "init")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+
+	for _, gitCfg := range [][]string{{"user.email", "test@example.com"}, {"user.name", "Test User"}} {
+		cmd = exec.Command("git", "config", gitCfg[0], gitCfg[1])
+		cmd.Dir = mainRepoDir
+		_ = cmd.Run()
+	}
+
+	mainBeadsDir := filepath.Join(mainRepoDir, ".beads")
+	if err := os.MkdirAll(mainBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainBeadsDir, "metadata.json"), []byte(`{"backend":"dolt","dolt_database":"main_db"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(mainRepoDir, "README.md"), []byte("# Test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "add", "-A")
+	cmd.Dir = mainRepoDir
+	_ = cmd.Run()
+	cmd = exec.Command("git", "commit", "-m", "Initial commit")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git commit failed: %v", err)
+	}
+
+	topicBeadsDir := filepath.Join(tmpDir, "topics", "focus-topic", ".beads")
+	if err := os.MkdirAll(topicBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(topicBeadsDir, "metadata.json"), []byte(`{"backend":"dolt","dolt_database":"topic_db"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	worktreeDir := filepath.Join(tmpDir, "worktree")
+	cmd = exec.Command("git", "worktree", "add", worktreeDir, "HEAD")
+	cmd.Dir = mainRepoDir
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git worktree add failed: %v", err)
+	}
+	defer func() {
+		cmd := exec.Command("git", "worktree", "remove", worktreeDir)
+		cmd.Dir = mainRepoDir
+		_ = cmd.Run()
+	}()
+
+	worktreeBeadsDir := filepath.Join(worktreeDir, ".beads")
+	if err := os.MkdirAll(worktreeBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	topicBeadsDirResolved, _ := filepath.EvalSymlinks(topicBeadsDir)
+	if err := os.WriteFile(filepath.Join(worktreeBeadsDir, "redirect"), []byte(topicBeadsDirResolved+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	polecatDir := filepath.Join(worktreeDir, "polecats", "jasper", "src")
+	if err := os.MkdirAll(polecatDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(polecatDir)
+	git.ResetCaches()
+
+	result := FindBeadsDir()
+	resultResolved, _ := filepath.EvalSymlinks(result)
+	if resultResolved != topicBeadsDirResolved {
+		t.Errorf("FindBeadsDir() = %q, want topic .beads %q from nested polecat dir", result, topicBeadsDirResolved)
+	}
+}
+
 // TestFindBeadsDir_SiblingWorktree tests that FindBeadsDir does not escape past
 // the worktree boundary when the worktree is a sibling of the main repo (not a
 // child). This is the regression test for GH#1653.
@@ -2064,6 +2166,48 @@ func TestResolveRedirect_SourceDatabaseAvailableForRouting(t *testing.T) {
 	}
 	if !info.WasRedirected {
 		t.Error("expected WasRedirected=true")
+	}
+}
+
+func TestLoadRedirectAwareConfig_PreservesSourceDatabase(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+
+	tmpDir := t.TempDir()
+	tmpDir, _ = filepath.EvalSymlinks(tmpDir)
+
+	sourceDir := filepath.Join(tmpDir, "rig", ".beads")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, sourceDir, &configfile.Config{
+		Database:     "beads.db",
+		DoltMode:     "server",
+		DoltDatabase: "rig_db",
+	})
+
+	targetDir := filepath.Join(tmpDir, "shared", ".beads")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeMetadataJSON(t, targetDir, &configfile.Config{
+		Database:     "beads.db",
+		DoltMode:     "server",
+		DoltDatabase: "shared_db",
+	})
+
+	if err := os.WriteFile(filepath.Join(sourceDir, "redirect"), []byte(targetDir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadRedirectAwareConfig(sourceDir)
+	if err != nil {
+		t.Fatalf("LoadRedirectAwareConfig() error = %v", err)
+	}
+	if got := cfg.GetDoltDatabase(); got != "rig_db" {
+		t.Fatalf("GetDoltDatabase() = %q, want %q", got, "rig_db")
+	}
+	if got := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); got != "rig_db" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want %q", got, "rig_db")
 	}
 }
 

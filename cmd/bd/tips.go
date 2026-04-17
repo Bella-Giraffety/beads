@@ -136,7 +136,7 @@ func selectNextTip(store storage.DoltStorage) *Tip {
 // Returns zero time if never shown
 func getLastShown(store storage.DoltStorage, tipID string) time.Time {
 	key := fmt.Sprintf("tip_%s_last_shown", tipID)
-	value, err := store.GetMetadata(context.Background(), key)
+	value, err := store.GetLocalMetadata(context.Background(), key)
 	if err != nil || value == "" {
 		return time.Time{}
 	}
@@ -153,6 +153,9 @@ func getLastShown(store storage.DoltStorage, tipID string) time.Time {
 // recordTipShown records the timestamp when a tip was shown
 func recordTipShown(store storage.DoltStorage, tipID string) {
 	if store == nil || tipID == "" {
+		return
+	}
+	if serverMode {
 		return
 	}
 
@@ -173,7 +176,7 @@ func recordTipShown(store storage.DoltStorage, tipID string) {
 
 	// Non-critical metadata, ok to fail silently.
 	// If it succeeds, track the write for tip auto-commit behavior.
-	if err := store.SetMetadata(context.Background(), key, value); err == nil {
+	if err := store.SetLocalMetadata(context.Background(), key, value); err == nil {
 		commandDidWriteTipMetadata = true
 		if commandTipIDsShown == nil {
 			commandTipIDsShown = make(map[string]struct{})

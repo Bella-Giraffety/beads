@@ -53,10 +53,16 @@ Pass --server to use an external dolt sql-server instead. In server mode,
 set connection details with --server-host, --server-port, and --server-user.
 Password should be set via BEADS_DOLT_PASSWORD environment variable.
 
+Auto-export is enabled by default. After every write command, bd exports
+issues to .beads/issues.jsonl (throttled to once per 60s). This keeps
+viewers (bv) and git-based workflows up to date without extra steps.
+To disable: bd config set export.auto false
+
 Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
   Skips all interactive prompts, using sensible defaults:
   • Role defaults to "maintainer" (override with --role)
   • Fork exclude auto-configured when fork detected
+  • Auto-export left at default (enabled)
   • --contributor and --team flags are rejected (wizards require interaction)
   Also auto-detected when stdin is not a terminal or CI=true is set.`,
 	Run: func(cmd *cobra.Command, _ []string) {
@@ -581,12 +587,40 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					}
 				}
 			}
+
+			// Ensure the global beads_global database exists on the shared server.
+			// This is idempotent — safe to run on every init.
+			globalHost := configfile.DefaultDoltServerHost
+			if serverHost != "" {
+				globalHost = serverHost
+			}
+			globalPort := initPort
+			if globalPort == 0 {
+				globalPort = doltserver.DefaultSharedServerPort
+			}
+			globalUser := configfile.DefaultDoltServerUser
+			if serverUser != "" {
+				globalUser = serverUser
+			}
+			if err := doltserver.EnsureGlobalDatabase(globalHost, globalPort, globalUser, ""); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to create global database: %v\n", err)
+				// Non-fatal — project init should succeed even if global DB creation fails
+			} else if !quiet {
+				fmt.Printf("  %s Global database %s available\n", ui.RenderPass("✓"), doltserver.GlobalDatabaseName)
+			}
 		}
 
 		store, err := newDoltStore(ctx, doltCfg, embeddeddolt.WithLock(initLock))
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: failed to open Dolt store: %v\n", err)
 			os.Exit(1)
+		}
+
+		// Initialize global database schema and config in shared-server mode.
+		// Opens a separate store connection to beads_global with CreateIfMissing
+		// to trigger schema migration, then seeds the issue prefix and project ID.
+		if sharedServer || doltserver.IsSharedServerMode() {
+			initGlobalDatabaseConfig(ctx, doltCfg, quiet)
 		}
 
 		// Configure the remote in the Dolt store so bd dolt push/pull
@@ -628,8 +662,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 		// but the system works without it. Failures here degrade gracefully - we warn but continue.
 		// Belt-and-suspenders: write then verify read-back for each field.
 
-		// Store and verify the bd version (for version mismatch detection)
-		verifyMetadata(ctx, store, "bd_version", Version)
+		// Store bd version in clone-local metadata (dolt-ignored, no merge conflicts)
+		if err := store.SetLocalMetadata(ctx, "bd_version", Version); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to write bd_version local metadata: %v\n", err)
+		}
 
 		// Compute and store repository fingerprint (FR-015)
 		repoID, err := beads.ComputeRepoID()
@@ -671,26 +707,22 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				cfg = configfile.DefaultConfig()
 			}
 
-			// Generate project identity UUID if not already set (GH#2372).
-			// This UUID is stored in both metadata.json and the database,
-			// and verified on every connection to detect cross-project leakage.
-			//
-			// When --database is specified and the database already exists on the
-			// server, adopt the existing project_id instead of generating a new
-			// one. This prevents identity mismatch when a second user joins a
-			// shared remote Dolt server. (GH#2922)
-			if cfg.ProjectID == "" {
-				if database != "" && store != nil {
-					if existingID, err := store.GetMetadata(ctx, "_project_id"); err == nil && existingID != "" {
-						cfg.ProjectID = existingID
-						if !quiet {
-							fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
-						}
-					}
+			// Project identity is database-authoritative when one already exists.
+			// Never preserve an inherited metadata.json project_id during init:
+			// cloned/shared-server workspaces may contain a committed stale value.
+			// If the target database already has _project_id, adopt it. Otherwise,
+			// generate a fresh identity for this newly initialized database.
+			dbProjectID := ""
+			if store != nil {
+				dbProjectID, _ = store.GetMetadata(ctx, "_project_id")
+			}
+			if dbProjectID != "" {
+				cfg.ProjectID = dbProjectID
+				if !quiet {
+					fmt.Printf("  %s Adopted project identity from existing database\n", ui.RenderPass("✓"))
 				}
-				if cfg.ProjectID == "" {
-					cfg.ProjectID = configfile.GenerateProjectID()
-				}
+			} else {
+				cfg.ProjectID = configfile.GenerateProjectID()
 			}
 
 			// Always store backend explicitly in metadata.json
@@ -717,6 +749,12 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 					cfg.DoltDatabase = strings.ReplaceAll(cfg.DoltDatabase, ".", "_")
 				}
 
+				// Set global database name for shared-server mode projects.
+				// This gives each project the connection info to reach beads_global.
+				if sharedServer || doltserver.IsSharedServerMode() {
+					cfg.GlobalDoltDatabase = doltserver.GlobalDatabaseName
+				}
+
 				// Persist the connection mode matching this build.
 				if isEmbeddedMode() {
 					cfg.DoltMode = configfile.DoltModeEmbedded
@@ -726,6 +764,10 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 				if serverHost != "" {
 					cfg.DoltServerHost = serverHost
 				}
+				// Never preserve an inherited git-tracked dolt_server_port. The
+				// runtime port file and env/config resolution are authoritative unless
+				// init was explicitly given --server-port.
+				cfg.DoltServerPort = 0
 				if serverPort != 0 {
 					cfg.DoltServerPort = serverPort
 				}
@@ -956,6 +998,25 @@ Non-interactive mode (--non-interactive or BD_NON_INTERACTIVE=1):
 						}
 					}
 				}
+			}
+		}
+
+		// Auto-export prompt: enabled by default, let user opt out interactively (GH#2973).
+		// In non-interactive mode the default (enabled) is kept.
+		if !nonInteractive && !quiet {
+			wantExport, err := promptAutoExport()
+			if err != nil && isCanceled(err) {
+				fmt.Fprintln(os.Stderr, "Setup canceled.")
+				exitCanceled()
+			}
+			if !wantExport {
+				if err := config.SetYamlConfig("export.auto", "false"); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to disable auto-export: %v\n", err)
+				} else {
+					fmt.Printf("  %s Auto-export disabled (enable later with: bd config set export.auto true)\n", ui.RenderPass("✓"))
+				}
+			} else if !quiet {
+				fmt.Printf("  %s Auto-export enabled → .beads/issues.jsonl\n", ui.RenderPass("✓"))
 			}
 		}
 
@@ -1610,6 +1671,27 @@ func promptContributorMode() (isContributor bool, err error) {
 	return isContributor, nil
 }
 
+// promptAutoExport asks the user whether to keep auto-export enabled (the default).
+// Returns true to keep it enabled, false to disable.
+func promptAutoExport() (bool, error) {
+	fmt.Printf("\n%s Auto-export keeps .beads/issues.jsonl up to date after every write command.\n", ui.RenderAccent("▶"))
+	fmt.Println("  This is useful for viewers (bv) and git-based sync workflows.")
+	fmt.Print("\nEnable auto-export? [Y/n]: ")
+
+	reader := bufio.NewReader(os.Stdin)
+	response, err := readLineWithContext(getRootContext(), reader, os.Stdin)
+	if err != nil {
+		if isCanceled(err) {
+			return true, err
+		}
+		response = ""
+	}
+	response = strings.TrimSpace(strings.ToLower(response))
+
+	// Default to yes (empty or "y" or "yes")
+	return response == "" || response == "y" || response == "yes", nil
+}
+
 // verifyMetadata writes a metadata field and verifies the write succeeded.
 // Returns true if write+verify succeeded, false with warning if either failed.
 func verifyMetadata(ctx context.Context, store storage.DoltStorage, key, value string) bool {
@@ -1630,4 +1712,50 @@ func verifyMetadata(ctx context.Context, store storage.DoltStorage, key, value s
 		return false
 	}
 	return true
+}
+
+// initGlobalDatabaseConfig opens a store connection to the beads_global database
+// and seeds its configuration (issue prefix, project ID). The database must already
+// exist (created by EnsureGlobalDatabase). This function is idempotent — it only
+// sets config values that are not already present.
+func initGlobalDatabaseConfig(ctx context.Context, projectCfg *dolt.Config, quiet bool) {
+	globalCfg := &dolt.Config{
+		Path:            projectCfg.Path,
+		BeadsDir:        projectCfg.BeadsDir,
+		Database:        doltserver.GlobalDatabaseName,
+		ServerHost:      projectCfg.ServerHost,
+		ServerPort:      projectCfg.ServerPort,
+		ServerUser:      projectCfg.ServerUser,
+		ServerPassword:  projectCfg.ServerPassword,
+		ServerMode:      true,
+		CreateIfMissing: true,
+		AutoStart:       false, // server is already running
+	}
+
+	globalStore, err := newDoltStore(ctx, globalCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: failed to open global database: %v\n", err)
+		return
+	}
+	defer func() { _ = globalStore.Close() }()
+
+	// Set issue prefix (only if not already configured)
+	existing, _ := globalStore.GetConfig(ctx, "issue_prefix")
+	if existing == "" {
+		if err := globalStore.SetConfig(ctx, "issue_prefix", doltserver.GlobalIssuePrefix); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to set global issue prefix: %v\n", err)
+		}
+	}
+
+	// Set well-known project ID for the global database
+	existingID, _ := globalStore.GetMetadata(ctx, "_project_id")
+	if existingID == "" {
+		if err := globalStore.SetMetadata(ctx, "_project_id", doltserver.GlobalProjectID); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to set global project ID: %v\n", err)
+		}
+	}
+
+	if !quiet {
+		fmt.Printf("  %s Global database schema initialized\n", ui.RenderPass("✓"))
+	}
 }
