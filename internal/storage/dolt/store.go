@@ -1186,7 +1186,7 @@ func shouldVerifyProjectIdentity(cfg *Config) bool {
 	if cfg == nil {
 		return true
 	}
-	return !cfg.CreateIfMissing && !cfg.ReadOnly
+	return !cfg.CreateIfMissing
 }
 
 // verifyProjectIdentity checks that the database belongs to the expected project.

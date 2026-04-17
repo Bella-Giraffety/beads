@@ -321,11 +321,11 @@ func TestShouldVerifyProjectIdentity(t *testing.T) {
 			want: false,
 		},
 		{
-			name: "read-only open skips verification",
+			name: "read-only open verifies identity before repair",
 			cfg: &Config{
 				ReadOnly: true,
 			},
-			want: false,
+			want: true,
 		},
 		{
 			name: "nil config defaults to verification",
@@ -403,6 +403,77 @@ func TestNewRejectsWrongProjectBeforeIgnoredTableRepair(t *testing.T) {
 	}
 
 	for _, table := range []string{"local_metadata", "repo_mtimes", "wisps", "wisp_labels", "wisp_dependencies", "wisp_events", "wisp_comments"} {
+		exists, tableErr := schema.TableExists(ctx, ownerStore.db, table)
+		if tableErr != nil {
+			t.Fatalf("check %s existence: %v", table, tableErr)
+		}
+		if exists {
+			t.Fatalf("%s was recreated before identity validation", table)
+		}
+	}
+}
+
+func TestNewReadOnlyRejectsWrongProjectBeforeIgnoredTableRepair(t *testing.T) {
+	skipIfNoDolt(t)
+	acquireTestSlot()
+	t.Cleanup(releaseTestSlot)
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	beadsDirA := t.TempDir()
+	beadsDirB := t.TempDir()
+	dbPathA := filepath.Join(beadsDirA, "dolt")
+	dbPathB := filepath.Join(beadsDirB, "dolt")
+	dbName := uniqueTestDBName(t)
+
+	if err := (&configfile.Config{ProjectID: "project-a"}).Save(beadsDirA); err != nil {
+		t.Fatalf("save metadata for project A: %v", err)
+	}
+	if err := (&configfile.Config{ProjectID: "project-b"}).Save(beadsDirB); err != nil {
+		t.Fatalf("save metadata for project B: %v", err)
+	}
+
+	ownerStore, err := New(ctx, &Config{
+		Path:            dbPathA,
+		BeadsDir:        beadsDirA,
+		CommitterName:   "test",
+		CommitterEmail:  "test@example.com",
+		Database:        dbName,
+		CreateIfMissing: true,
+	})
+	if err != nil {
+		t.Fatalf("create owner store: %v", err)
+	}
+	defer ownerStore.Close()
+
+	if err := ownerStore.SetMetadata(ctx, "_project_id", "project-a"); err != nil {
+		t.Fatalf("set project identity: %v", err)
+	}
+
+	for _, table := range []string{"wisps", "local_metadata"} {
+		if _, err := ownerStore.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil { //nolint:gosec // G201: table names are fixed in test.
+			t.Fatalf("drop %s: %v", table, err)
+		}
+	}
+
+	wrongStore, err := New(ctx, &Config{
+		Path:           dbPathB,
+		BeadsDir:       beadsDirB,
+		CommitterName:  "test",
+		CommitterEmail: "test@example.com",
+		Database:       dbName,
+		ReadOnly:       true,
+	})
+	if err == nil {
+		wrongStore.Close()
+		t.Fatal("expected project identity mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "PROJECT IDENTITY MISMATCH") {
+		t.Fatalf("expected project identity mismatch, got: %v", err)
+	}
+
+	for _, table := range []string{"wisps", "local_metadata"} {
 		exists, tableErr := schema.TableExists(ctx, ownerStore.db, table)
 		if tableErr != nil {
 			t.Fatalf("check %s existence: %v", table, tableErr)
