@@ -79,7 +79,7 @@ func TestWithStorage_ReopensRedirectedSourceDatabaseAndPreservesEphemeralState(t
 	targetDBPath := filepath.Join(targetBeadsDir, "dolt")
 
 	sourceStore := newTestStoreIsolatedDB(t, sourceDBPath, "rig")
-	_ = newTestStoreIsolatedDB(t, targetDBPath, "shared")
+	targetStore := newTestStoreIsolatedDB(t, targetDBPath, "shared")
 
 	sourceCfg, err := configfile.Load(sourceBeadsDir)
 	if err != nil {
@@ -121,10 +121,20 @@ func TestWithStorage_ReopensRedirectedSourceDatabaseAndPreservesEphemeralState(t
 		IssueType: types.TypeTask,
 		Ephemeral: true,
 	}
+	targetOnly := &types.Issue{
+		ID:        "target-only",
+		Title:     "Target-only issue",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
 	for _, issue := range []*types.Issue{root, reply, wisp} {
 		if err := sourceStore.CreateIssue(ctx, issue, "test"); err != nil {
 			t.Fatalf("CreateIssue(%s): %v", issue.ID, err)
 		}
+	}
+	if err := targetStore.CreateIssue(ctx, targetOnly, "test"); err != nil {
+		t.Fatalf("CreateIssue(%s): %v", targetOnly.ID, err)
 	}
 	if err := sourceStore.AddDependency(ctx, &types.Dependency{
 		IssueID: reply.ID, DependsOnID: root.ID, Type: types.DepRepliesTo,
@@ -171,8 +181,31 @@ func TestWithStorage_ReopensRedirectedSourceDatabaseAndPreservesEphemeralState(t
 	if err != nil {
 		t.Fatalf("withStorage() reopen failed: %v", err)
 	}
-	if got := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); got != sourceCfg.GetDoltDatabase() {
-		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want %q", got, sourceCfg.GetDoltDatabase())
+	if got := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); got != "" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want empty", got)
+	}
+
+	err = withStorage(ctx, nil, targetDBPath, func(s storage.DoltStorage) error {
+		gotTarget, err := s.GetIssue(ctx, targetOnly.ID)
+		if err != nil {
+			return err
+		}
+		if gotTarget == nil || gotTarget.ID != targetOnly.ID {
+			return fmt.Errorf("target issue missing after second reopen: %#v", gotTarget)
+		}
+
+		gotRoot, err := s.GetIssue(ctx, root.ID)
+		if err != nil {
+			return err
+		}
+		if gotRoot != nil {
+			return fmt.Errorf("second reopen used source database; found %#v in target open", gotRoot)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("withStorage() target reopen failed: %v", err)
 	}
 }
 

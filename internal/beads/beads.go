@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/utils"
@@ -51,27 +52,37 @@ type SourceDatabaseInfo struct {
 	SourceDatabase string
 }
 
-// PreserveRedirectSourceDatabase restores the source workspace's dolt_database
-// into BEADS_DOLT_SERVER_DATABASE when a redirected .beads directory points at a
-// shared target with different metadata. This keeps startup/store-open paths on
-// the source workspace's database instead of silently drifting to the target's.
-func PreserveRedirectSourceDatabase(beadsDir string) {
-	if beadsDir == "" || os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" {
-		return
+// RedirectSourceDatabase returns the source workspace's dolt_database when a
+// redirected .beads directory points at a shared target with different
+// metadata. Callers can apply this to a single config or open without leaking
+// the selection into unrelated store opens.
+func RedirectSourceDatabase(beadsDir string) string {
+	if beadsDir == "" {
+		return ""
 	}
 
 	info := ResolveRedirect(beadsDir)
-	if info.WasRedirected && info.SourceDatabase != "" {
-		_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", info.SourceDatabase)
+	if !info.WasRedirected {
+		return ""
 	}
+	return info.SourceDatabase
 }
 
-// LoadRedirectAwareConfig preserves any redirected source database identity
-// before loading metadata.json. Callers that open stores during startup should
-// use this instead of configfile.Load directly.
+// LoadRedirectAwareConfig loads metadata.json and scopes any redirect-derived
+// source database override to the returned config object instead of mutating
+// process-global env state.
 func LoadRedirectAwareConfig(beadsDir string) (*configfile.Config, error) {
-	PreserveRedirectSourceDatabase(beadsDir)
-	return configfile.Load(beadsDir)
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		return cfg, err
+	}
+	if os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" || doltdboverride.Current() != "" {
+		return cfg, nil
+	}
+	if database := RedirectSourceDatabase(beadsDir); database != "" {
+		cfg.DoltDatabase = database
+	}
+	return cfg, nil
 }
 
 // ResolveRedirect follows a .beads/redirect file and captures the source directory's
