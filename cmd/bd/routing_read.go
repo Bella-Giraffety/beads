@@ -95,7 +95,10 @@ func openRoutedReadStore(ctx context.Context, store storage.DoltStorage) (storag
 	}
 
 	targetRepoPath := routing.ExpandPathFrom(repoPath, routedReadWorkspaceRoot())
-	targetBeadsDir := filepath.Join(targetRepoPath, ".beads")
+	targetBeadsDir := targetRepoPath
+	if filepath.Base(targetRepoPath) != ".beads" {
+		targetBeadsDir = filepath.Join(targetRepoPath, ".beads")
+	}
 	restoreOverride := doltdboverride.Replace(redirectSourceDatabaseOverride(targetBeadsDir))
 	defer restoreOverride()
 	targetStore, err := newReadOnlyStoreFromConfig(ctx, targetBeadsDir)
