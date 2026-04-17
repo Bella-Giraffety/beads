@@ -557,11 +557,23 @@ func isValidRemoteURL(rawURL string) bool {
 
 // findBeadsRepoRoot walks up from the given path to find the repo root (containing .beads)
 func findBeadsRepoRoot(startPath string) string {
+	var worktreeRoot string
+	var mainRepoRoot string
+	if isGitRepo() && git.IsWorktree() {
+		worktreeRoot = git.GetRepoRoot()
+		if root, err := git.GetMainRepoRoot(); err == nil {
+			mainRepoRoot = root
+		}
+	}
+
 	path := startPath
 	for {
 		beadsDir := filepath.Join(path, ".beads")
 		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
 			return path
+		}
+		if worktreeRoot != "" && path == worktreeRoot {
+			break
 		}
 		parent := filepath.Dir(path)
 		if parent == path {
@@ -570,7 +582,14 @@ func findBeadsRepoRoot(startPath string) string {
 		path = parent
 	}
 
-	if isGitRepo() && git.IsWorktree() {
+	if mainRepoRoot != "" {
+		beadsDir := filepath.Join(mainRepoRoot, ".beads")
+		if info, err := os.Stat(beadsDir); err == nil && info.IsDir() {
+			return mainRepoRoot
+		}
+	}
+
+	if worktreeRoot != "" {
 		if fallbackDir := beads.GetWorktreeFallbackBeadsDir(); fallbackDir != "" {
 			return filepath.Dir(fallbackDir)
 		}

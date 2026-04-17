@@ -21,6 +21,13 @@ func TestFindBeadsRepoRoot_WorktreeFallback(t *testing.T) {
 	if err := os.MkdirAll(mainRepoDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	ancestorRepoDir := filepath.Join(tmpDir, "ancestor-repo")
+	if err := os.MkdirAll(filepath.Join(ancestorRepoDir, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ancestorRepoDir, ".beads", "metadata.json"), []byte(`{"backend":"dolt"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	run := func(dir string, args ...string) {
 		cmd := exec.Command("git", args...)
@@ -40,7 +47,7 @@ func TestFindBeadsRepoRoot_WorktreeFallback(t *testing.T) {
 	run(mainRepoDir, "add", "README.md")
 	run(mainRepoDir, "commit", "-m", "Initial commit")
 
-	worktreeDir := filepath.Join(tmpDir, "worktree")
+	worktreeDir := filepath.Join(ancestorRepoDir, "worktree")
 	cmd := exec.Command("git", "worktree", "add", worktreeDir, "HEAD")
 	cmd.Dir = mainRepoDir
 	if out, err := cmd.CombinedOutput(); err != nil {
