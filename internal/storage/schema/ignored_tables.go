@@ -20,18 +20,15 @@ type ignoredMigration struct {
 // tables, in the order they must be applied. The embedded .up.sql files are
 // the single source of truth for the recreated ignored-table schema.
 var ignoredMigrations = []ignoredMigration{
-	{version: 29},                  // CREATE TABLE local_metadata
 	{version: 11},                  // CREATE TABLE repo_mtimes
 	{version: 20},                  // CREATE TABLE wisps
 	{version: 21},                  // CREATE TABLE wisp_labels, wisp_dependencies, wisp_events, wisp_comments
 	{version: 22},                  // CREATE INDEX on wisp_dependencies
 	{version: 23, filter: "wisps"}, // ALTER TABLE wisps ADD COLUMN no_history (skip issues ALTER)
 	{version: 27, filter: "wisps"}, // ALTER TABLE wisps ADD COLUMN started_at (skip issues ALTER)
-	{version: 31},                  // CREATE INDEX idx_wisp_events_created_at
 }
 
 var requiredIgnoredTables = []string{
-	"local_metadata",
 	"repo_mtimes",
 	"wisps",
 	"wisp_labels",
