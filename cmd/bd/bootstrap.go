@@ -172,12 +172,16 @@ Examples:
 		// workspace-level metadata.json that contains the correct database
 		// name (e.g. dolt_database). Without this, server-mode rigs get the
 		// default name "beads" instead of their configured name. (GH#3029)
-		cfg, err := loadWorkspaceConfig(beadsDir)
+		cfg, err := loadBootstrapWorkspaceConfig(beadsDir)
 		if err != nil {
 			FatalError("failed to load metadata.json: %v", err)
 		}
 		if cfg == nil {
 			cfg = configfile.DefaultConfig()
+		}
+		serverMode = cfg.IsDoltServerMode() || doltserver.IsSharedServerMode()
+		if cmdCtx != nil {
+			cmdCtx.ServerMode = serverMode
 		}
 
 		// Determine action based on state
@@ -555,10 +559,17 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 		return err
 	}
 
-	// Open and close the store to ensure dolt_ignore'd wisp tables are
-	// created in the working set. Clone does not include these tables
-	// (they are never committed), so they must be recreated after clone.
-	// Both embedded and server mode handle this in their store init paths.
+	// Repair stale local project_id from the cloned database before the mutable
+	// reopen path enforces identity verification. Read-only opens intentionally
+	// skip that guard so bootstrap can adopt the authoritative DB identity first.
+	if err := repairBootstrapProjectIdentity(ctx, plan.BeadsDir); err != nil {
+		return err
+	}
+
+	// Open and close the store to ensure dolt_ignore'd wisp tables are created
+	// in the working set. Clone does not include these tables (they are never
+	// committed), so they must be recreated after clone. Both embedded and
+	// server mode handle this in their store init paths.
 	warmupStore, err := newDoltStoreFromConfig(ctx, plan.BeadsDir)
 	if err != nil {
 		// Non-fatal: wisp tables will be created on the next command that
@@ -567,7 +578,21 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 		fmt.Fprintf(os.Stderr, "Warning: post-clone store init failed (wisp tables may be missing): %v\n", err)
 		return nil
 	}
-	_ = warmupStore.Close()
+	defer func() { _ = warmupStore.Close() }()
+
+	return nil
+}
+
+func repairBootstrapProjectIdentity(ctx context.Context, beadsDir string) error {
+	repairStore, err := newReadOnlyStoreFromConfig(ctx, beadsDir)
+	if err != nil {
+		return fmt.Errorf("open cloned database for project identity repair: %w", err)
+	}
+	defer func() { _ = repairStore.Close() }()
+
+	if err := syncProjectIDToBeadsDir(ctx, beadsDir, repairStore); err != nil {
+		return fmt.Errorf("sync project identity from cloned database: %w", err)
+	}
 
 	return nil
 }
@@ -639,12 +664,19 @@ func finalizeSyncedBootstrap(ctx context.Context, beadsDir, syncRemote string, c
 	return nil
 }
 
-// loadWorkspaceConfig reads the local metadata.json when present, and falls back
-// to the parent workspace's committed metadata only when the local file is absent.
-// This keeps rig/bootstrap paths on the authoritative database name without
-// silently ignoring malformed local metadata.
+// loadWorkspaceConfig reads only the local metadata.json for the current
+// workspace. Ordinary command startup must fail closed when local metadata is
+// missing instead of silently inheriting a parent workspace's database.
 func loadWorkspaceConfig(beadsDir string) (*configfile.Config, error) {
-	cfg, err := beads.LoadRedirectAwareConfig(beadsDir)
+	return beads.LoadRedirectAwareConfig(beadsDir)
+}
+
+// loadBootstrapWorkspaceConfig reads the local metadata.json when present, and
+// falls back to the parent workspace's committed metadata only when the local
+// file is absent. Bootstrap/recovery paths use this to recover the correct
+// database name from the owning workspace without relaxing normal startup.
+func loadBootstrapWorkspaceConfig(beadsDir string) (*configfile.Config, error) {
+	cfg, err := loadWorkspaceConfig(beadsDir)
 	if err != nil || cfg != nil {
 		return cfg, err
 	}

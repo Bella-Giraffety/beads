@@ -297,3 +297,44 @@ func TestLoadRedirectAwareConfig_PreservesSourceDatabase(t *testing.T) {
 		t.Fatalf("GetDoltDatabase() = %q, want %q", got, "rig_db")
 	}
 }
+
+func TestShouldVerifyProjectIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *Config
+		want bool
+	}{
+		{
+			name: "default write open verifies identity",
+			cfg:  &Config{},
+			want: true,
+		},
+		{
+			name: "create-if-missing skips verification",
+			cfg: &Config{
+				CreateIfMissing: true,
+			},
+			want: false,
+		},
+		{
+			name: "read-only open skips verification",
+			cfg: &Config{
+				ReadOnly: true,
+			},
+			want: false,
+		},
+		{
+			name: "nil config defaults to verification",
+			cfg:  nil,
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldVerifyProjectIdentity(tt.cfg); got != tt.want {
+				t.Fatalf("shouldVerifyProjectIdentity() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

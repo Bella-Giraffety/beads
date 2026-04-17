@@ -1302,7 +1302,7 @@ func TestFinalizeSyncedBootstrapClearsInheritedIdentityAndPort(t *testing.T) {
 	}
 }
 
-func TestLoadWorkspaceConfig_FallsBackToParentWorkspaceMetadata(t *testing.T) {
+func TestLoadWorkspaceConfig_DoesNotFallBackToParentWorkspaceMetadata(t *testing.T) {
 	workspaceRoot := t.TempDir()
 	workspaceBeads := filepath.Join(workspaceRoot, ".beads")
 	if err := os.MkdirAll(workspaceBeads, 0o750); err != nil {
@@ -1330,8 +1330,41 @@ func TestLoadWorkspaceConfig_FallsBackToParentWorkspaceMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadWorkspaceConfig: %v", err)
 	}
+	if loaded != nil {
+		t.Fatalf("loadWorkspaceConfig() = %#v, want nil when local metadata.json is absent", loaded)
+	}
+}
+
+func TestLoadBootstrapWorkspaceConfig_FallsBackToParentWorkspaceMetadata(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workspaceBeads := filepath.Join(workspaceRoot, ".beads")
+	if err := os.MkdirAll(workspaceBeads, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	parentCfg := &configfile.Config{
+		Database:       "dolt",
+		Backend:        configfile.BackendDolt,
+		DoltMode:       configfile.DoltModeServer,
+		DoltDatabase:   "my_rig",
+		DoltServerHost: "127.0.0.1",
+		ProjectID:      "workspace-project-id",
+	}
+	if err := parentCfg.Save(workspaceBeads); err != nil {
+		t.Fatalf("save parent metadata.json: %v", err)
+	}
+
+	rigBeads := filepath.Join(workspaceRoot, "rig", "nested", ".beads")
+	if err := os.MkdirAll(rigBeads, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadBootstrapWorkspaceConfig(rigBeads)
+	if err != nil {
+		t.Fatalf("loadBootstrapWorkspaceConfig: %v", err)
+	}
 	if loaded == nil {
-		t.Fatal("loadWorkspaceConfig returned nil")
+		t.Fatal("loadBootstrapWorkspaceConfig returned nil")
 	}
 	if loaded.GetDoltDatabase() != "my_rig" {
 		t.Fatalf("GetDoltDatabase() = %q, want %q", loaded.GetDoltDatabase(), "my_rig")
@@ -1413,4 +1446,66 @@ func TestSyncProjectIDToBeadsDirUpdatesMetadata(t *testing.T) {
 	if loaded.ProjectID != dbProjectID {
 		t.Fatalf("ProjectID = %q, want %q", loaded.ProjectID, dbProjectID)
 	}
+}
+
+func TestRepairBootstrapProjectIdentityRepairsStaleSharedServerMetadata(t *testing.T) {
+	if testDoltServerPort == 0 {
+		t.Skip("Dolt test server not available")
+	}
+
+	ensureTestMode(t)
+	t.Setenv("BEADS_DOLT_SHARED_SERVER", "1")
+
+	repoDir := t.TempDir()
+	dbPath := filepath.Join(repoDir, ".beads", "dolt")
+	store := newTestStoreWithPrefix(t, dbPath, "sync")
+
+	ctx := context.Background()
+	const dbProjectID = "project-id-from-db"
+	if err := store.SetMetadata(ctx, "_project_id", dbProjectID); err != nil {
+		t.Fatalf("SetMetadata(_project_id): %v", err)
+	}
+
+	beadsDir := filepath.Dir(dbPath)
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load before repair: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("configfile.Load returned nil")
+	}
+	cfg.ProjectID = "stale-project-id"
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("save stale metadata.json: %v", err)
+	}
+
+	blockedStore, err := newDoltStoreFromConfig(ctx, beadsDir)
+	if err == nil {
+		_ = blockedStore.Close()
+		t.Fatal("expected mutable reopen to fail before repair")
+	}
+	if !strings.Contains(err.Error(), "PROJECT IDENTITY MISMATCH") {
+		t.Fatalf("expected PROJECT IDENTITY MISMATCH, got: %v", err)
+	}
+
+	if err := repairBootstrapProjectIdentity(ctx, beadsDir); err != nil {
+		t.Fatalf("repairBootstrapProjectIdentity: %v", err)
+	}
+
+	loaded, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("configfile.Load after repair: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("configfile.Load returned nil after repair")
+	}
+	if loaded.ProjectID != dbProjectID {
+		t.Fatalf("ProjectID = %q, want %q", loaded.ProjectID, dbProjectID)
+	}
+
+	repairedStore, err := newDoltStoreFromConfig(ctx, beadsDir)
+	if err != nil {
+		t.Fatalf("mutable reopen after repair: %v", err)
+	}
+	defer repairedStore.Close()
 }
