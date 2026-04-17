@@ -559,10 +559,17 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 		return err
 	}
 
-	// Open and close the store to ensure dolt_ignore'd wisp tables are
-	// created in the working set. Clone does not include these tables
-	// (they are never committed), so they must be recreated after clone.
-	// Both embedded and server mode handle this in their store init paths.
+	// Repair stale local project_id from the cloned database before the mutable
+	// reopen path enforces identity verification. Read-only opens intentionally
+	// skip that guard so bootstrap can adopt the authoritative DB identity first.
+	if err := repairBootstrapProjectIdentity(ctx, plan.BeadsDir); err != nil {
+		return err
+	}
+
+	// Open and close the store to ensure dolt_ignore'd wisp tables are created
+	// in the working set. Clone does not include these tables (they are never
+	// committed), so they must be recreated after clone. Both embedded and
+	// server mode handle this in their store init paths.
 	warmupStore, err := newDoltStoreFromConfig(ctx, plan.BeadsDir)
 	if err != nil {
 		// Non-fatal: wisp tables will be created on the next command that
@@ -573,8 +580,18 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 	}
 	defer func() { _ = warmupStore.Close() }()
 
-	if err := syncProjectIDToBeadsDir(ctx, plan.BeadsDir, warmupStore); err != nil {
-		return err
+	return nil
+}
+
+func repairBootstrapProjectIdentity(ctx context.Context, beadsDir string) error {
+	repairStore, err := newReadOnlyStoreFromConfig(ctx, beadsDir)
+	if err != nil {
+		return fmt.Errorf("open cloned database for project identity repair: %w", err)
+	}
+	defer func() { _ = repairStore.Close() }()
+
+	if err := syncProjectIDToBeadsDir(ctx, beadsDir, repairStore); err != nil {
+		return fmt.Errorf("sync project identity from cloned database: %w", err)
 	}
 
 	return nil
