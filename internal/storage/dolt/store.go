@@ -1137,10 +1137,10 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 	}
 
 	// Project identity verification: detect cross-project data leakage (GH#2372).
-	// If the local metadata.json has a project_id and the database has one too,
-	// they must match. A mismatch means this client is connected to the wrong
-	// project's Dolt server — refuse to proceed.
-	if !cfg.CreateIfMissing {
+	// Mutable opens must refuse to proceed on mismatch. Read-only opens are
+	// allowed so routed reads and diagnostics can still inspect the target store
+	// even when metadata has drifted.
+	if shouldVerifyProjectIdentity(cfg) {
 		if verifyErr := store.verifyProjectIdentity(ctx, cfg.BeadsDir); verifyErr != nil {
 			_ = db.Close()
 			return nil, verifyErr
@@ -1171,6 +1171,13 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 	store.registerPoolGauges()
 
 	return store, nil
+}
+
+func shouldVerifyProjectIdentity(cfg *Config) bool {
+	if cfg == nil {
+		return true
+	}
+	return !cfg.CreateIfMissing && !cfg.ReadOnly
 }
 
 // verifyProjectIdentity checks that the database belongs to the expected project.
