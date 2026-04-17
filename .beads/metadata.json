@@ -3,5 +3,7 @@
   "database": "dolt",
   "dolt_database": "beads",
   "dolt_mode": "server",
-  "dolt_server_port": 3307
+  "dolt_server_host": "127.0.0.1",
+  "dolt_server_port": 3307,
+  "project_id": "5c6d323d-f3a3-4bcf-8eef-308bedfedd9b"
 }
