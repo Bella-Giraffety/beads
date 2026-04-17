@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -206,6 +207,141 @@ func TestWithStorage_ReopensRedirectedSourceDatabaseAndPreservesEphemeralState(t
 	})
 	if err != nil {
 		t.Fatalf("withStorage() target reopen failed: %v", err)
+	}
+}
+
+func TestShow_StartupReopensRedirectedSourceDatabaseAndPreservesEphemeralState(t *testing.T) {
+	if testDoltServerPort == 0 {
+		t.Skip("Dolt test server not available")
+	}
+
+	binPath := buildBDUnderTest(t)
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	repoA := filepath.Join(rootDir, "repo-a")
+	repoB := filepath.Join(rootDir, "repo-b")
+	sourceBeadsDir := filepath.Join(repoB, ".beads")
+	targetBeadsDir := filepath.Join(rootDir, "shared", ".beads")
+	sourceDBPath := filepath.Join(sourceBeadsDir, "dolt")
+	targetDBPath := filepath.Join(targetBeadsDir, "dolt")
+
+	initGitRepo(t, repoA)
+	initGitRepo(t, repoB)
+
+	sourceStore := newTestStoreIsolatedDB(t, sourceDBPath, "rig")
+	targetStore := newTestStoreIsolatedDB(t, targetDBPath, "shared")
+
+	sourceCfg, err := configfile.Load(sourceBeadsDir)
+	if err != nil {
+		t.Fatalf("load source metadata: %v", err)
+	}
+	targetCfg, err := configfile.Load(targetBeadsDir)
+	if err != nil {
+		t.Fatalf("load target metadata: %v", err)
+	}
+	if sourceCfg.GetDoltDatabase() == targetCfg.GetDoltDatabase() {
+		t.Fatal("expected source and target databases to differ")
+	}
+
+	root := &types.Issue{
+		ID:        "startup-root",
+		Title:     "Startup thread root",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeMessage,
+		Sender:    "mayor",
+		Assignee:  "worker",
+		Ephemeral: true,
+	}
+	reply := &types.Issue{
+		ID:        "startup-reply",
+		Title:     "Startup thread reply",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeMessage,
+		Sender:    "worker",
+		Assignee:  "mayor",
+		Ephemeral: true,
+	}
+	wisp := &types.Issue{
+		ID:        "startup-wisp",
+		Title:     "Startup wisp",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+		Ephemeral: true,
+	}
+	targetOnly := &types.Issue{
+		ID:        "target-only",
+		Title:     "Target-only issue",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+	for _, issue := range []*types.Issue{root, reply, wisp} {
+		if err := sourceStore.CreateIssue(ctx, issue, "test"); err != nil {
+			t.Fatalf("CreateIssue(%s): %v", issue.ID, err)
+		}
+	}
+	if err := targetStore.CreateIssue(ctx, targetOnly, "test"); err != nil {
+		t.Fatalf("CreateIssue(%s): %v", targetOnly.ID, err)
+	}
+	if err := sourceStore.AddDependency(ctx, &types.Dependency{
+		IssueID: reply.ID, DependsOnID: root.ID, Type: types.DepRepliesTo,
+	}, "test"); err != nil {
+		t.Fatalf("AddDependency(replies-to): %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceBeadsDir, "redirect"), []byte(targetBeadsDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+	if err := sourceStore.Close(); err != nil {
+		t.Fatalf("close source store before startup: %v", err)
+	}
+	if err := targetStore.Close(); err != nil {
+		t.Fatalf("close target store before startup: %v", err)
+	}
+
+	type shownIssue struct {
+		ID           string `json:"id"`
+		Ephemeral    bool   `json:"ephemeral,omitempty"`
+		Dependencies []struct {
+			ID   string `json:"id"`
+			Type string `json:"dependency_type"`
+		} `json:"dependencies,omitempty"`
+	}
+
+	showIssue := func(extraEnv []string, args ...string) shownIssue {
+		t.Helper()
+		out := runBDCommand(t, binPath, repoA, append([]string{"BEADS_TEST_MODE=1"}, extraEnv...), args...)
+		obj := parseShowJSON(t, string(out))
+		var issue shownIssue
+		if err := json.Unmarshal(obj, &issue); err != nil {
+			t.Fatalf("parse show output: %v\n%s", err, out)
+		}
+		return issue
+	}
+
+	gotRoot := showIssue(nil, "--db", sourceDBPath, "show", root.ID, "--json")
+	if gotRoot.ID != root.ID || !gotRoot.Ephemeral {
+		t.Fatalf("startup root missing after explicit --db reopen: %#v", gotRoot)
+	}
+
+	gotReply := showIssue([]string{"BEADS_DB=" + sourceDBPath}, "show", reply.ID, "--json")
+	if gotReply.ID != reply.ID || !gotReply.Ephemeral {
+		t.Fatalf("startup reply missing after BEADS_DB reopen: %#v", gotReply)
+	}
+	if len(gotReply.Dependencies) != 1 || gotReply.Dependencies[0].ID != root.ID || gotReply.Dependencies[0].Type != string(types.DepRepliesTo) {
+		t.Fatalf("startup reply dependencies = %#v, want replies-to %q", gotReply.Dependencies, root.ID)
+	}
+
+	gotWisp := showIssue([]string{"BEADS_DB=" + sourceDBPath}, "show", wisp.ID, "--json")
+	if gotWisp.ID != wisp.ID || !gotWisp.Ephemeral {
+		t.Fatalf("startup wisp missing after BEADS_DB reopen: %#v", gotWisp)
+	}
+
+	gotTarget := showIssue(nil, "--db", targetDBPath, "show", targetOnly.ID, "--json")
+	if gotTarget.ID != targetOnly.ID || gotTarget.Ephemeral {
+		t.Fatalf("target reopen returned wrong issue: %#v", gotTarget)
 	}
 }
 

@@ -381,7 +381,7 @@ func TestNewRejectsWrongProjectBeforeIgnoredTableRepair(t *testing.T) {
 		t.Fatalf("set project identity: %v", err)
 	}
 
-	for _, table := range []string{"wisps", "local_metadata"} {
+	for _, table := range []string{"local_metadata", "repo_mtimes", "wisps", "wisp_labels", "wisp_dependencies", "wisp_events", "wisp_comments"} {
 		if _, err := ownerStore.db.ExecContext(ctx, "DROP TABLE IF EXISTS "+table); err != nil { //nolint:gosec // G201: table names are fixed in test.
 			t.Fatalf("drop %s: %v", table, err)
 		}
@@ -402,7 +402,7 @@ func TestNewRejectsWrongProjectBeforeIgnoredTableRepair(t *testing.T) {
 		t.Fatalf("expected project identity mismatch, got: %v", err)
 	}
 
-	for _, table := range []string{"wisps", "local_metadata"} {
+	for _, table := range []string{"local_metadata", "repo_mtimes", "wisps", "wisp_labels", "wisp_dependencies", "wisp_events", "wisp_comments"} {
 		exists, tableErr := schema.TableExists(ctx, ownerStore.db, table)
 		if tableErr != nil {
 			t.Fatalf("check %s existence: %v", table, tableErr)
