@@ -11,6 +11,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltdboverride"
 	"github.com/steveyegge/beads/internal/doltserver"
 )
 
@@ -38,9 +39,9 @@ func ApplyCLIAutoStart(beadsDir string, cfg *Config) {
 	cfg.AutoStart = resolveAutoStart(true, autoStartCfg, ServerModeOwned)
 }
 
-func preserveRedirectSourceDatabase(beadsDir string) {
-	if beadsDir == "" || os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" {
-		return
+func redirectSourceDatabaseOverride(beadsDir string) string {
+	if beadsDir == "" {
+		return ""
 	}
 
 	var raw struct {
@@ -51,13 +52,13 @@ func preserveRedirectSourceDatabase(beadsDir string) {
 		_ = json.Unmarshal(data, &raw)
 	}
 	if raw.DoltDatabase == "" {
-		return
+		return ""
 	}
 
 	//nolint:gosec // G304: beadsDir is an internal workspace path, not untrusted input.
 	data, err := os.ReadFile(filepath.Join(beadsDir, "redirect"))
 	if err != nil {
-		return
+		return ""
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -68,15 +69,25 @@ func preserveRedirectSourceDatabase(beadsDir string) {
 			line = filepath.Join(filepath.Dir(beadsDir), line)
 		}
 		if info, statErr := os.Stat(line); statErr == nil && info.IsDir() {
-			_ = os.Setenv("BEADS_DOLT_SERVER_DATABASE", raw.DoltDatabase)
+			return raw.DoltDatabase
 		}
-		return
+		return ""
 	}
+	return ""
 }
 
 func loadRedirectAwareConfig(beadsDir string) (*configfile.Config, error) {
-	preserveRedirectSourceDatabase(beadsDir)
-	return configfile.Load(beadsDir)
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		return cfg, err
+	}
+	if os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" || doltdboverride.Current() != "" {
+		return cfg, nil
+	}
+	if database := redirectSourceDatabaseOverride(beadsDir); database != "" {
+		cfg.DoltDatabase = database
+	}
+	return cfg, nil
 }
 
 // NewFromConfig creates a DoltStore based on the metadata.json configuration.

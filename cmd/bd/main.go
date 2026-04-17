@@ -186,7 +186,6 @@ func loadServerModeFromConfig() {
 	if beadsDir == "" {
 		return
 	}
-	preserveRedirectSourceDatabase(beadsDir)
 	cfg, err := loadWorkspaceConfig(beadsDir)
 	if err != nil || cfg == nil {
 		return
@@ -239,16 +238,6 @@ func installRedirectSourceDatabaseOverride(cmd *cobra.Command) {
 		clearRedirectSourceDatabaseOverride = doltdboverride.Push(database)
 		if os.Getenv("BD_DEBUG_ROUTING") != "" {
 			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", database)
-		}
-	}
-}
-
-func preserveRedirectSourceDatabase(beadsDir string) {
-	before := os.Getenv("BEADS_DOLT_SERVER_DATABASE")
-	beads.PreserveRedirectSourceDatabase(beadsDir)
-	if os.Getenv("BD_DEBUG_ROUTING") != "" && before == "" {
-		if after := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); after != "" {
-			fmt.Fprintf(os.Stderr, "[routing] Preserved source dolt_database %q across redirect\n", after)
 		}
 	}
 }
@@ -770,7 +759,6 @@ var rootCmd = &cobra.Command{
 		}
 
 		// Load config to get database name and server connection settings
-		preserveRedirectSourceDatabase(beadsDir)
 		cfg, cfgErr := loadWorkspaceConfig(beadsDir)
 		if cfgErr != nil {
 			FatalError("failed to load beads config from %s: %v", beadsDir, cfgErr)

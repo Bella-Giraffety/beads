@@ -2206,8 +2206,8 @@ func TestLoadRedirectAwareConfig_PreservesSourceDatabase(t *testing.T) {
 	if got := cfg.GetDoltDatabase(); got != "rig_db" {
 		t.Fatalf("GetDoltDatabase() = %q, want %q", got, "rig_db")
 	}
-	if got := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); got != "rig_db" {
-		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want %q", got, "rig_db")
+	if got := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); got != "" {
+		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want empty", got)
 	}
 }
 
