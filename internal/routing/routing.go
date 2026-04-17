@@ -177,6 +177,14 @@ func DetermineTargetRepo(config *RoutingConfig, userRole UserRole, repoPath stri
 // ExpandPath expands ~ to home directory and resolves relative paths to absolute.
 // Returns the original path if expansion fails.
 func ExpandPath(path string) string {
+	return ExpandPathFrom(path, "")
+
+}
+
+// ExpandPathFrom expands ~ to home directory and resolves relative paths
+// relative to baseDir when provided. Returns the original path if expansion
+// fails.
+func ExpandPathFrom(path string, baseDir string) string {
 	if path == "" || path == "." {
 		return path
 	}
@@ -191,6 +199,9 @@ func ExpandPath(path string) string {
 
 	// Convert relative paths to absolute
 	if !filepath.IsAbs(path) {
+		if baseDir != "" {
+			path = filepath.Join(baseDir, path)
+		}
 		if abs, err := filepath.Abs(path); err == nil {
 			path = abs
 		}

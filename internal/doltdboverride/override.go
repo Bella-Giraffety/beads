@@ -36,3 +36,24 @@ func Current() string {
 	}
 	return stack[len(stack)-1]
 }
+
+// Replace swaps the entire override stack for the duration of a scoped
+// operation. This is used when opening a different workspace's store so the
+// caller can avoid leaking the current workspace's redirect-derived database
+// selection into the routed open.
+func Replace(database string) func() {
+	mu.Lock()
+	prev := append([]string(nil), stack...)
+	if database == "" {
+		stack = nil
+	} else {
+		stack = []string{database}
+	}
+	mu.Unlock()
+
+	return func() {
+		mu.Lock()
+		stack = prev
+		mu.Unlock()
+	}
+}
