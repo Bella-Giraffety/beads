@@ -1098,6 +1098,18 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 		autoStartedServerDir: autoStartedDir,
 	}
 
+	// Project identity verification: detect cross-project data leakage (GH#2372).
+	// Mutable opens must refuse to proceed on mismatch. Read-only opens are
+	// allowed so routed reads and diagnostics can still inspect the target store
+	// even when metadata has drifted. Run this before any startup repair or
+	// schema-init writes so a foreign database is rejected without mutation.
+	if shouldVerifyProjectIdentity(cfg) {
+		if verifyErr := store.verifyProjectIdentity(ctx, cfg.BeadsDir); verifyErr != nil {
+			_ = db.Close()
+			return nil, verifyErr
+		}
+	}
+
 	// Schema initialization for server mode (idempotent).
 	// Short retry for Dolt "no root value found in session" race: after
 	// CREATE DATABASE, information_schema queries may fail transiently
@@ -1133,17 +1145,6 @@ func newServerMode(ctx context.Context, cfg *Config) (*DoltStore, error) {
 	if !cfg.ReadOnly {
 		if err := store.initCredentialKey(ctx); err != nil {
 			return nil, fmt.Errorf("failed to initialize credential key: %w", err)
-		}
-	}
-
-	// Project identity verification: detect cross-project data leakage (GH#2372).
-	// Mutable opens must refuse to proceed on mismatch. Read-only opens are
-	// allowed so routed reads and diagnostics can still inspect the target store
-	// even when metadata has drifted.
-	if shouldVerifyProjectIdentity(cfg) {
-		if verifyErr := store.verifyProjectIdentity(ctx, cfg.BeadsDir); verifyErr != nil {
-			_ = db.Close()
-			return nil, verifyErr
 		}
 	}
 
