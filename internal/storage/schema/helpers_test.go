@@ -51,8 +51,15 @@ func TestRepairIgnoredTables(t *testing.T) {
 		}
 	}
 
-	if got := db.queries[len(ignoredTables)]; !strings.Contains(got, "CREATE TABLE IF NOT EXISTS local_metadata") {
-		t.Fatalf("expected recreate statements after drops, got %q", got)
+	foundRecreate := false
+	for _, query := range db.queries[len(ignoredTables):] {
+		if strings.Contains(query, "CREATE TABLE IF NOT EXISTS wisps") {
+			foundRecreate = true
+			break
+		}
+	}
+	if !foundRecreate {
+		t.Fatalf("expected recreate statements after drops, got %q", db.queries[len(ignoredTables):])
 	}
 }
 

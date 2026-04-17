@@ -11,8 +11,6 @@ var ignoredTables = []string{
 	"wisp_comments",
 	"wisp_labels",
 	"wisps",
-	"repo_mtimes",
-	"local_metadata",
 }
 
 // EnsureIgnoredTables checks whether the dolt_ignore'd wisp tables exist in
@@ -48,7 +46,7 @@ func CreateIgnoredTables(ctx context.Context, db DBConn) error {
 	return nil
 }
 
-// RepairIgnoredTables drops and recreates all dolt_ignore'd tables.
+// RepairIgnoredTables drops and recreates the dolt_ignore'd wisp tables.
 //
 // This is the safe repair path for ignored-table working-set corruption: these
 // tables do not participate in Dolt history, so rebuilding them repairs the
