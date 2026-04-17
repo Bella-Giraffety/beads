@@ -175,6 +175,7 @@ type DoltStore struct {
 	blockedIDsCached             bool // true once blockedIDsCache has been populated
 	blockedIDsCacheIncludesWisps bool // true if cache was computed with wisps
 	cacheMu                      sync.Mutex
+	ignoredTableRepairMu         sync.Mutex
 
 	// OTel span attribute cache (avoids per-call allocation)
 	spanAttrsOnce  sync.Once
