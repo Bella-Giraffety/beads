@@ -31,9 +31,10 @@ const CanonicalDatabaseName = "beads.db"
 // RedirectFileName is the name of the file that redirects to another .beads directory
 const RedirectFileName = "redirect"
 
-// SourceDatabaseInfo contains the dolt_database name from a source .beads/metadata.json,
-// preserved across a redirect so that the source directory's database identity is not
-// lost when the redirect target has a different dolt_database.
+// SourceDatabaseInfo contains source identity fields from a source
+// .beads/metadata.json, preserved across a redirect so that the source
+// directory's database identity is not lost when the redirect target has
+// different metadata.
 //
 // When a .beads/redirect points to a shared .beads directory that serves multiple
 // databases, the source's metadata.json may specify a different dolt_database than
@@ -50,6 +51,9 @@ type SourceDatabaseInfo struct {
 	// NOT the env-var-aware GetDoltDatabase()). Empty if no source metadata exists
 	// or the source has no dolt_database configured.
 	SourceDatabase string
+	// SourceProjectID is project_id from the source metadata.json. Empty if the
+	// source has no project_id configured.
+	SourceProjectID string
 }
 
 // RedirectSourceDatabase returns the source workspace's dolt_database when a
@@ -69,18 +73,22 @@ func RedirectSourceDatabase(beadsDir string) string {
 }
 
 // LoadRedirectAwareConfig loads metadata.json and scopes any redirect-derived
-// source database override to the returned config object instead of mutating
+// source identity overrides to the returned config object instead of mutating
 // process-global env state.
 func LoadRedirectAwareConfig(beadsDir string) (*configfile.Config, error) {
 	cfg, err := configfile.Load(beadsDir)
 	if err != nil || cfg == nil {
 		return cfg, err
 	}
+	info := ResolveRedirect(beadsDir)
+	if info.SourceProjectID != "" {
+		cfg.ProjectID = info.SourceProjectID
+	}
 	if os.Getenv("BEADS_DOLT_SERVER_DATABASE") != "" || doltdboverride.Current() != "" {
 		return cfg, nil
 	}
-	if database := RedirectSourceDatabase(beadsDir); database != "" {
-		cfg.DoltDatabase = database
+	if info.SourceDatabase != "" {
+		cfg.DoltDatabase = info.SourceDatabase
 	}
 	return cfg, nil
 }
@@ -108,9 +116,11 @@ func ResolveRedirect(beadsDir string) SourceDatabaseInfo {
 	if data, err := os.ReadFile(metadataPath); err == nil {
 		var raw struct {
 			DoltDatabase string `json:"dolt_database"`
+			ProjectID    string `json:"project_id"`
 		}
 		if json.Unmarshal(data, &raw) == nil {
 			info.SourceDatabase = raw.DoltDatabase
+			info.SourceProjectID = raw.ProjectID
 		}
 	}
 

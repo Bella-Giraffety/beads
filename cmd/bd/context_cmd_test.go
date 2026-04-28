@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	internalbeads "github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
 )
 
@@ -179,6 +180,65 @@ func TestContextInfo_ProjectIDPresent(t *testing.T) {
 	}
 	if info.ProjectID != "proj-deadbeef-1234" {
 		t.Errorf("ContextInfo.ProjectID: got %q, want %q", info.ProjectID, "proj-deadbeef-1234")
+	}
+}
+
+func TestContextInfo_RedirectedWorkspaceUsesSourceIdentity(t *testing.T) {
+	t.Setenv("BEADS_DOLT_SERVER_DATABASE", "")
+
+	tmpDir := t.TempDir()
+	sourceDir := filepath.Join(tmpDir, "source", ".beads")
+	targetDir := filepath.Join(tmpDir, "shared", ".beads")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatalf("mkdir source: %v", err)
+	}
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+
+	sourceCfg := &configfile.Config{
+		Database:     "dolt",
+		DoltMode:     "server",
+		DoltDatabase: "rig_db",
+		ProjectID:    "rig-project",
+	}
+	if err := sourceCfg.Save(sourceDir); err != nil {
+		t.Fatalf("save source config: %v", err)
+	}
+
+	targetCfg := &configfile.Config{
+		Database:     "dolt",
+		DoltMode:     "server",
+		DoltDatabase: "shared_db",
+		ProjectID:    "shared-project",
+	}
+	if err := targetCfg.Save(targetDir); err != nil {
+		t.Fatalf("save target config: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(sourceDir, "redirect"), []byte(targetDir+"\n"), 0o644); err != nil {
+		t.Fatalf("write redirect: %v", err)
+	}
+
+	loaded, err := internalbeads.LoadRedirectAwareConfig(sourceDir)
+	if err != nil {
+		t.Fatalf("LoadRedirectAwareConfig: %v", err)
+	}
+	if loaded == nil {
+		t.Fatal("loaded config is nil")
+	}
+
+	info := ContextInfo{
+		Backend:   configfile.BackendDolt,
+		DoltMode:  loaded.GetDoltMode(),
+		Database:  loaded.GetDoltDatabase(),
+		ProjectID: loaded.ProjectID,
+	}
+	if info.Database != "rig_db" {
+		t.Errorf("ContextInfo.Database = %q, want %q", info.Database, "rig_db")
+	}
+	if info.ProjectID != "rig-project" {
+		t.Errorf("ContextInfo.ProjectID = %q, want %q", info.ProjectID, "rig-project")
 	}
 }
 

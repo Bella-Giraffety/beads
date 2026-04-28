@@ -1070,8 +1070,9 @@ func validateWorkspaceIdentity(ctx context.Context, beadsDir string) {
 		return // No store connection, nothing to validate
 	}
 
-	// Load project_id from metadata.json
-	cfg, err := configfile.Load(beadsDir)
+	// Load project_id from the effective workspace config so redirected
+	// workspaces validate against their source identity, not the shared target.
+	cfg, err := loadWorkspaceConfig(beadsDir)
 	if err != nil || cfg == nil {
 		return // No config, skip validation (fresh init)
 	}

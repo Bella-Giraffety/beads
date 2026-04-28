@@ -76,8 +76,13 @@ Examples:
 			info.Role = string(role)
 		}
 
-		// Load metadata.json config (does not require DB)
-		cfg, err := configfile.Load(rc.BeadsDir)
+		configBeadsDir := rc.BeadsDir
+		if selected := selectedNoDBBeadsDir(); selected != "" {
+			configBeadsDir = selected
+		}
+
+		// Load effective metadata.json config (does not require DB).
+		cfg, err := beads.LoadRedirectAwareConfig(configBeadsDir)
 		if err != nil {
 			cfg = configfile.DefaultConfig()
 		}

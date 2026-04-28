@@ -2183,6 +2183,7 @@ func TestLoadRedirectAwareConfig_PreservesSourceDatabase(t *testing.T) {
 		Database:     "beads.db",
 		DoltMode:     "server",
 		DoltDatabase: "rig_db",
+		ProjectID:    "rig-project",
 	})
 
 	targetDir := filepath.Join(tmpDir, "shared", ".beads")
@@ -2193,6 +2194,7 @@ func TestLoadRedirectAwareConfig_PreservesSourceDatabase(t *testing.T) {
 		Database:     "beads.db",
 		DoltMode:     "server",
 		DoltDatabase: "shared_db",
+		ProjectID:    "shared-project",
 	})
 
 	if err := os.WriteFile(filepath.Join(sourceDir, "redirect"), []byte(targetDir+"\n"), 0o644); err != nil {
@@ -2205,6 +2207,9 @@ func TestLoadRedirectAwareConfig_PreservesSourceDatabase(t *testing.T) {
 	}
 	if got := cfg.GetDoltDatabase(); got != "rig_db" {
 		t.Fatalf("GetDoltDatabase() = %q, want %q", got, "rig_db")
+	}
+	if got := cfg.ProjectID; got != "rig-project" {
+		t.Fatalf("ProjectID = %q, want %q", got, "rig-project")
 	}
 	if got := os.Getenv("BEADS_DOLT_SERVER_DATABASE"); got != "" {
 		t.Fatalf("BEADS_DOLT_SERVER_DATABASE = %q, want empty", got)

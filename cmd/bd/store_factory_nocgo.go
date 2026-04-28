@@ -6,7 +6,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/storage/embeddeddolt"
@@ -34,7 +34,7 @@ func acquireEmbeddedLock(_ string, _ bool) (embeddeddolt.Unlocker, error) {
 
 // newDoltStoreFromConfig creates a server-mode storage backend from config.
 func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
-	cfg, err := configfile.Load(beadsDir)
+	cfg, err := beads.LoadRedirectAwareConfig(beadsDir)
 	if err == nil && cfg != nil && cfg.IsDoltServerMode() {
 		return dolt.NewFromConfig(ctx, beadsDir)
 	}
@@ -43,7 +43,7 @@ func newDoltStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltS
 
 // newReadOnlyStoreFromConfig creates a read-only server-mode storage backend.
 func newReadOnlyStoreFromConfig(ctx context.Context, beadsDir string) (storage.DoltStorage, error) {
-	cfg, err := configfile.Load(beadsDir)
+	cfg, err := beads.LoadRedirectAwareConfig(beadsDir)
 	if err == nil && cfg != nil && cfg.IsDoltServerMode() {
 		return dolt.NewFromConfigWithOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	}
