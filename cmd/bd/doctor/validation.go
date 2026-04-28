@@ -64,6 +64,7 @@ func checkOrphanedDependenciesDB(db *sql.DB) DoctorCheck {
 		LEFT JOIN issues i ON d.depends_on_id = i.id
 		WHERE i.id IS NULL
 		  AND d.depends_on_id NOT LIKE 'external:%'
+		  AND NOT (d.type = 'blocks' AND d.depends_on_id LIKE '%-wisp-%')
 	`
 	rows, err := db.Query(query)
 	if err != nil {

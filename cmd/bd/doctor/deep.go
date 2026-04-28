@@ -188,7 +188,10 @@ func checkDependencyIntegrity(db *sql.DB) DoctorCheck {
 		FROM dependencies d
 		WHERE (
 		    NOT EXISTS (SELECT 1 FROM issues WHERE id = d.issue_id)
-		    OR NOT EXISTS (SELECT 1 FROM issues WHERE id = d.depends_on_id)
+		    OR (
+		      NOT EXISTS (SELECT 1 FROM issues WHERE id = d.depends_on_id)
+		      AND NOT (d.type = 'blocks' AND d.depends_on_id LIKE '%-wisp-%')
+		    )
 		  )
 		LIMIT 10`
 

@@ -317,23 +317,27 @@ func (s *DoltStore) deleteWispBatchTx(ctx context.Context, ids []string) (int, e
 
 		inClause, args := doltBuildSQLInClause(ids)
 
-		// Delete from wisp_dependencies using two separate queries rather than a
-		// single OR condition. An OR across issue_id and depends_on_id forces Dolt
-		// to union two index scans in one statement, which is slow enough to trigger
-		// the driver's write timeout on large batches (ff-tqm). Two targeted queries
-		// each use their own index: PRIMARY KEY for issue_id and
-		// idx_wisp_dep_depends for depends_on_id.
-		//nolint:gosec // G201: inClause contains only ? markers
-		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM wisp_dependencies WHERE issue_id IN (%s)", inClause),
-			args...); err != nil {
-			return fmt.Errorf("failed to batch delete from wisp_dependencies (issue_id): %w", err)
-		}
-		//nolint:gosec // G201: inClause contains only ? markers
-		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_id IN (%s)", inClause),
-			args...); err != nil {
-			return fmt.Errorf("failed to batch delete from wisp_dependencies (depends_on_id): %w", err)
+		// Clean both the wisp-local graph and any regular dependency edges that point
+		// at the wisps. Molecule/workflow parents live in the main issues table, so
+		// they can legitimately create rows in dependencies that reference a wisp ID.
+		// If those rows survive GC, doctor reports long-lived orphaned be-wisp-* edges.
+		for _, table := range []string{"wisp_dependencies", "dependencies"} {
+			// Use two targeted DELETEs rather than a single OR condition. An OR across
+			// issue_id and depends_on_id forces Dolt to union two index scans in one
+			// statement, which is slow enough to trigger the driver's write timeout on
+			// large batches (ff-tqm).
+			//nolint:gosec // G201: table is a hardcoded constant, inClause contains only ? markers
+			if _, err := tx.ExecContext(ctx,
+				fmt.Sprintf("DELETE FROM %s WHERE issue_id IN (%s)", table, inClause),
+				args...); err != nil {
+				return fmt.Errorf("failed to batch delete from %s (issue_id): %w", table, err)
+			}
+			//nolint:gosec // G201: table is a hardcoded constant, inClause contains only ? markers
+			if _, err := tx.ExecContext(ctx,
+				fmt.Sprintf("DELETE FROM %s WHERE depends_on_id IN (%s)", table, inClause),
+				args...); err != nil {
+				return fmt.Errorf("failed to batch delete from %s (depends_on_id): %w", table, err)
+			}
 		}
 
 		for _, table := range []string{"wisp_events", "wisp_comments", "wisp_labels"} {

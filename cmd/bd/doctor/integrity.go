@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/git"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
@@ -345,7 +346,7 @@ func CheckRepoFingerprint(path string) DoctorCheck {
 	}
 	defer func() { _ = store.Close() }()
 
-	return checkRepoFingerprintWithStore(store, path)
+	return checkRepoFingerprintWithStore(store, beadsDir, path)
 }
 
 // CheckRepoFingerprintWithStore checks repo fingerprint using a shared store (GH#2636).
@@ -358,10 +359,10 @@ func CheckRepoFingerprintWithStore(ss *SharedStore, path string) DoctorCheck {
 			Message: "N/A (no database)",
 		}
 	}
-	return checkRepoFingerprintWithStore(store, path)
+	return checkRepoFingerprintWithStore(store, sharedStoreBeadsDir(ss), path)
 }
 
-func checkRepoFingerprintWithStore(store *dolt.DoltStore, path string) DoctorCheck {
+func checkRepoFingerprintWithStore(store *dolt.DoltStore, beadsDir string, path string) DoctorCheck {
 	ctx := context.Background()
 
 	storedRepoID, err := store.GetMetadata(ctx, "repo_id")
@@ -384,7 +385,7 @@ func checkRepoFingerprintWithStore(store *dolt.DoltStore, path string) DoctorChe
 		}
 	}
 
-	currentRepoID, err := beads.ComputeRepoIDForPath(path)
+	currentRepoID, err := beads.ComputeRepoIDForPath(repoFingerprintPath(beadsDir, path))
 	if err != nil {
 		if strings.Contains(err.Error(), "not a git repository") {
 			return DoctorCheck{
@@ -402,6 +403,15 @@ func checkRepoFingerprintWithStore(store *dolt.DoltStore, path string) DoctorChe
 	}
 
 	if storedRepoID != currentRepoID {
+		if repoFingerprintProjectIdentityMatches(ctx, store, beadsDir) {
+			return DoctorCheck{
+				Name:    "Repo Fingerprint",
+				Status:  StatusWarning,
+				Message: "Repository fingerprint drift detected",
+				Detail:  fmt.Sprintf("stored: %s, current: %s", truncateID(storedRepoID), truncateID(currentRepoID)),
+				Fix:     "Run 'bd migrate --update-repo-id' to refresh repo fingerprint metadata",
+			}
+		}
 		return DoctorCheck{
 			Name:    "Repo Fingerprint",
 			Status:  StatusError,
@@ -416,6 +426,28 @@ func checkRepoFingerprintWithStore(store *dolt.DoltStore, path string) DoctorChe
 		Status:  StatusOK,
 		Message: fmt.Sprintf("Verified (%s)", truncateID(currentRepoID)),
 	}
+}
+
+func repoFingerprintPath(beadsDir string, fallback string) string {
+	if beadsDir != "" {
+		return filepath.Dir(beadsDir)
+	}
+	return fallback
+}
+
+func repoFingerprintProjectIdentityMatches(ctx context.Context, store *dolt.DoltStore, beadsDir string) bool {
+	if beadsDir == "" {
+		return false
+	}
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil || cfg.ProjectID == "" {
+		return false
+	}
+	dbProjectID, err := store.GetMetadata(ctx, "_project_id")
+	if err != nil || dbProjectID == "" {
+		return false
+	}
+	return cfg.ProjectID == dbProjectID
 }
 
 // Helper functions

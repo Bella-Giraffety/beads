@@ -190,6 +190,46 @@ func TestDeleteWispBatch_BothDirectionsCleared(t *testing.T) {
 	}
 }
 
+// TestDeleteWispBatch_CleansRegularDependencies verifies that GC also removes
+// rows from the main dependencies table when a regular issue points at a wisp.
+func TestDeleteWispBatch_CleansRegularDependencies(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	wisp := createTestWisp(t, ctx, store, "target wisp")
+	root := &types.Issue{
+		Title:     "workflow root",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, root, "test"); err != nil {
+		t.Fatalf("CreateIssue(root): %v", err)
+	}
+
+	if _, err := store.db.ExecContext(ctx,
+		`INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by) VALUES (?, ?, 'blocks', NOW(), 'test')`,
+		root.ID, wisp.ID); err != nil {
+		t.Fatalf("insert regular dependency to wisp: %v", err)
+	}
+
+	deleted, err := store.deleteWispBatch(ctx, []string{wisp.ID})
+	if err != nil {
+		t.Fatalf("deleteWispBatch: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("expected 1 deleted, got %d", deleted)
+	}
+
+	depCount := countRegularDependencyRows(t, ctx, store.db, root.ID, wisp.ID)
+	if depCount != 0 {
+		t.Errorf("expected 0 regular dependency rows referencing deleted wisp, got %d", depCount)
+	}
+}
+
 // TestDeleteWispBatch_LargeBatch verifies that a batch exceeding the internal
 // batchSize constant (200) is processed correctly across multiple transactions.
 func TestDeleteWispBatch_LargeBatch(t *testing.T) {
@@ -260,6 +300,26 @@ func countWispDependencyRows(t *testing.T, ctx context.Context, db *sql.DB, ids 
 	var count int
 	if err := db.QueryRowContext(ctx, query, append(args, args...)...).Scan(&count); err != nil {
 		t.Fatalf("countWispDependencyRows: %v", err)
+	}
+	return count
+}
+
+// countRegularDependencyRows counts rows in dependencies that reference any of
+// the given IDs (as either issue_id or depends_on_id).
+func countRegularDependencyRows(t *testing.T, ctx context.Context, db *sql.DB, ids ...string) int {
+	t.Helper()
+	if len(ids) == 0 {
+		return 0
+	}
+	inClause, args := doltBuildSQLInClause(ids)
+	//nolint:gosec // G201: inClause contains only ? markers
+	query := fmt.Sprintf(
+		"SELECT COUNT(*) FROM dependencies WHERE issue_id IN (%s) OR depends_on_id IN (%s)",
+		inClause, inClause,
+	)
+	var count int
+	if err := db.QueryRowContext(ctx, query, append(args, args...)...).Scan(&count); err != nil {
+		t.Fatalf("countRegularDependencyRows: %v", err)
 	}
 	return count
 }

@@ -507,6 +507,31 @@ func TestCheckChildParentDependenciesDB_NonBlockingIgnored(t *testing.T) {
 	}
 }
 
+func TestCheckOrphanedDependenciesDB_IgnoresHistoricalWispEdges(t *testing.T) {
+	store := newTestDoltStore(t, "test")
+	ctx := context.Background()
+
+	root := &types.Issue{Title: "Workflow root", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeTask}
+	if err := store.CreateIssue(ctx, root, "test"); err != nil {
+		t.Fatalf("Failed to create root: %v", err)
+	}
+
+	_, err := store.DB().ExecContext(ctx,
+		`INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by) VALUES (?, ?, 'blocks', NOW(), 'test')`,
+		root.ID, "test-wisp-orphan")
+	if err != nil {
+		t.Fatalf("Failed to insert historical wisp dependency: %v", err)
+	}
+
+	check := checkOrphanedDependenciesDB(store.DB())
+	if check.Status != StatusOK {
+		t.Fatalf("Status = %q, want %q (message=%q detail=%q)", check.Status, StatusOK, check.Message, check.Detail)
+	}
+	if check.Message != "No orphaned dependencies" {
+		t.Fatalf("Message = %q, want %q", check.Message, "No orphaned dependencies")
+	}
+}
+
 // TestCheckTestPollution_NoTestIssues_NoServer verifies StatusOK when no Dolt
 // server is reachable. This isolates BEADS_DOLT_PORT set by TestMain (which
 // starts a Docker-based Dolt container on Ubuntu but not macOS) so the test

@@ -41,7 +41,11 @@ func updateRepoIDInProcess(path string, beadsDir string, autoYes bool) error {
 	ctx := context.Background()
 
 	// Compute new repo ID
-	newRepoID, err := beads.ComputeRepoIDForPath(path)
+	repoPath := path
+	if beadsDir != "" {
+		repoPath = filepath.Dir(beadsDir)
+	}
+	newRepoID, err := beads.ComputeRepoIDForPath(repoPath)
 	if err != nil {
 		return fmt.Errorf("failed to compute repository ID: %w", err)
 	}
