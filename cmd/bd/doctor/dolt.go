@@ -13,6 +13,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltprobe"
 	"github.com/steveyegge/beads/internal/doltserver"
 
 	"github.com/steveyegge/beads/internal/storage/dolt"
@@ -583,11 +584,20 @@ func checkPhantomDatabases(conn *doltConn) DoctorCheck {
 }
 
 // probeForCorrectDatabase checks if another database on the same server has the
-// expected beads tables. Returns the database name if found, empty string otherwise.
+// expected project identity and a readable issues table. Ambiguous matches are
+// rejected so stale compat/orphan catalogs are not treated as authoritative.
 // Used by checkSchemaWithDB to detect pre-#2142 migrations where dolt_database
 // was not written to metadata.json (GH#2160).
 func probeForCorrectDatabase(conn *doltConn) string {
 	ctx := context.Background()
+	expectedProjectID := ""
+	if conn.cfg != nil {
+		expectedProjectID = conn.cfg.ProjectID
+	}
+	if strings.TrimSpace(expectedProjectID) == "" {
+		return ""
+	}
+
 	rows, err := conn.db.QueryContext(ctx, "SHOW DATABASES")
 	if err != nil {
 		return ""
@@ -623,19 +633,33 @@ func probeForCorrectDatabase(conn *doltConn) string {
 		candidates = append(candidates, dbName)
 	}
 
-	// Probe each candidate for an issues table
+	probeResults := make([]doltprobe.Candidate, 0, len(candidates))
 	for _, dbName := range candidates {
 		var count int
 		// USE + query to check if the database has the issues table
 		//nolint:gosec // G201: dbName is from SHOW DATABASES, not user input
 		err := conn.db.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM `%s`.issues LIMIT 1", dbName)).Scan(&count)
-		if err == nil {
-			return dbName
+		if err != nil {
+			continue
 		}
+
+		var projectID sql.NullString
+		//nolint:gosec // G201: dbName is from SHOW DATABASES, not user input
+		err = conn.db.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT value FROM `%s`.metadata WHERE `key` = '_project_id' LIMIT 1", dbName)).Scan(&projectID)
+		if err != nil || !projectID.Valid {
+			continue
+		}
+
+		probeResults = append(probeResults, doltprobe.Candidate{
+			Name:           dbName,
+			HasIssuesTable: true,
+			ProjectID:      projectID.String,
+		})
 	}
 
-	return ""
+	return doltprobe.SelectAuthoritativeDatabase(expectedProjectID, probeResults)
 }
 
 // checkSharedServerHealth verifies shared server configuration and health.

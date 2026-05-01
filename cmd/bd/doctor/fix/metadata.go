@@ -9,6 +9,7 @@ import (
 
 	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/doltprobe"
 	"github.com/steveyegge/beads/internal/storage/dolt"
 )
 
@@ -194,7 +195,7 @@ func FixMissingDoltDatabase(path string) error {
 	}
 	defer db.Close()
 
-	correctDB := probeForCorrectDoltDatabase(db, configfile.DefaultDoltDatabase)
+	correctDB := probeForCorrectDoltDatabase(db, configfile.DefaultDoltDatabase, cfg.ProjectID)
 	if correctDB == "" {
 		return nil // No alternate database found
 	}
@@ -211,10 +212,14 @@ func FixMissingDoltDatabase(path string) error {
 }
 
 // probeForCorrectDoltDatabase checks if another database on the server has the
-// expected beads tables (issues, dependencies, config). Returns the database name
-// if found, empty string otherwise.
-func probeForCorrectDoltDatabase(db *sql.DB, skipDB string) string {
+// expected project identity and readable issues table. Ambiguous matches are
+// rejected so stale compat/orphan catalogs are not treated as authoritative.
+func probeForCorrectDoltDatabase(db *sql.DB, skipDB string, expectedProjectID string) string {
 	ctx := context.Background()
+	if strings.TrimSpace(expectedProjectID) == "" {
+		return ""
+	}
+
 	rows, err := db.QueryContext(ctx, "SHOW DATABASES")
 	if err != nil {
 		return ""
@@ -244,15 +249,30 @@ func probeForCorrectDoltDatabase(db *sql.DB, skipDB string) string {
 		candidates = append(candidates, dbName)
 	}
 
+	probeResults := make([]doltprobe.Candidate, 0, len(candidates))
 	for _, dbName := range candidates {
 		var count int
 		//nolint:gosec // G201: dbName from SHOW DATABASES, not user input
 		err := db.QueryRowContext(ctx,
 			fmt.Sprintf("SELECT COUNT(*) FROM `%s`.issues LIMIT 1", dbName)).Scan(&count)
-		if err == nil {
-			return dbName
+		if err != nil {
+			continue
 		}
+
+		var projectID sql.NullString
+		//nolint:gosec // G201: dbName from SHOW DATABASES, not user input
+		err = db.QueryRowContext(ctx,
+			fmt.Sprintf("SELECT value FROM `%s`.metadata WHERE `key` = '_project_id' LIMIT 1", dbName)).Scan(&projectID)
+		if err != nil || !projectID.Valid {
+			continue
+		}
+
+		probeResults = append(probeResults, doltprobe.Candidate{
+			Name:           dbName,
+			HasIssuesTable: true,
+			ProjectID:      projectID.String,
+		})
 	}
 
-	return ""
+	return doltprobe.SelectAuthoritativeDatabase(expectedProjectID, probeResults)
 }

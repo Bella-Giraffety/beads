@@ -1070,27 +1070,11 @@ func validateWorkspaceIdentity(ctx context.Context, beadsDir string) {
 		return // No store connection, nothing to validate
 	}
 
-	// Load project_id from metadata.json
-	cfg, err := configfile.Load(beadsDir)
-	if err != nil || cfg == nil {
-		return // No config, skip validation (fresh init)
-	}
-	configProjectID := cfg.ProjectID
-	if configProjectID == "" {
-		return // No project_id in config (pre-identity era)
-	}
-
-	// Get project_id from database
-	dbProjectID, err := store.GetMetadata(ctx, "_project_id")
-	if err != nil || dbProjectID == "" {
-		return // No project_id in DB (new or pre-identity database)
-	}
-
-	// Compare: mismatch means drift
-	if configProjectID != dbProjectID {
+	identity := currentWorkspaceIdentity(ctx, beadsDir, store)
+	if identity.Mismatch {
 		fmt.Fprintf(os.Stderr, "Error: workspace identity mismatch detected\n\n")
-		fmt.Fprintf(os.Stderr, "  metadata.json project_id: %s\n", configProjectID)
-		fmt.Fprintf(os.Stderr, "  database _project_id:     %s\n\n", dbProjectID)
+		fmt.Fprintf(os.Stderr, "  metadata.json project_id: %s\n", identity.LocalID)
+		fmt.Fprintf(os.Stderr, "  database _project_id:     %s\n\n", identity.DatabaseID)
 		fmt.Fprintf(os.Stderr, "This means the CLI config and database belong to different projects.\n")
 		fmt.Fprintf(os.Stderr, "Possible causes:\n")
 		fmt.Fprintf(os.Stderr, "  • BEADS_DIR points to a different project's .beads/\n")

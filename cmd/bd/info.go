@@ -57,8 +57,28 @@ Examples:
 			"mode":          "direct",
 		}
 
-		// Get issue count from direct store
+		beadsDir := filepath.Dir(dbPath)
+		identity := workspaceIdentityStatus{}
 		if store != nil {
+			identity = currentWorkspaceIdentity(rootCtx, beadsDir, store)
+			if identity.LocalID != "" {
+				status := "ok"
+				message := "Workspace and database identities match"
+				if identity.Mismatch {
+					status = "mismatch"
+					message = "Workspace metadata.json and database _project_id disagree; suppressing issue-derived diagnostics"
+				}
+				info["workspace_identity"] = map[string]interface{}{
+					"status":              status,
+					"message":             message,
+					"metadata_project_id": identity.LocalID,
+					"database_project_id": identity.DatabaseID,
+				}
+			}
+		}
+
+		// Get issue count from direct store
+		if store != nil && !identity.Mismatch {
 			ctx := rootCtx
 
 			filter := types.IssueFilter{}
@@ -98,22 +118,27 @@ Examples:
 			}
 
 			// Get sample issue IDs
-			filter := types.IssueFilter{}
-			issues, err := store.SearchIssues(ctx, "", filter)
 			sampleIDs := []string{}
 			detectedPrefix := ""
-			if err == nil && len(issues) > 0 {
-				// Get first 3 issue IDs as samples
-				maxSamples := 3
-				if len(issues) < maxSamples {
-					maxSamples = len(issues)
-				}
-				for i := 0; i < maxSamples; i++ {
-					sampleIDs = append(sampleIDs, issues[i].ID)
-				}
-				// Detect prefix from first issue
-				if len(issues) > 0 {
-					detectedPrefix = extractPrefix(issues[0].ID)
+			identityWarning := ""
+			if identity.Mismatch {
+				identityWarning = "Workspace metadata.json and database _project_id disagree; sample issues suppressed"
+			} else {
+				filter := types.IssueFilter{}
+				issues, err := store.SearchIssues(ctx, "", filter)
+				if err == nil && len(issues) > 0 {
+					// Get first 3 issue IDs as samples
+					maxSamples := 3
+					if len(issues) < maxSamples {
+						maxSamples = len(issues)
+					}
+					for i := 0; i < maxSamples; i++ {
+						sampleIDs = append(sampleIDs, issues[i].ID)
+					}
+					// Detect prefix from first issue
+					if len(issues) > 0 {
+						detectedPrefix = extractPrefix(issues[0].ID)
+					}
 				}
 			}
 
@@ -123,6 +148,7 @@ Examples:
 				"config":           configMap,
 				"sample_issue_ids": sampleIDs,
 				"detected_prefix":  detectedPrefix,
+				"identity_warning": identityWarning,
 			}
 		}
 
@@ -137,6 +163,21 @@ Examples:
 		fmt.Println("===========================")
 		fmt.Printf("Database: %s\n", absDBPath)
 		fmt.Printf("Mode: direct\n")
+		if identityInfo, ok := info["workspace_identity"].(map[string]interface{}); ok {
+			fmt.Println("\nWorkspace Identity:")
+			if status, ok := identityInfo["status"].(string); ok {
+				fmt.Printf("  Status: %s\n", status)
+			}
+			if localID, ok := identityInfo["metadata_project_id"].(string); ok && localID != "" {
+				fmt.Printf("  metadata.json project_id: %s\n", localID)
+			}
+			if dbID, ok := identityInfo["database_project_id"].(string); ok && dbID != "" {
+				fmt.Printf("  database _project_id: %s\n", dbID)
+			}
+			if message, ok := identityInfo["message"].(string); ok && message != "" {
+				fmt.Printf("  %s\n", message)
+			}
+		}
 
 		// Show issue count
 		if count, ok := info["issue_count"].(int); ok {
@@ -156,6 +197,9 @@ Examples:
 				}
 				if samples, ok := schemaInfo["sample_issue_ids"].([]string); ok && len(samples) > 0 {
 					fmt.Printf("  Sample Issues: %v\n", samples)
+				}
+				if warning, ok := schemaInfo["identity_warning"].(string); ok && warning != "" {
+					fmt.Printf("  Identity Warning: %s\n", warning)
 				}
 			}
 		}
