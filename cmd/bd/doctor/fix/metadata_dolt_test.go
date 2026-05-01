@@ -7,10 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/configfile"
 	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/testutil"
 )
 
 // setupDoltWorkspace creates a temp beads workspace with a Dolt database.
@@ -64,6 +66,22 @@ func setupDoltWorkspace(t *testing.T) string {
 	}
 
 	return dir
+}
+
+func openServerTestStore(t *testing.T, port int, dbName string) *dolt.DoltStore {
+	t.Helper()
+
+	store, err := dolt.New(context.Background(), &dolt.Config{
+		Path:       filepath.Join(t.TempDir(), dbName+".db"),
+		ServerHost: "127.0.0.1",
+		ServerPort: port,
+		Database:   dbName,
+	})
+	if err != nil {
+		t.Fatalf("open server store %s: %v", dbName, err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	return store
 }
 
 // TestFixMissingMetadata_DoltRepair verifies that FixMissingMetadata writes
@@ -209,5 +227,103 @@ func TestFixMissingMetadata_DoltPartialRepair(t *testing.T) {
 	cloneID, _ := store2.GetMetadata(ctx, "clone_id")
 	if cloneID == "" {
 		t.Error("clone_id was not set during partial repair")
+	}
+}
+
+func TestFixMissingMetadata_RepairsAuthoritativeAlternateDatabaseFirst(t *testing.T) {
+	portStr := testutil.StartIsolatedDoltContainer(t)
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("parse isolated Dolt port %q: %v", portStr, err)
+	}
+
+	dir := t.TempDir()
+	beadsDir := filepath.Join(dir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("create .beads directory: %v", err)
+	}
+	setupGitRepoInDir(t, dir)
+
+	const authoritativeDB = "repair_authoritative"
+	const projectID = "project-authoritative"
+
+	wrongStore := openServerTestStore(t, port, configfile.DefaultDoltDatabase)
+	if err := wrongStore.SetMetadata(context.Background(), "_project_id", "project-wrong"); err != nil {
+		t.Fatalf("seed wrong default database identity: %v", err)
+	}
+
+	authoritativeStore := openServerTestStore(t, port, authoritativeDB)
+	if err := authoritativeStore.SetMetadata(context.Background(), "_project_id", projectID); err != nil {
+		t.Fatalf("seed authoritative database identity: %v", err)
+	}
+
+	cfg := &configfile.Config{
+		Database:       "dolt",
+		Backend:        configfile.BackendDolt,
+		DoltMode:       configfile.DoltModeServer,
+		DoltServerHost: "127.0.0.1",
+		DoltServerPort: port,
+		ProjectID:      projectID,
+	}
+	if err := cfg.Save(beadsDir); err != nil {
+		t.Fatalf("save workspace metadata: %v", err)
+	}
+
+	if err := FixMissingMetadata(dir, "1.2.3"); err != nil {
+		t.Fatalf("FixMissingMetadata failed: %v", err)
+	}
+
+	loadedCfg, err := configfile.Load(beadsDir)
+	if err != nil {
+		t.Fatalf("reload workspace metadata: %v", err)
+	}
+	if loadedCfg.DoltDatabase != authoritativeDB {
+		t.Fatalf("DoltDatabase = %q, want %q", loadedCfg.DoltDatabase, authoritativeDB)
+	}
+
+	verifyAuthoritative := openServerTestStore(t, port, authoritativeDB)
+	bdVersion, err := verifyAuthoritative.GetLocalMetadata(context.Background(), "bd_version")
+	if err != nil {
+		t.Fatalf("authoritative GetLocalMetadata(bd_version): %v", err)
+	}
+	if bdVersion != "1.2.3" {
+		t.Fatalf("authoritative bd_version = %q, want %q", bdVersion, "1.2.3")
+	}
+	repoID, err := verifyAuthoritative.GetMetadata(context.Background(), "repo_id")
+	if err != nil {
+		t.Fatalf("authoritative GetMetadata(repo_id): %v", err)
+	}
+	if repoID == "" {
+		t.Fatal("authoritative repo_id was not set")
+	}
+	cloneID, err := verifyAuthoritative.GetMetadata(context.Background(), "clone_id")
+	if err != nil {
+		t.Fatalf("authoritative GetMetadata(clone_id): %v", err)
+	}
+	if cloneID == "" {
+		t.Fatal("authoritative clone_id was not set")
+	}
+
+	verifyWrongDefault := openServerTestStore(t, port, configfile.DefaultDoltDatabase)
+	wrongBDVersion, err := verifyWrongDefault.GetLocalMetadata(context.Background(), "bd_version")
+	if err != nil {
+		t.Fatalf("wrong default GetLocalMetadata(bd_version): %v", err)
+	}
+	if wrongBDVersion != "" {
+		t.Fatalf("wrong default bd_version = %q, want empty", wrongBDVersion)
+	}
+	wrongRepoID, err := verifyWrongDefault.GetMetadata(context.Background(), "repo_id")
+	if err != nil {
+		t.Fatalf("wrong default GetMetadata(repo_id): %v", err)
+	}
+	if wrongRepoID != "" {
+		t.Fatalf("wrong default repo_id = %q, want empty", wrongRepoID)
+	}
+	wrongCloneID, err := verifyWrongDefault.GetMetadata(context.Background(), "clone_id")
+	if err != nil {
+		t.Fatalf("wrong default GetMetadata(clone_id): %v", err)
+	}
+	if wrongCloneID != "" {
+		t.Fatalf("wrong default clone_id = %q, want empty", wrongCloneID)
 	}
 }

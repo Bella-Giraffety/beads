@@ -35,6 +35,9 @@ func FixMissingMetadata(path string, bdVersion string) error {
 	if cfg.GetBackend() != configfile.BackendDolt {
 		return nil // Not a Dolt backend, nothing to fix
 	}
+	if err := repairMissingDoltDatabase(beadsDir, cfg); err != nil {
+		return err
+	}
 
 	ctx := context.Background()
 
@@ -182,6 +185,14 @@ func FixMissingDoltDatabase(path string) error {
 		return nil // Not Dolt backend
 	}
 
+	return repairMissingDoltDatabase(beadsDir, cfg)
+}
+
+func repairMissingDoltDatabase(beadsDir string, cfg *configfile.Config) error {
+	if cfg == nil || cfg.GetBackend() != configfile.BackendDolt {
+		return nil
+	}
+
 	// Only fix if dolt_database is missing (using default)
 	if cfg.DoltDatabase != "" {
 		return nil // Already configured explicitly
@@ -195,7 +206,7 @@ func FixMissingDoltDatabase(path string) error {
 	}
 	defer db.Close()
 
-	correctDB := probeForCorrectDoltDatabase(db, configfile.DefaultDoltDatabase, cfg.ProjectID)
+	correctDB := probeForCorrectDoltDatabase(db, cfg.GetDoltDatabase(), cfg.ProjectID)
 	if correctDB == "" {
 		return nil // No alternate database found
 	}
