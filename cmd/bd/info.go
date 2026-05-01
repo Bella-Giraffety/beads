@@ -61,13 +61,7 @@ Examples:
 		identity := workspaceIdentityStatus{}
 		if store != nil {
 			identity = currentWorkspaceIdentity(rootCtx, beadsDir, store)
-			if identity.LocalID != "" {
-				status := "ok"
-				message := "Workspace and database identities match"
-				if identity.Mismatch {
-					status = "mismatch"
-					message = "Workspace metadata.json and database _project_id disagree; suppressing issue-derived diagnostics"
-				}
+			if status, message, ok := identity.infoStatus(); ok {
 				info["workspace_identity"] = map[string]interface{}{
 					"status":              status,
 					"message":             message,
@@ -78,7 +72,7 @@ Examples:
 		}
 
 		// Get issue count from direct store
-		if store != nil && !identity.Mismatch {
+		if store != nil && identity.allowsIssueDiagnostics() {
 			ctx := rootCtx
 
 			filter := types.IssueFilter{}
@@ -121,8 +115,8 @@ Examples:
 			sampleIDs := []string{}
 			detectedPrefix := ""
 			identityWarning := ""
-			if identity.Mismatch {
-				identityWarning = "Workspace metadata.json and database _project_id disagree; sample issues suppressed"
+			if !identity.allowsIssueDiagnostics() {
+				_, identityWarning, _ = identity.infoStatus()
 			} else {
 				filter := types.IssueFilter{}
 				issues, err := store.SearchIssues(ctx, "", filter)

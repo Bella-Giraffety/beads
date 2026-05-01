@@ -48,6 +48,36 @@ func TestCurrentWorkspaceIdentity(t *testing.T) {
 		if identity.LocalID != "project-a" || identity.DatabaseID != "" {
 			t.Fatalf("unexpected identity status: %+v", identity)
 		}
+		if identity.allowsIssueDiagnostics() {
+			t.Fatalf("expected issue-derived diagnostics to stay suppressed until identity is proven: %+v", identity)
+		}
+		status, message, ok := identity.infoStatus()
+		if !ok {
+			t.Fatalf("expected info status for unverified identity")
+		}
+		if status != "unverified" {
+			t.Fatalf("status = %q, want unverified", status)
+		}
+		if message == "" {
+			t.Fatal("expected unverified identity warning message")
+		}
+	})
+
+	t.Run("verified identity allows issue diagnostics", func(t *testing.T) {
+		identity := currentWorkspaceIdentity(context.Background(), beadsDir, fakeMetadataStore{projectID: "project-a"})
+		if !identity.allowsIssueDiagnostics() {
+			t.Fatalf("expected verified identity to allow issue-derived diagnostics: %+v", identity)
+		}
+		status, message, ok := identity.infoStatus()
+		if !ok {
+			t.Fatalf("expected info status for verified identity")
+		}
+		if status != "ok" {
+			t.Fatalf("status = %q, want ok", status)
+		}
+		if message == "" {
+			t.Fatal("expected verified identity message")
+		}
 	})
 }
 

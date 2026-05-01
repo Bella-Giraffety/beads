@@ -16,6 +16,30 @@ type workspaceIdentityStatus struct {
 	Mismatch   bool
 }
 
+func (s workspaceIdentityStatus) infoStatus() (string, string, bool) {
+	if s.LocalID == "" {
+		return "", "", false
+	}
+
+	if s.Mismatch {
+		return "mismatch", "Workspace metadata.json and database _project_id disagree; suppressing issue-derived diagnostics", true
+	}
+
+	if s.DatabaseID == "" {
+		return "unverified", "Database _project_id is missing; suppressing issue-derived diagnostics until identity is proven", true
+	}
+
+	return "ok", "Workspace and database identities match", true
+}
+
+func (s workspaceIdentityStatus) allowsIssueDiagnostics() bool {
+	if s.LocalID == "" {
+		return true
+	}
+
+	return s.DatabaseID != "" && !s.Mismatch
+}
+
 func currentWorkspaceIdentity(ctx context.Context, beadsDir string, s workspaceIdentityMetadataStore) workspaceIdentityStatus {
 	if s == nil {
 		return workspaceIdentityStatus{}
