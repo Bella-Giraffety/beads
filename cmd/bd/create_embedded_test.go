@@ -96,7 +96,7 @@ func bdShow(t *testing.T, bd, dir, id string) *types.Issue {
 // openStore opens an EmbeddedDoltStore for direct verification queries.
 func openStore(t *testing.T, beadsDir, database string) *embeddeddolt.EmbeddedDoltStore {
 	t.Helper()
-	store, err := embeddeddolt.New(t.Context(), beadsDir, database, "main")
+	store, err := embeddeddolt.Open(t.Context(), beadsDir, database, "main")
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -122,6 +122,27 @@ func assertDepExists(t *testing.T, beadsDir, database, issueID, dependsOnID stri
 	}
 	if count == 0 {
 		t.Errorf("expected dependency %s -> %s, not found", issueID, dependsOnID)
+	}
+}
+
+func assertDepExistsWithType(t *testing.T, beadsDir, database, issueID, dependsOnID, expectedType string) {
+	t.Helper()
+	dataDir := filepath.Join(beadsDir, "embeddeddolt")
+	db, cleanup, err := embeddeddolt.OpenSQL(t.Context(), dataDir, database, "main")
+	if err != nil {
+		t.Fatalf("OpenSQL: %v", err)
+	}
+	defer cleanup()
+
+	var depType string
+	err = db.QueryRowContext(t.Context(),
+		"SELECT type FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
+		issueID, dependsOnID).Scan(&depType)
+	if err != nil {
+		t.Fatalf("query dependencies for %s -> %s: %v", issueID, dependsOnID, err)
+	}
+	if depType != expectedType {
+		t.Errorf("dependency %s -> %s: got type %q, want %q", issueID, dependsOnID, depType, expectedType)
 	}
 }
 
@@ -270,6 +291,34 @@ func TestEmbeddedCreate(t *testing.T) {
 
 		// "blocks:X" reverses direction: X depends on new issue (parent.ID -> child.ID)
 		assertDepExists(t, beadsDir, "dp", parent.ID, child.ID)
+	})
+
+	t.Run("blocked_by_alias", func(t *testing.T) {
+		dir, beadsDir, _ := bdInit(t, bd, "--prefix", "bb")
+		blocker := bdCreate(t, bd, dir, "Blocker issue")
+		blocked := bdCreate(t, bd, dir, "Blocked issue", "--deps", "blocked-by:"+blocker.ID)
+
+		assertDepExistsWithType(t, beadsDir, "bb", blocked.ID, blocker.ID, "blocks")
+	})
+
+	t.Run("depends_on_alias", func(t *testing.T) {
+		dir, beadsDir, _ := bdInit(t, bd, "--prefix", "do")
+		prereq := bdCreate(t, bd, dir, "Prerequisite")
+		dependent := bdCreate(t, bd, dir, "Dependent issue", "--deps", "depends-on:"+prereq.ID)
+
+		assertDepExistsWithType(t, beadsDir, "do", dependent.ID, prereq.ID, "blocks")
+	})
+
+	t.Run("unknown_dep_type_rejected", func(t *testing.T) {
+		dir, _, _ := bdInit(t, bd, "--prefix", "ud")
+		blocker := bdCreate(t, bd, dir, "Blocker")
+		out := bdCreateFail(t, bd, dir, "Bad dep type", "--deps", "bogus-type:"+blocker.ID)
+		if !strings.Contains(out, "unknown dependency type") {
+			t.Errorf("expected 'unknown dependency type' error, got:\n%s", out)
+		}
+		if !strings.Contains(out, "blocked-by") || !strings.Contains(out, "depends-on") {
+			t.Errorf("expected accepted dependency aliases in error, got:\n%s", out)
+		}
 	})
 
 	t.Run("multiple_dependencies", func(t *testing.T) {
@@ -421,6 +470,15 @@ func TestEmbeddedCreate(t *testing.T) {
 		issue := bdCreate(t, bd, dir, "External ref issue", "--external-ref", "gh-123")
 		if issue.ExternalRef == nil || *issue.ExternalRef != "gh-123" {
 			t.Errorf("external_ref: got %v, want %q", issue.ExternalRef, "gh-123")
+		}
+	})
+
+	t.Run("linear_external_ref", func(t *testing.T) {
+		dir, _, _ := bdInit(t, bd, "--prefix", "ler")
+		ref := "https://linear.app/team/issue/TEAM-123/fix-login"
+		issue := bdCreate(t, bd, dir, "Pre-linked Linear issue", "--external-ref", ref)
+		if issue.ExternalRef == nil || *issue.ExternalRef != ref {
+			t.Errorf("external_ref: got %v, want %q", issue.ExternalRef, ref)
 		}
 	})
 

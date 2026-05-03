@@ -27,12 +27,23 @@ var configCmd = &cobra.Command{
 Configuration is stored per-project in the beads database and is version-control-friendly.
 
 Common namespaces:
+  - export.*          Auto-export settings (stored in config.yaml)
   - jira.*            Jira integration settings
   - linear.*          Linear integration settings
   - github.*          GitHub integration settings
   - custom.*          Custom integration settings
   - status.*          Issue status configuration
   - doctor.suppress.* Suppress specific bd doctor warnings (GH#1095)
+
+Auto-Export (config.yaml):
+  Writes .beads/issues.jsonl after every write command (throttled).
+  Enabled by default. Useful for viewers (bv) and git-based sync.
+
+  Keys:
+    export.auto       Enable/disable auto-export (default: true)
+    export.path       Output filename relative to .beads/ (default: issues.jsonl)
+    export.interval   Minimum time between exports (default: 60s)
+    export.git-add    Auto-stage the export file (default: true)
 
 Custom Status States:
   You can define custom status states for multi-step pipelines using the
@@ -53,14 +64,18 @@ Suppressing Doctor Warnings:
   To unsuppress: bd config unset doctor.suppress.<slug>
 
 Examples:
+  bd config set export.auto false                      # Disable auto-export
+  bd config set export.path "beads.jsonl"              # Custom export filename
   bd config set jira.url "https://company.atlassian.net"
   bd config set jira.project "PROJ"
   bd config set status.custom "awaiting_review,awaiting_testing"
   bd config set doctor.suppress.pending-migrations true
-  bd config get jira.url
+  bd config get export.auto
   bd config list
   bd config unset jira.url`,
 }
+
+var forceGitTracked bool
 
 var configSetCmd = &cobra.Command{
 	Use:   "set <key> <value>",
@@ -69,6 +84,39 @@ var configSetCmd = &cobra.Command{
 	Run: func(_ *cobra.Command, args []string) {
 		key := args[0]
 		value := args[1]
+
+		// Reject keys that look like init-only state so the user does not
+		// silently land a write in a store that 'bd create' never reads.
+		// 'bd config set issue-prefix' used to write DB key "issue-prefix"
+		// (dash) while 'bd create' only reads YAML "issue-prefix" or DB
+		// "issue_prefix" (underscore) — three divergent stores, write never
+		// visible.
+		if msg, rejected := rejectProtectedConfigKey(key); rejected {
+			fmt.Fprintln(os.Stderr, msg)
+			os.Exit(1)
+		}
+
+		// Warn on unrecognized config keys so typos don't silently become
+		// no-ops. The custom.* namespace is exempt (user-extensible). GH#3293.
+		if !isRecognizedConfigKey(key) {
+			suggestion := suggestConfigKey(key)
+			if suggestion != "" {
+				fmt.Fprintf(os.Stderr, "Warning: %q is not a recognized config key. Did you mean %q?\n", key, suggestion)
+			} else {
+				fmt.Fprintf(os.Stderr, "Warning: %q is not a recognized config key. Use 'custom.*' for user-defined keys.\n", key)
+			}
+			fmt.Fprintf(os.Stderr, "Run 'bd config --help' for valid namespaces.\n")
+		}
+
+		// Refuse to write secret keys to git-tracked config files unless
+		// --force-git-tracked is set. This prevents accidental exposure of
+		// API keys and tokens in git history.
+		if !forceGitTracked {
+			if err := config.CheckSecretKeyGitSafety(key); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
 
 		// Check if this is a yaml-only key (startup settings like no-db, etc.)
 		// These must be written to config.yaml, not SQLite, because they're read
@@ -137,9 +185,7 @@ var configSetCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "Error setting config: %v\n", err)
 			os.Exit(1)
 		}
-		if _, err := store.CommitPending(ctx, getActor()); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to commit config change: %v\n", err)
-		}
+		commandDidWrite.Store(true)
 
 		if jsonOutput {
 			outputJSON(map[string]string{
@@ -410,9 +456,7 @@ var configUnsetCmd = &cobra.Command{
 			fmt.Fprintf(os.Stderr, "Error deleting config: %v\n", err)
 			os.Exit(1)
 		}
-		if _, err := store.CommitPending(ctx, getActor()); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to commit config change: %v\n", err)
-		}
+		commandDidWrite.Store(true)
 
 		if jsonOutput {
 			outputJSON(map[string]string{
@@ -489,8 +533,9 @@ Checks:
 func validateSyncConfig(repoPath string) []string {
 	var issues []string
 
-	// Load config.yaml directly from the repo path
-	configPath := filepath.Join(repoPath, ".beads", "config.yaml")
+	// Load config.yaml from the resolved workspace so shared worktrees validate
+	// the same config file they actually run with.
+	configPath := filepath.Join(doctor.ResolveBeadsDirForRepo(repoPath), "config.yaml")
 	v := viper.New()
 	v.SetConfigType("yaml")
 	v.SetConfigFile(configPath)
@@ -634,6 +679,16 @@ Examples:
 			}
 		}
 
+		// Phase 3b: Check git-tracked secret safety for yaml keys
+		if !forceGitTracked {
+			for _, p := range yamlPairs {
+				if err := config.CheckSecretKeyGitSafety(p.key); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+			}
+		}
+
 		// Phase 4: Write yaml-only keys
 		for _, p := range yamlPairs {
 			if err := config.SetYamlConfig(p.key, p.value); err != nil {
@@ -665,9 +720,7 @@ Examples:
 					os.Exit(1)
 				}
 			}
-			if _, err := store.CommitPending(ctx, getActor()); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to commit config changes: %v\n", err)
-			}
+			commandDidWrite.Store(true)
 		}
 
 		// Phase 7: Output results
@@ -701,7 +754,112 @@ Examples:
 	},
 }
 
+// recognizedConfigPrefixes lists valid top-level config namespaces.
+// Keys under custom.* are always accepted (user-extensible).
+var recognizedConfigPrefixes = []string{
+	"export.", "dolt.", "jira.", "linear.", "github.", "custom.",
+	"status.", "doctor.suppress.", "routing.", "sync.", "git.",
+	"directory.", "repos.", "external_projects.", "validation.",
+	"hierarchy.", "ai.", "backup.", "federation.",
+}
+
+// recognizedConfigKeys lists valid non-namespaced config keys.
+var recognizedConfigKeys = map[string]bool{
+	"no-db": true, "json": true, "db": true, "actor": true,
+	"identity": true, "no-push": true, "no-git-ops": true,
+	"create.require-description": true, "beads.role": true,
+	"auto_compact_enabled": true, "schema_version": true,
+	"output.title-length": true,
+}
+
+func isRecognizedConfigKey(key string) bool {
+	if recognizedConfigKeys[key] {
+		return true
+	}
+	for _, prefix := range recognizedConfigPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// rejectProtectedConfigKey rejects keys that are owned by a dedicated
+// lifecycle command (init/rename) rather than 'bd config set'. The canonical
+// example is issue_prefix: 'bd create' reads YAML "issue-prefix"
+// then DB "issue_prefix", while 'bd config set' would land in DB
+// "issue-prefix" — a third key no reader consults. Accepting either the
+// dash or underscore form silently produces a write that looks like it
+// succeeded but is never visible to 'bd create'. Reject both and point the
+// user at the right command.
+func rejectProtectedConfigKey(key string) (string, bool) {
+	switch key {
+	case "issue_prefix", "issue-prefix":
+		return "Error: issue_prefix cannot be set via 'bd config set'.\n" +
+			"  - New project:       bd init --prefix <prefix>\n" +
+			"  - Fresh clone:       bd bootstrap\n" +
+			"  - Rename existing:   bd rename-prefix <new-prefix>", true
+	}
+	return "", false
+}
+
+// suggestConfigKey tries to find a close match for a mistyped key by checking
+// if the key's prefix is a known prefix with a typo. Returns empty string if
+// no suggestion can be made.
+func suggestConfigKey(key string) string {
+	parts := strings.SplitN(key, ".", 2)
+	if len(parts) < 2 {
+		return ""
+	}
+	prefix := parts[0] + "."
+
+	bestMatch := ""
+	bestDist := 3 // max edit distance to suggest
+	for _, known := range recognizedConfigPrefixes {
+		knownPrefix := strings.TrimSuffix(known, ".")
+		d := levenshteinDistance(parts[0], knownPrefix)
+		if d > 0 && d < bestDist {
+			bestDist = d
+			bestMatch = known + parts[1]
+		}
+	}
+	_ = prefix
+	return bestMatch
+}
+
+func levenshteinDistance(a, b string) int {
+	la, lb := len(a), len(b)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+
+	prev := make([]int, lb+1)
+	curr := make([]int, lb+1)
+	for j := range prev {
+		prev[j] = j
+	}
+
+	for i := 1; i <= la; i++ {
+		curr[0] = i
+		for j := 1; j <= lb; j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			curr[j] = min(curr[j-1]+1, min(prev[j]+1, prev[j-1]+cost))
+		}
+		prev, curr = curr, prev
+	}
+	return prev[lb]
+}
+
 func init() {
+	configSetCmd.Flags().BoolVar(&forceGitTracked, "force-git-tracked", false, "Allow writing secret keys to git-tracked config files (use with caution)")
+	configSetManyCmd.Flags().BoolVar(&forceGitTracked, "force-git-tracked", false, "Allow writing secret keys to git-tracked config files (use with caution)")
+
 	configCmd.AddCommand(configSetCmd)
 	configCmd.AddCommand(configSetManyCmd)
 	configCmd.AddCommand(configGetCmd)

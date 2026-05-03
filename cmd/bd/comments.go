@@ -8,7 +8,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
-	"github.com/steveyegge/beads/internal/utils"
 )
 
 var commentsCmd = &cobra.Command{
@@ -18,7 +17,7 @@ var commentsCmd = &cobra.Command{
 	Long: `View or manage comments on an issue.
 
 Examples:
-  # List all comments on an issue
+  # List all comments on an issue (issue id is required — there is no "comments list")
   bd comments bd-123
 
   # List comments in JSON format
@@ -38,13 +37,24 @@ Examples:
 			FatalErrorRespectJSON("getting comments: %v", err)
 		}
 		ctx := rootCtx
-		fullID, err := utils.ResolvePartialID(ctx, store, issueID)
+
+		result, err := resolveAndGetIssueWithRouting(ctx, store, issueID)
 		if err != nil {
+			if result != nil {
+				result.Close()
+			}
 			FatalErrorRespectJSON("resolving %s: %v", issueID, err)
 		}
-		issueID = fullID
+		if result == nil || result.Issue == nil {
+			if result != nil {
+				result.Close()
+			}
+			FatalErrorRespectJSON("issue %s not found", issueID)
+		}
+		defer result.Close()
+		issueID = result.ResolvedID
 
-		comments, err := store.GetIssueComments(ctx, issueID)
+		comments, err := result.Store.GetIssueComments(ctx, issueID)
 		if err != nil {
 			FatalErrorRespectJSON("getting comments: %v", err)
 		}
@@ -79,6 +89,24 @@ Examples:
 			}
 			fmt.Println()
 		}
+	},
+}
+
+// commentsMisplacedListCmd catches the reflexive "bd comments list" invocation (GH#3542).
+// Listing comments always requires an issue id: bd comments <issue-id>.
+var commentsMisplacedListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "Invalid — use bd comments <issue-id> to list comments",
+	Run: func(cmd *cobra.Command, args []string) {
+		FatalErrorRespectJSON(`"bd comments list" is not valid.
+
+To list comments on an issue, run:
+  bd comments <issue-id>
+
+Example:
+  bd comments bd-123
+
+See: bd comments --help`)
 	},
 }
 
@@ -128,23 +156,28 @@ Examples:
 		}
 		ctx := rootCtx
 
-		fullID, err := utils.ResolvePartialID(ctx, store, issueID)
+		result, err := resolveAndGetIssueWithRouting(ctx, store, issueID)
 		if err != nil {
+			if result != nil {
+				result.Close()
+			}
 			FatalErrorRespectJSON("resolving %s: %v", issueID, err)
 		}
-		issueID = fullID
+		if result == nil || result.Issue == nil {
+			if result != nil {
+				result.Close()
+			}
+			FatalErrorRespectJSON("issue %s not found", issueID)
+		}
+		defer result.Close()
+		issueID = result.ResolvedID
 
-		comment, err := store.AddIssueComment(ctx, issueID, author, commentText)
+		comment, err := result.Store.AddIssueComment(ctx, issueID, author, commentText)
 		if err != nil {
 			FatalErrorRespectJSON("adding comment: %v", err)
 		}
 
-		// Embedded mode: flush Dolt commit.
-		if isEmbeddedMode() {
-			if _, err := store.CommitPending(ctx, author); err != nil {
-				FatalErrorRespectJSON("failed to commit: %v", err)
-			}
-		}
+		commandDidWrite.Store(true)
 
 		if jsonOutput {
 			outputJSON(comment)
@@ -156,6 +189,7 @@ Examples:
 }
 
 func init() {
+	commentsCmd.AddCommand(commentsMisplacedListCmd)
 	commentsCmd.AddCommand(commentsAddCmd)
 	commentsCmd.Flags().Bool("local-time", false, "Show timestamps in local time instead of UTC")
 	commentsAddCmd.Flags().StringP("file", "f", "", "Read comment text from file")

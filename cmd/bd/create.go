@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -263,23 +264,18 @@ var createCmd = &cobra.Command{
 		// Handle --dry-run flag (before --rig to ensure it works with cross-rig creation)
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		if dryRun {
-			// Build preview issue
-			var externalRefPtr *string
-			if externalRef != "" {
-				externalRefPtr = &externalRef
-			}
-			previewIssue := &types.Issue{
+			previewIssue := buildCreateIssue(createIssueParams{
+				ID:                 explicitID,
 				Title:              title,
 				Description:        description,
 				Design:             design,
 				AcceptanceCriteria: acceptance,
 				Notes:              notes,
 				SpecID:             specID,
-				Status:             types.StatusOpen,
 				Priority:           priority,
 				IssueType:          types.IssueType(issueType).Normalize(),
 				Assignee:           assignee,
-				ExternalRef:        externalRefPtr,
+				ExternalRef:        externalRef,
 				Ephemeral:          wisp,
 				NoHistory:          noHistory,
 				CreatedBy:          getActorWithGit(),
@@ -289,44 +285,16 @@ var createCmd = &cobra.Command{
 				DueAt:              dueAt,
 				DeferUntil:         deferUntil,
 				Metadata:           metadata,
-				// Event fields
-				EventKind: eventCategory,
-				Actor:     eventActor,
-				Target:    eventTarget,
-				Payload:   eventPayload,
-			}
-			if explicitID != "" {
-				previewIssue.ID = explicitID
-			}
+				EventKind:          eventCategory,
+				Actor:              eventActor,
+				Target:             eventTarget,
+				Payload:            eventPayload,
+			})
 
 			if jsonOutput {
 				outputJSON(previewIssue)
 			} else {
-				idDisplay := previewIssue.ID
-				if idDisplay == "" {
-					idDisplay = "(will be generated)"
-				}
-				fmt.Printf("%s [DRY RUN] Would create issue:\n", ui.RenderWarn("⚠"))
-				fmt.Printf("  ID: %s\n", idDisplay)
-				fmt.Printf("  Title: %s\n", previewIssue.Title)
-				fmt.Printf("  Type: %s\n", previewIssue.IssueType)
-				fmt.Printf("  Priority: P%d\n", previewIssue.Priority)
-				fmt.Printf("  Status: %s\n", previewIssue.Status)
-				if previewIssue.Assignee != "" {
-					fmt.Printf("  Assignee: %s\n", previewIssue.Assignee)
-				}
-				if previewIssue.Description != "" {
-					fmt.Printf("  Description: %s\n", previewIssue.Description)
-				}
-				if len(labels) > 0 {
-					fmt.Printf("  Labels: %s\n", strings.Join(labels, ", "))
-				}
-				if len(deps) > 0 {
-					fmt.Printf("  Dependencies: %s\n", strings.Join(deps, ", "))
-				}
-				if eventCategory != "" {
-					fmt.Printf("  Event category: %s\n", eventCategory)
-				}
+				renderCreateDryRunPreview(previewIssue, labels, deps)
 			}
 			return
 		}
@@ -426,8 +394,11 @@ var createCmd = &cobra.Command{
 				_ = store.Close() // Best effort cleanup on error path
 			}
 
-			// Replace store for remainder of create operation
-			store = targetStore
+			// Replace store for remainder of create operation.
+			// Must use setStore to sync cmdCtx.Store — a bare `store = targetStore`
+			// leaves cmdCtx.Store pointing at the closed original, which causes
+			// "store is closed" in PostRun tip auto-commit (GH#tip-closed-bug).
+			setStore(targetStore)
 		}
 
 		// Check for conflicting flags
@@ -492,25 +463,18 @@ var createCmd = &cobra.Command{
 			}
 		}
 
-		var externalRefPtr *string
-		if externalRef != "" {
-			externalRefPtr = &externalRef
-		}
-
-		// Direct mode
-		issue := &types.Issue{
-			ID:                 explicitID, // Set explicit ID if provided (empty string if not)
+		issue := buildCreateIssue(createIssueParams{
+			ID:                 explicitID,
 			Title:              title,
 			Description:        description,
 			Design:             design,
 			AcceptanceCriteria: acceptance,
 			Notes:              notes,
 			SpecID:             specID,
-			Status:             types.StatusOpen,
 			Priority:           priority,
 			IssueType:          types.IssueType(issueType).Normalize(),
 			Assignee:           assignee,
-			ExternalRef:        externalRefPtr,
+			ExternalRef:        externalRef,
 			EstimatedMinutes:   estimatedMinutes,
 			Ephemeral:          wisp,
 			NoHistory:          noHistory,
@@ -525,7 +489,7 @@ var createCmd = &cobra.Command{
 			DueAt:              dueAt,
 			DeferUntil:         deferUntil,
 			Metadata:           metadata,
-		}
+		})
 
 		ctx := rootCtx
 
@@ -612,7 +576,6 @@ var createCmd = &cobra.Command{
 
 		// Add dependencies if specified (format: type:id or just id for default "blocks" type)
 		for _, depSpec := range deps {
-			// Skip empty specs (e.g., from trailing commas)
 			depSpec = strings.TrimSpace(depSpec)
 			if depSpec == "" {
 				continue
@@ -620,41 +583,46 @@ var createCmd = &cobra.Command{
 
 			var depType types.DependencyType
 			var dependsOnID string
+			swapDirection := false
 
-			// Parse format: "type:id" or just "id" (defaults to "blocks")
 			if strings.Contains(depSpec, ":") {
 				parts := strings.SplitN(depSpec, ":", 2)
 				if len(parts) != 2 {
 					WarnError("invalid dependency format '%s', expected 'type:id' or 'id'", depSpec)
 					continue
 				}
-				depType = types.DependencyType(strings.TrimSpace(parts[0]))
-				// "depends-on" is an alias — keep default direction (new issue depends on target)
-				if depType == "depends-on" {
-					depType = types.DepBlocks
-				}
+				rawType := types.DependencyType(strings.TrimSpace(parts[0]))
 				dependsOnID = strings.TrimSpace(parts[1])
+
+				switch rawType {
+				case "depends-on", "blocked-by":
+					// Alias: the new issue depends on the target. Store as a blocks edge.
+					depType = types.DepBlocks
+				case types.DepBlocks:
+					// Explicit "blocks:X" means the new issue blocks X, so store X -> new issue.
+					depType = types.DepBlocks
+					swapDirection = true
+				default:
+					depType = rawType
+				}
 			} else {
-				// Default to "blocks" if no type specified
 				depType = types.DepBlocks
 				dependsOnID = depSpec
 			}
 
-			// Validate dependency type
 			if !depType.IsValid() {
-				WarnError("invalid dependency type '%s' (valid: blocks, related, parent-child, discovered-from)", depType)
-				continue
+				FatalErrorRespectJSON("invalid dependency type %q (must be non-empty, max 50 chars); valid types: %s", depType, createDepsAcceptedTypeList())
+			}
+			if !depType.IsWellKnown() {
+				FatalErrorRespectJSON("unknown dependency type %q; valid types: %s", depType, createDepsAcceptedTypeList())
 			}
 
-			// Add the dependency
 			dep := &types.Dependency{
 				IssueID:     issue.ID,
 				DependsOnID: dependsOnID,
 				Type:        depType,
 			}
-			// When user explicitly says "blocks:X", they mean "new issue blocks X"
-			// So X depends on the new issue — swap direction
-			if depType == types.DepBlocks && strings.Contains(depSpec, ":") {
+			if swapDirection {
 				dep.IssueID = dependsOnID
 				dep.DependsOnID = issue.ID
 			}
@@ -715,7 +683,7 @@ var createCmd = &cobra.Command{
 		// DoltHub remotes. Per-create pushes caused 22GB of git-remote-cache
 		// bloat with dozens of agents creating wisps constantly (hq-glw).
 		if repoPath != "." && targetStore != nil {
-			if _, err := targetStore.CommitPending(ctx, actor); err != nil {
+			if err := targetStore.Commit(ctx, fmt.Sprintf("bd: create (auto-commit) by %s", actor)); err != nil && !isDoltNothingToCommit(err) {
 				debug.Logf("warning: failed to commit routed repo: %v", err)
 			}
 		}
@@ -745,6 +713,107 @@ var createCmd = &cobra.Command{
 		// Track as last touched issue
 		SetLastTouchedID(issue.ID)
 	},
+}
+
+type createIssueParams struct {
+	ID                 string
+	Title              string
+	Description        string
+	Design             string
+	AcceptanceCriteria string
+	Notes              string
+	SpecID             string
+	Priority           int
+	IssueType          types.IssueType
+	Assignee           string
+	ExternalRef        string
+	EstimatedMinutes   *int
+	Ephemeral          bool
+	NoHistory          bool
+	CreatedBy          string
+	Owner              string
+	MolType            types.MolType
+	WispType           types.WispType
+	EventKind          string
+	Actor              string
+	Target             string
+	Payload            string
+	DueAt              *time.Time
+	DeferUntil         *time.Time
+	Metadata           json.RawMessage
+}
+
+func buildCreateIssue(params createIssueParams) *types.Issue {
+	var externalRefPtr *string
+	if params.ExternalRef != "" {
+		externalRefPtr = &params.ExternalRef
+	}
+
+	return &types.Issue{
+		ID:                 params.ID,
+		Title:              params.Title,
+		Description:        params.Description,
+		Design:             params.Design,
+		AcceptanceCriteria: params.AcceptanceCriteria,
+		Notes:              params.Notes,
+		SpecID:             params.SpecID,
+		Status:             types.StatusOpen,
+		Priority:           params.Priority,
+		IssueType:          params.IssueType,
+		Assignee:           params.Assignee,
+		ExternalRef:        externalRefPtr,
+		EstimatedMinutes:   params.EstimatedMinutes,
+		Ephemeral:          params.Ephemeral,
+		NoHistory:          params.NoHistory,
+		CreatedBy:          params.CreatedBy,
+		Owner:              params.Owner,
+		MolType:            params.MolType,
+		WispType:           params.WispType,
+		EventKind:          params.EventKind,
+		Actor:              params.Actor,
+		Target:             params.Target,
+		Payload:            params.Payload,
+		DueAt:              params.DueAt,
+		DeferUntil:         params.DeferUntil,
+		Metadata:           params.Metadata,
+	}
+}
+
+func renderCreateDryRunPreview(issue *types.Issue, labels, deps []string) {
+	idDisplay := issue.ID
+	if idDisplay == "" {
+		idDisplay = "(will be generated)"
+	}
+	fmt.Printf("%s [DRY RUN] Would create issue:\n", ui.RenderWarn("⚠"))
+	fmt.Printf("  ID: %s\n", idDisplay)
+	fmt.Printf("  Title: %s\n", issue.Title)
+	fmt.Printf("  Type: %s\n", issue.IssueType)
+	fmt.Printf("  Priority: P%d\n", issue.Priority)
+	fmt.Printf("  Status: %s\n", issue.Status)
+	if issue.Assignee != "" {
+		fmt.Printf("  Assignee: %s\n", issue.Assignee)
+	}
+	if issue.Description != "" {
+		fmt.Printf("  Description: %s\n", issue.Description)
+	}
+	if len(labels) > 0 {
+		fmt.Printf("  Labels: %s\n", strings.Join(labels, ", "))
+	}
+	if len(deps) > 0 {
+		fmt.Printf("  Dependencies: %s\n", strings.Join(deps, ", "))
+	}
+	if issue.EventKind != "" {
+		fmt.Printf("  Event category: %s\n", issue.EventKind)
+	}
+}
+
+func createDepsAcceptedTypeList() string {
+	names := []string{"blocked-by", "depends-on"}
+	for _, depType := range types.WellKnownDependencyTypes() {
+		names = append(names, string(depType))
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 func init() {

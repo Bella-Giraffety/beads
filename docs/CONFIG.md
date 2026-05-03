@@ -44,7 +44,7 @@ Tool-level settings you can configure:
 | `external_projects` | - | - | (none) | Map project names to paths for cross-project deps |
 | `backup.enabled` | - | `BD_BACKUP_ENABLED` | `false` | Enable periodic Dolt-native backup to `.beads/backup/` |
 | `backup.interval` | - | `BD_BACKUP_INTERVAL` | `15m` | Minimum time between auto-backups |
-| `dolt.auto-push` | - | `BD_DOLT_AUTO_PUSH` | (auto) | Auto-push to Dolt remote after writes (auto-enabled when origin exists) |
+| `dolt.auto-push` | - | `BD_DOLT_AUTO_PUSH` | `false` | Auto-push to Dolt remote after writes (explicit opt-in) |
 | `dolt.auto-push-interval` | - | `BD_DOLT_AUTO_PUSH_INTERVAL` | `5m` | Minimum time between auto-pushes |
 | `dolt.shared-server` | `--shared-server` | `BEADS_DOLT_SHARED_SERVER` | `false` | Share a single Dolt server across all projects at `~/.beads/shared-server/` |
 | `dolt.idle-timeout` | - | - | `30m` | Idle auto-stop timeout (`"0"` disables) |
@@ -103,11 +103,11 @@ backup:
 
 ### Dolt Auto-Push
 
-When a Dolt remote named `origin` is configured, `bd` automatically pushes after write commands with a 5-minute debounce. This completes the Dolt replication story: add a remote once, and data flows automatically.
+By default, `bd` does not push automatically after write commands. Auto-push is explicit opt-in because concurrent pushes to git-protocol Dolt remotes can corrupt or strand remote history when multiple writers race.
 
 ```yaml
 dolt:
-  auto-push: true       # Auto-enable when origin remote exists (default)
+  auto-push: false      # Explicit opt-in only; set true for single-writer setups
   auto-push-interval: 5m  # Minimum time between auto-pushes
 ```
 
@@ -118,10 +118,10 @@ dolt:
 - Push failures are warnings only (non-fatal)
 - Last push time and commit are tracked in the metadata table
 
-**Opt out:**
+**Opt in:**
 ```yaml
 dolt:
-  auto-push: false
+  auto-push: true
 ```
 
 ### Actor Identity Resolution
@@ -331,6 +331,10 @@ Configuration keys use dot-notation namespaces to organize settings:
 - `min_hash_length` - Minimum hash ID length (default: 4)
 - `max_hash_length` - Maximum hash ID length (default: 8)
 - `import.orphan_handling` - How to handle hierarchical issues with missing parents during import (default: `allow`)
+- `export.auto` - Refresh the git-tracked JSONL file after every write command (default: `true`)
+- `export.path` - Output filename relative to `.beads/` (default: `issues.jsonl`)
+- `export.interval` - Minimum time between auto-exports (default: `60s`)
+- `export.git-add` - Run `git add` on the export file after writing (default: `true`)
 - `export.error_policy` - Error handling strategy for exports (default: `strict`)
 - `export.retry_attempts` - Number of retry attempts for transient errors (default: 3)
 - `export.retry_backoff_ms` - Initial backoff in milliseconds for retries (default: 100)
@@ -637,8 +641,8 @@ Linear integration provides bidirectional sync between bd and Linear via GraphQL
 **Required configuration:**
 
 ```bash
-# API Key (can also use LINEAR_API_KEY environment variable)
-bd config set linear.api_key "lin_api_YOUR_API_KEY"
+# API Key (recommended: use environment variable to avoid git exposure)
+export LINEAR_API_KEY="lin_api_YOUR_API_KEY"  # add to ~/.secrets or ~/.zshrc
 
 # Team ID (find in Linear team settings or URL)
 bd config set linear.team_id "team-uuid-here"
@@ -714,6 +718,12 @@ bd config set linear.relation_map.duplicate duplicates
 bd config set linear.relation_map.related related
 ```
 
+Relation import is opt-in when pulling:
+
+```bash
+bd linear sync --pull --relations
+```
+
 **Sync commands:**
 
 ```bash
@@ -722,6 +732,15 @@ bd linear sync
 
 # Pull only (import from Linear)
 bd linear sync --pull
+
+# Pull only if data is stale (skip if fresh)
+bd linear sync --pull-if-stale
+
+# Pull with custom staleness threshold (default 20m)
+bd linear sync --pull-if-stale --threshold 5m
+
+# Pull issues and Linear relations as bd dependencies
+bd linear sync --pull --relations
 
 # Push only (export to Linear)
 bd linear sync --push
@@ -737,6 +756,16 @@ bd linear sync --prefer-linear   # Linear version wins on conflicts
 # Check sync status
 bd linear status
 ```
+
+**Staleness detection:**
+
+After each successful pull, `bd` writes the current timestamp to `.beads/last_pull`. This enables ambient staleness detection:
+
+- **`--pull-if-stale`**: Only pull if data is older than the threshold (default 20m). When data is fresh, prints "Linear data is fresh" and exits. In `--json` mode, includes `"is_fresh": true/false`.
+- **`--threshold`**: Override the default 20-minute staleness threshold (e.g., `--threshold 5m`).
+- **Debounce**: A 5-minute debounce prevents agent loops — if a pull completed within the last 5 minutes, data is always treated as fresh regardless of the threshold.
+- **`bd prime` auto-pull**: When `LINEAR_API_KEY` is set and data is stale, `bd prime` automatically pulls from Linear before emitting orientation output.
+- **Per-session warning**: On any `bd` command, if data is stale, a one-time warning is emitted to stderr: `⚠ Linear data is 45m stale — run 'bd linear sync --pull' to refresh`. Suppressed in subsequent commands within the same shell session.
 
 **Automatic sync tracking:**
 

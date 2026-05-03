@@ -164,6 +164,14 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 		}
 		whereClauses = append(whereClauses, fmt.Sprintf("id IN (SELECT issue_id FROM %s WHERE label IN (%s))", tables.Labels, strings.Join(placeholders, ", ")))
 	}
+	if len(filter.ExcludeLabels) > 0 {
+		placeholders := make([]string, len(filter.ExcludeLabels))
+		for i, label := range filter.ExcludeLabels {
+			placeholders[i] = "?"
+			args = append(args, label)
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("id NOT IN (SELECT issue_id FROM %s WHERE label IN (%s))", tables.Labels, strings.Join(placeholders, ", ")))
+	}
 	if filter.NoLabels {
 		whereClauses = append(whereClauses, fmt.Sprintf("id NOT IN (SELECT DISTINCT issue_id FROM %s)", tables.Labels))
 	}
@@ -225,6 +233,14 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 		whereClauses = append(whereClauses, "closed_at < ?")
 		args = append(args, filter.ClosedBefore.Format(time.RFC3339))
 	}
+	if filter.StartedAfter != nil {
+		whereClauses = append(whereClauses, "started_at > ?")
+		args = append(args, filter.StartedAfter.Format(time.RFC3339))
+	}
+	if filter.StartedBefore != nil {
+		whereClauses = append(whereClauses, "started_at < ?")
+		args = append(args, filter.StartedBefore.Format(time.RFC3339))
+	}
 	if filter.DeferAfter != nil {
 		whereClauses = append(whereClauses, "defer_until > ?")
 		args = append(args, filter.DeferAfter.Format(time.RFC3339))
@@ -243,7 +259,8 @@ func BuildIssueFilterClauses(query string, filter types.IssueFilter, tables Filt
 	}
 
 	if filter.Deferred {
-		whereClauses = append(whereClauses, "defer_until IS NOT NULL")
+		whereClauses = append(whereClauses, "(defer_until IS NOT NULL OR status = ?)")
+		args = append(args, types.StatusDeferred)
 	}
 	if filter.Overdue {
 		whereClauses = append(whereClauses, "due_at IS NOT NULL AND due_at < ? AND status != ?")

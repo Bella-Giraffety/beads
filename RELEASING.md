@@ -29,7 +29,7 @@ A beads release involves multiple distribution channels:
 
 ### Required Tools
 
-- `git` with push access to steveyegge/beads
+- `git` with push access to gastownhall/beads
 - `goreleaser` for building binaries
 - `npm` with authentication (for npm releases)
 - `python3` and `twine` (for PyPI releases)
@@ -38,6 +38,9 @@ A beads release involves multiple distribution channels:
 ### Required Access
 
 - GitHub: Write access to repository and ability to create releases
+- GitHub: Ability to create protected `v*` release tags. The repository should
+  restrict `refs/tags/v*` creation, updates, and deletion to trusted release
+  maintainers.
 - PyPI: Maintainer access to `beads-mcp` package
 - npm: Member of `@beads` organization
 
@@ -45,7 +48,7 @@ A beads release involves multiple distribution channels:
 
 ```bash
 # Check git
-git remote -v  # Should show steveyegge/beads
+git remote -v  # Should show gastownhall/beads
 
 # Check goreleaser
 goreleaser --version
@@ -136,8 +139,9 @@ This updates:
 - `cmd/bd/version.go` - CLI version constant
 - `integrations/beads-mcp/pyproject.toml` - MCP server version
 - `integrations/beads-mcp/src/beads_mcp/__init__.py` - MCP Python version
-- `claude-plugin/.claude-plugin/plugin.json` - Plugin version
-- `.claude-plugin/marketplace.json` - Marketplace version
+- `plugins/beads/.claude-plugin/plugin.json` - Claude plugin version
+- `plugins/beads/.codex-plugin/plugin.json` - Codex plugin version
+- `.claude-plugin/marketplace.json` - Claude marketplace version
 - `npm-package/package.json` - npm package version
 - `cmd/bd/templates/hooks/*` - Git hook versions
 - `README.md` - Documentation version
@@ -164,6 +168,10 @@ git tag -a v0.22.0 -m "Release v0.22.0"
 git push origin main
 git push origin v0.22.0
 ```
+
+The release workflow is intentionally gated to `refs/tags/v*`. A manual
+workflow dispatch from a branch will skip publishing jobs; manual reruns must
+select the release tag.
 
 **Alternative (step-by-step):**
 
@@ -221,7 +229,7 @@ gh release create v0.22.0 \
 
 ### Verify GitHub Release
 
-1. Visit https://github.com/steveyegge/beads/releases
+1. Visit https://github.com/gastownhall/beads/releases
 2. Verify v0.22.0 is marked as "Latest"
 3. Check all platform binaries are present:
    - `beads_0.22.0_darwin_amd64.tar.gz`
@@ -303,24 +311,27 @@ pip install beads-mcp==0.22.0
 python -m beads_mcp --version
 ```
 
-## 5. Claude Code Marketplace Update
+## 5. Plugin Marketplace Update
 
-Update the Claude Code marketplace metadata files:
+Update the plugin marketplace metadata files:
 
 ```bash
 # Update .claude-plugin/marketplace.json
 # Change version to match current release
 vim .claude-plugin/marketplace.json
 
-# Update claude-plugin/.claude-plugin/plugin.json if needed
-vim claude-plugin/.claude-plugin/plugin.json
+# Update plugins/beads/.claude-plugin/plugin.json if needed
+vim plugins/beads/.claude-plugin/plugin.json
+
+# Update plugins/beads/.codex-plugin/plugin.json if needed
+vim plugins/beads/.codex-plugin/plugin.json
 
 # Commit changes
-git add .claude-plugin/ claude-plugin/.claude-plugin/
-git commit -m "chore: Update Claude Code marketplace to v0.22.0"
+git add .claude-plugin/ plugins/beads/.claude-plugin/ plugins/beads/.codex-plugin/
+git commit -m "chore: Update plugin marketplaces to v0.22.0"
 ```
 
-**Note:** These files define how beads appears in Claude Code's plugin marketplace. Version should match the release version.
+**Note:** These files define how beads appears in Claude Code and Codex plugin marketplaces. Version should match the release version.
 
 ## 6. npm Package Release
 
@@ -416,7 +427,7 @@ After all distribution channels are updated, verify each one:
 
 ```bash
 # Download and test binary
-wget https://github.com/steveyegge/beads/releases/download/v0.22.0/beads_0.22.0_darwin_arm64.tar.gz
+wget https://github.com/gastownhall/beads/releases/download/v0.22.0/beads_0.22.0_darwin_arm64.tar.gz
 tar -xzf beads_0.22.0_darwin_arm64.tar.gz
 ./bd version
 ```
@@ -447,7 +458,7 @@ bd version
 
 ```bash
 # Test quick install script
-curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
 bd version
 ```
 
@@ -662,5 +673,5 @@ Examples:
 
 ## Questions?
 
-- Open an issue: https://github.com/steveyegge/beads/issues
-- Check existing releases: https://github.com/steveyegge/beads/releases
+- Open an issue: https://github.com/gastownhall/beads/issues
+- Check existing releases: https://github.com/gastownhall/beads/releases

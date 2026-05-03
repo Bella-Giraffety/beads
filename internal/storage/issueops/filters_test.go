@@ -1,6 +1,7 @@
 package issueops
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -178,6 +179,46 @@ func TestBuildIssueFilterClauses_LabelsAny(t *testing.T) {
 	}
 }
 
+func TestBuildIssueFilterClauses_ExcludeLabels(t *testing.T) {
+	t.Parallel()
+
+	filter := types.IssueFilter{ExcludeLabels: []string{"triage:pending", "wontfix"}}
+	clauses, args, err := BuildIssueFilterClauses("", filter, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Exclude labels produce a single NOT IN clause
+	if len(clauses) != 1 {
+		t.Fatalf("expected 1 clause for exclude labels, got %d", len(clauses))
+	}
+	if len(args) != 2 {
+		t.Errorf("expected 2 args for 2 exclude labels, got %d", len(args))
+	}
+	if !strings.Contains(clauses[0], "NOT IN") {
+		t.Errorf("expected NOT IN clause, got %q", clauses[0])
+	}
+}
+
+func TestBuildIssueFilterClauses_ExcludeLabelsWithInclude(t *testing.T) {
+	t.Parallel()
+
+	filter := types.IssueFilter{
+		Labels:        []string{"backend"},
+		ExcludeLabels: []string{"triage:pending"},
+	}
+	clauses, args, err := BuildIssueFilterClauses("", filter, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// 1 AND label clause + 1 exclude clause
+	if len(clauses) != 2 {
+		t.Fatalf("expected 2 clauses, got %d", len(clauses))
+	}
+	if len(args) != 2 {
+		t.Errorf("expected 2 args, got %d", len(args))
+	}
+}
+
 func TestBuildIssueFilterClauses_DateFilters(t *testing.T) {
 	t.Parallel()
 
@@ -196,6 +237,28 @@ func TestBuildIssueFilterClauses_DateFilters(t *testing.T) {
 	}
 	if len(args) != 2 {
 		t.Errorf("expected 2 args, got %d", len(args))
+	}
+}
+
+func TestBuildIssueFilterClauses_DeferredIncludesStatus(t *testing.T) {
+	t.Parallel()
+	clauses, args, err := BuildIssueFilterClauses("", types.IssueFilter{Deferred: true}, IssuesFilterTables)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "(defer_until IS NOT NULL OR status = ?)"
+	var found bool
+	for _, c := range clauses {
+		if c == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected deferred clause %q in %v", want, clauses)
+	}
+	if len(args) != 1 || args[0] != types.StatusDeferred {
+		t.Fatalf("args = %v, want [%q]", args, types.StatusDeferred)
 	}
 }
 

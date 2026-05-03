@@ -465,7 +465,8 @@ func (t *doltTransaction) SearchIssues(ctx context.Context, query string, filter
 
 	// Time-based scheduling filters
 	if filter.Deferred {
-		whereClauses = append(whereClauses, "defer_until IS NOT NULL")
+		whereClauses = append(whereClauses, "(defer_until IS NOT NULL OR status = ?)")
+		args = append(args, types.StatusDeferred)
 	}
 	if filter.Overdue {
 		whereClauses = append(whereClauses, "due_at IS NOT NULL AND due_at < ? AND status != ?")
@@ -631,37 +632,36 @@ func (t *doltTransaction) DeleteIssue(ctx context.Context, id string) error {
 // AddDependency adds a dependency within the transaction.
 // Checks for existing pairs to prevent silent type overwrites.
 func (t *doltTransaction) AddDependency(ctx context.Context, dep *types.Dependency, actor string) error {
+	return t.AddDependencyWithOptions(ctx, dep, actor, storage.DependencyAddOptions{})
+}
+
+func (t *doltTransaction) AddDependencyWithOptions(ctx context.Context, dep *types.Dependency, actor string, addOpts storage.DependencyAddOptions) error {
 	table := "dependencies"
+	sourceTable := "issues"
 	if t.isActiveWisp(ctx, dep.IssueID) {
 		table = "wisp_dependencies"
+		sourceTable = "wisps"
 	}
 
-	// Check for existing dependency to prevent silent type overwrites.
-	var existingType string
-	//nolint:gosec // G201: table is hardcoded
-	err := t.tx.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT type FROM %s WHERE issue_id = ? AND depends_on_id = ?
-	`, table), dep.IssueID, dep.DependsOnID).Scan(&existingType)
-	if err == nil {
-		if existingType == string(dep.Type) {
-			return nil // idempotent
-		}
-		return fmt.Errorf("dependency %s -> %s already exists with type %q (requested %q); remove it first with 'bd dep remove' then re-add",
-			dep.IssueID, dep.DependsOnID, existingType, dep.Type)
-	}
-	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("failed to check existing dependency: %w", err)
+	isCrossPrefix := isCrossPrefixDep(dep.IssueID, dep.DependsOnID)
+	targetTable := "issues"
+	if !strings.HasPrefix(dep.DependsOnID, "external:") && !isCrossPrefix && t.isActiveWisp(ctx, dep.DependsOnID) {
+		targetTable = "wisps"
 	}
 
-	//nolint:gosec // G201: table is hardcoded
-	_, err = t.tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO %s (issue_id, depends_on_id, type, created_at, created_by, thread_id)
-		VALUES (?, ?, ?, NOW(), ?, ?)
-	`, table), dep.IssueID, dep.DependsOnID, dep.Type, actor, dep.ThreadID)
-	if err == nil {
-		t.dirty.MarkDirty(table)
+	opts := issueops.AddDependencyOpts{
+		SourceTable:    sourceTable,
+		TargetTable:    targetTable,
+		WriteTable:     table,
+		IsCrossPrefix:  isCrossPrefix,
+		SkipCycleCheck: addOpts.SkipCycleCheck,
 	}
-	return wrapExecError("add dependency in tx", err)
+	if err := issueops.AddDependencyInTx(ctx, t.tx, dep, actor, opts); err != nil {
+		return err
+	}
+	t.dirty.MarkDirty(table)
+	t.store.invalidateBlockedIDsCache()
+	return nil
 }
 
 func (t *doltTransaction) GetDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {
@@ -816,6 +816,22 @@ func (t *doltTransaction) GetMetadata(ctx context.Context, key string) (string, 
 		return "", nil
 	}
 	return value, wrapQueryError("get metadata in tx", err)
+}
+
+// SetLocalMetadata sets a value in the dolt-ignored local_metadata table within the transaction.
+func (t *doltTransaction) SetLocalMetadata(ctx context.Context, key, value string) error {
+	_, err := t.tx.ExecContext(ctx, "REPLACE INTO local_metadata (`key`, value) VALUES (?, ?)", key, value)
+	return wrapExecError("set local metadata in tx", err)
+}
+
+// GetLocalMetadata gets a value from the dolt-ignored local_metadata table within the transaction.
+func (t *doltTransaction) GetLocalMetadata(ctx context.Context, key string) (string, error) {
+	var value string
+	err := t.tx.QueryRowContext(ctx, "SELECT value FROM local_metadata WHERE `key` = ?", key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, wrapQueryError("get local metadata in tx", err)
 }
 
 func (t *doltTransaction) ImportIssueComment(ctx context.Context, issueID, author, text string, createdAt time.Time) (*types.Comment, error) {
